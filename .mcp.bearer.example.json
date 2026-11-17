@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "megalens": {
+      "type": "http",
+      "url": "https://megalens.ai/api/mcp?ide=claude-code",
+      "headers": { "Authorization": "Bearer ${MEGALENS_TOKEN}" }
+    }
+  }
+}

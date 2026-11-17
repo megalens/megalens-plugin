@@ -1,0 +1,11 @@
+{
+  "name": "megalens",
+  "owner": { "name": "MegaLens", "url": "https://megalens.ai" },
+  "plugins": [
+    {
+      "name": "megalens",
+      "source": "./",
+      "description": "Review your current change with MegaLens: models from different companies review the same diff, changed files and related code."
+    }
+  ]
+}

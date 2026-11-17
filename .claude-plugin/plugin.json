@@ -1,0 +1,11 @@
+{
+  "name": "megalens",
+  "displayName": "MegaLens",
+  "version": "0.1.0",
+  "description": "Independent multi-company code review of your change: /megalens-review collects the diff, changed files and bounded context the same way every time and sends it to MegaLens.",
+  "author": { "name": "MegaLens", "url": "https://megalens.ai" },
+  "homepage": "https://megalens.ai",
+  "license": "MIT",
+  "keywords": ["code-review", "mcp", "megalens"],
+  "privacyPolicyUrl": "https://megalens.ai/privacy"
+}
