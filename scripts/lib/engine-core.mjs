@@ -4,6 +4,9 @@
 // BYO login stays off until the owner clears OpenAI's terms (design 02, S7 and T26).
 // There is deliberately no environment variable or flag that turns it on: change this constant in a reviewed commit.
 export const BYO_LOGIN_ENABLED = false;
+// Owner decision 20 Nov 2026 (CONTRACT section 7): BYO OpenAI key mode is OFF for now. Same rule: a constant, no env or flag switch.
+// The code path stays; tests turn it on only through the `flags` argument that production code never passes.
+export const BYO_KEY_ENABLED = false;
 
 export const TIERS = ['standard', 'double', 'deep'];
 export const REVIEW_ID_RE = /^rv_[A-Za-z0-9_-]{6,64}$/;
@@ -41,17 +44,21 @@ export function assertReviewId(id) {
  * Which route will the engine use? Mirrors the engine's own rules and never falls back from one to another.
  * Returns {mode} or {error}. Never returns a secret.
  */
-export function chooseAuth(env) {
+export function chooseAuth(env, flags = {}) {
+  const byoLoginOn = flags.byoLogin ?? BYO_LOGIN_ENABLED; const byoKeyOn = flags.byoKey ?? BYO_KEY_ENABLED;
   const byo = String(env.MEGALENS_BYO ?? '').trim();
   if (byo === 'login') {
-    return BYO_LOGIN_ENABLED ? { mode: 'byo-login' } : { error: 'byo-login is switched off in this plugin build (it needs the OpenAI terms cleared first). Use MEGALENS_TOKEN, or MEGALENS_BYO=1 with your own OPENAI_API_KEY.' };
+    return byoLoginOn ? { mode: 'byo-login' } : { error: 'byo-login is switched off in this plugin build (it needs the OpenAI terms cleared first). Use your MegaLens token.' };
   }
   if (byo === '1' || byo.toLowerCase() === 'true') {
-    return env.OPENAI_API_KEY ? { mode: 'byo-key' } : { error: 'MEGALENS_BYO=1 needs OPENAI_API_KEY set in the environment you started Claude Code from.' };
+    if (!byoKeyOn) return { error: 'BYO OpenAI key mode is not available yet; use your MegaLens token.' };
+    if (!env.OPENAI_API_KEY) return { error: 'MEGALENS_BYO=1 needs OPENAI_API_KEY set in the environment you started Claude Code from.' };
+    for (const k of ['OPENAI_BASE_URL', 'OPENAI_API_BASE', 'OPENAI_API_HOST']) if (env[k]) return { error: `${k} is set; refusing to send your OpenAI key anywhere but OpenAI. Unset it.` };
+    return { mode: 'byo-key' };
   }
-  if (byo !== '') return { error: 'MEGALENS_BYO must be 1 (your own OpenAI key) or unset.' };
+  if (byo !== '') return { error: 'MEGALENS_BYO is not a supported value. Use your MegaLens token.' };
   if (env.MEGALENS_TOKEN) return { mode: 'gateway' };
-  return { error: 'No MegaLens credentials. Set MEGALENS_TOKEN (or MEGALENS_BYO=1 with OPENAI_API_KEY) and restart Claude Code. Without a repo or without the engine installed, /megalens:megalens-review still works with a token.' };
+  return { error: 'No MegaLens credentials. Set MEGALENS_TOKEN and restart Claude Code. Without a repo or without the engine installed, /megalens:megalens-review still works with a token.' };
 }
 
 /** The environment handed to the engine: an allowlist, and the provider key only in byo-key mode. */
@@ -59,11 +66,13 @@ export function childEnv(env, mode) {
   const out = {};
   for (const [k, v] of Object.entries(env)) {
     if (v === undefined) continue;
-    if (/^(PATH|HOME|USER|LOGNAME|LANG|TERM|TMPDIR|SHELL|TZ|CI|GITHUB_ACTIONS)$/.test(k) || /^(LC_|XDG_|MEGALENS_)/.test(k)) out[k] = v;
+    // Explicit names only: engine settings that are safe in every mode. No MEGALENS_* wildcard (that would pass
+    // MEGALENS_ALLOW_CUSTOM_API, MEGALENS_REVIEW_KEY and friends).
+    if (/^(PATH|HOME|USER|LOGNAME|LANG|TERM|TMPDIR|SHELL|TZ|CI|GITHUB_ACTIONS|MEGALENS_STATE_DIR|MEGALENS_CODEX_BIN)$/.test(k) || /^(LC_|XDG_)/.test(k)) out[k] = v;
   }
-  if (mode === 'byo-key') out.OPENAI_API_KEY = env.OPENAI_API_KEY; else delete out.OPENAI_API_KEY;
-  if (mode !== 'byo-login' && out.MEGALENS_BYO === 'login') delete out.MEGALENS_BYO;
-  delete out.MEGALENS_REVIEW_BIN;
+  if (mode === 'gateway') { out.MEGALENS_TOKEN = env.MEGALENS_TOKEN; if (env.MEGALENS_API_URL) out.MEGALENS_API_URL = env.MEGALENS_API_URL; }
+  if (mode === 'byo-key') { out.MEGALENS_BYO = '1'; out.OPENAI_API_KEY = env.OPENAI_API_KEY; }
+  if (mode === 'byo-login') out.MEGALENS_BYO = 'login';
   return out;
 }
 
@@ -76,26 +85,28 @@ export function scrub(text, env = {}) {
   return t.replace(/\b(?:sk|ml|mlk|rk)[-_][A-Za-z0-9_-]{12,}/g, '[redacted]').replace(/\b(Bearer\s+)[A-Za-z0-9._~+\/-]{12,}/gi, '$1[redacted]');
 }
 
-const oneLine = (s, n) => String(s ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, n);
+const oneLine = (s, n) => String(s ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]+/g, ' ').trim().slice(0, n);
 const PRIO = new Set(['P0', 'P1', 'P2', 'P3']);
 
 /**
  * Turn whatever Claude wrote for its own review into a clean megalens.findings/v1 document.
  * Throws UsageError on anything that is not a findings list. At most 60 findings, short one-line fields.
  */
-export function normalizeFirstReview(raw) {
+export function normalizeFirstReview(raw, env = {}) {
   let parsed;
   try { parsed = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { throw new UsageError('the first review file is not valid JSON'); }
   const arr = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.findings) ? parsed.findings : null;
   if (!arr) throw new UsageError('the first review must be a megalens.findings/v1 document or an array of findings');
   const findings = arr.filter((x) => x && typeof x === 'object' && !Array.isArray(x)).slice(0, 60).map((x, i) => {
-    const file = typeof x.file === 'string' && x.file && !x.file.startsWith('/') && !x.file.split('/').includes('..') ? oneLine(x.file, 300) : null;
+    const f1 = typeof x.file === 'string' ? oneLine(x.file, 300) : '';
+    const file = f1 && !f1.startsWith('/') && !f1.startsWith('-') && !f1.includes('\\') && !f1.includes('`') && !f1.split('/').some((seg) => seg === '' || seg === '.' || seg === '..') ? f1 : null;
+    const sc = (v, n) => scrub(oneLine(v, n), env);
     const ls = Number.isInteger(x.line_start) && x.line_start > 0 ? x.line_start : Number.isInteger(x.line) && x.line > 0 ? x.line : null;
     const le = Number.isInteger(x.line_end) && x.line_end >= (ls ?? 1) ? x.line_end : ls;
-    const title = oneLine(x.title ?? x.summary ?? x.claim, 200);
+    const title = sc(x.title ?? x.summary ?? x.claim, 200);
     return {
       id: `h${i + 1}`, file, line_start: ls, line_end: le, title,
-      claim: oneLine(x.claim ?? title, 600), failure_scenario: oneLine(x.failure_scenario ?? '', 600),
+      claim: sc(x.claim ?? title, 600), failure_scenario: sc(x.failure_scenario ?? '', 600),
       priority: PRIO.has(x.priority) ? x.priority : 'P2', strength: 'normal', found_by: ['first-review'],
     };
   }).filter((f) => f.title);
@@ -104,7 +115,12 @@ export function normalizeFirstReview(raw) {
 
 const EXIT_WORDS = { 3: 'refused by the MegaLens gateway (quota, spend cap or sign-in)', 4: 'failed or hit a local error' };
 
-function where(f) { return f.file ? `${oneLine(f.file, 200)}${f.line_start ? `:${f.line_start}${f.line_end && f.line_end !== f.line_start ? `-${f.line_end}` : ''}` : ''}` : '(no file named)'; }
+function where(f) {
+  const file = typeof f.file === 'string' && f.file ? oneLine(f.file, 200).replace(/`/g, "'") : null;
+  if (!file) return '(no file named)';
+  const pos = (n) => Number.isInteger(n) && n > 0;
+  return `${file}${pos(f.line_start) ? `:${f.line_start}${pos(f.line_end) && f.line_end !== f.line_start ? `-${f.line_end}` : ''}` : ''}`;
+}
 function bullet(f) {
   const lines = [`- **${PRIO.has(f.priority) ? f.priority : 'P?'}** \`${where(f)}\`: ${oneLine(f.title, 200)}`];
   if (f.claim && oneLine(f.claim, 600) !== oneLine(f.title, 200)) lines.push(`  - Problem: ${oneLine(f.claim, 600)}`);
@@ -112,8 +128,20 @@ function bullet(f) {
   return lines.join('\n');
 }
 const fromHost = (f) => Array.isArray(f.found_by) && f.found_by.includes('first-review');
-const fromEngine = (f) => !Array.isArray(f.found_by) || f.found_by.some((n) => n !== 'first-review');
+const fromEngine = (f) => !Array.isArray(f.found_by) || f.found_by.length === 0 || f.found_by.some((n) => n !== 'first-review');
 const sortF = (a, b) => String(a.priority).localeCompare(String(b.priority)) || String(a.file).localeCompare(String(b.file)) || (a.line_start ?? 0) - (b.line_start ?? 0);
+
+/**
+ * The document's own status is never trusted upward: refusal, a bad exit code, failed passes, or no engine pass
+ * that actually ran all downgrade it. (An empty reviewed diff yields status complete with no passes: nothing was reviewed.)
+ */
+export function effectiveStatus(doc, passes, failedPasses, exit) {
+  let st = ['complete', 'partial', 'failed'].includes(doc.status) ? doc.status : 'failed';
+  const enginePassOk = passes.some((p) => p && p.status === 'ok' && p.name !== 'first-review' && p.model !== 'supplied');
+  if (doc.refused === true || exit === 3 || exit === 4 || !enginePassOk) return 'failed';
+  if (st === 'complete' && (exit === 2 || failedPasses.length > 0)) st = 'partial';
+  return st;
+}
 
 /**
  * Render a result document as the text Claude shows the user.
@@ -124,9 +152,9 @@ export function renderResult(doc, { exit = 0, stderrText = '' } = {}) {
     const why = EXIT_WORDS[exit] ?? `ended with exit code ${exit} and no result`;
     return [`## MegaLens review: NOT COMPLETED`, '', `The review ${why}. There is no result, so nothing can be said about your change: this is not a clean review.`, stderrText ? `\nEngine said: ${oneLine(stderrText, 500)}` : ''].join('\n').trimEnd() + '\n';
   }
-  const status = ['complete', 'partial', 'failed'].includes(doc.status) ? doc.status : 'failed';
   const passes = Array.isArray(doc.passes) ? doc.passes : [];
   const failedPasses = passes.filter((p) => p && p.status === 'failed');
+  const status = effectiveStatus(doc, passes, failedPasses, exit);
   const out = [];
   const head = { complete: 'complete', partial: 'PARTIAL', failed: 'FAILED' }[status];
   out.push(`## MegaLens ${oneLine(doc.tier, 20)} review: ${head}`, '');

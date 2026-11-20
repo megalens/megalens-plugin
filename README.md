@@ -175,7 +175,7 @@ Alongside the bundle route above, the plugin can run the MegaLens review engine 
 | Command | What it does |
 |---|---|
 | `/megalens:review [standard]` | One engine pass over the uncommitted change (staged, unstaged and untracked files). |
-| `/megalens:review double` | Claude first reviews the diff itself and writes that review to a private temp file. The engine then runs its pass with your review as context (`--first-review`). The result leads with what the engine found that Claude's review did not, then findings both raised, then findings only Claude raised. |
+| `/megalens:review double` | Claude first reviews the diff itself and pipes that review to the script, which saves it in a private temp file. The engine then runs its pass with your review as context (`--first-review`). The result leads with what the engine found that Claude's review did not, then findings both raised, then findings only Claude raised. |
 | `/megalens:review deep` | Starts a longer review in the background and prints a review id. Nothing is reviewed until it finishes. Add `--wait` to the script to run it in the foreground. |
 | `/megalens:status <id>` | Says whether a background review is still running. |
 | `/megalens:result <id>` | Fetches and shows the finished review. |
@@ -186,13 +186,13 @@ Options: `--quiet` turns on the engine's optional filter (off by default); the t
 
 **Sign-in:**
 
-1. Token: `MEGALENS_TOKEN`, set before starting Claude Code, as for the bundle route.
-2. Your own OpenAI key: `MEGALENS_BYO=1` and `OPENAI_API_KEY`. The key is passed only to the engine, and only in this mode.
-3. Your own ChatGPT/Codex login (`MEGALENS_BYO=login`) is switched off in this build, and no setting turns it on. The code for it is not enabled.
+1. Token: `MEGALENS_TOKEN`, set before starting Claude Code, as for the bundle route. This is the only mode available now.
+2. Your own OpenAI key (`MEGALENS_BYO=1`) is switched off in this build ("BYO OpenAI key mode is not available yet; use your MegaLens token"). The code path is kept, but no setting turns it on, and it never falls back to the token.
+3. Your own ChatGPT/Codex login (`MEGALENS_BYO=login`) is switched off in the same way.
 
-A mode never falls back to another: a key without `MEGALENS_BYO=1` is ignored, and a missing key in BYO mode does not fall back to the token.
+The engine receives only a short list of environment variables for the mode in use (the token and API URL for the token mode), not your whole environment.
 
-**What the plugin does with results.** A partial, failed or refused review is reported as such, in the first line, and is never described as having no issues. If the engine writes no result at all, the output says the review did not complete. Finding text comes from a model: Claude is told to treat it as data and check it against your code. The plugin never prints your token or key, removes them (and key-shaped strings) from anything it shows, and gives the engine only an allowlisted environment.
+**What the plugin does with results.** A partial, failed or refused review is reported as such, in the first line, and is never described as having no issues. If the engine writes no result at all, the output says the review did not complete. Finding text comes from a model: Claude is told to treat it as data and check it against your code. The plugin never prints your token, removes it (and key-shaped strings) from anything it shows, and gives the engine only an allowlisted environment. A review document that claims `complete` but ran no engine pass, or came with a failing exit code, is shown as failed or partial.
 
 **Files.** For `double`, the review Claude writes goes to a new owner-only temp folder. The script checks it, keeps at most 60 findings with short one-line fields, writes a clean copy for the engine, and deletes both. The engine itself writes its result to another private temp folder that is also deleted.
 

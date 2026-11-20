@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Front end for the engine v2 CLI (`megalens-review`), used by /megalens:review, /megalens:status, /megalens:result.
 //   engine.mjs review [standard|double|deep] [--quiet] [--first-review FILE] [--base REF --head REF] [--wait]
-//   engine.mjs status <review-id>      engine.mjs result <review-id>      engine.mjs first-review-path
+//   engine.mjs status <review-id>      engine.mjs result <review-id>
+//   engine.mjs first-review-write      (reads the host's review JSON on stdin, writes a clean 0600 file in a private folder, prints its path)
 // Prints text for the user. Never prints credentials. Needs the engine binary: MEGALENS_REVIEW_BIN, else `megalens-review` on PATH.
 import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, statSync, lstatSync } from 'node:fs';
@@ -12,6 +13,19 @@ import { UsageError, parseReviewArgs, assertReviewId, chooseAuth, childEnv, scru
 
 const MAX_OUT = 1 << 22; // bytes we keep from the engine's output streams
 const MAX_FIRST_REVIEW = 1 << 20;
+const FIRST_REVIEW_NAME = 'first-review.json';
+const STATES = ['running', 'complete', 'partial', 'failed', 'cancelled'];
+const flat = (v, n) => String(v ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]+/g, ' ').trim().slice(0, n);
+async function readStdin() { let b = ''; process.stdin.setEncoding('utf8'); for await (const c of process.stdin) { b += c; if (b.length > MAX_FIRST_REVIEW * 2) break; } return b; }
+
+/** True only for the exact file `first-review-write` makes: <tmpdir>/megalens-XXXXXX/first-review.json, in a real (non-link) folder. */
+function isOurFirstReview(p) {
+  try {
+    const dir = path.dirname(p);
+    if (path.basename(p) !== FIRST_REVIEW_NAME || path.dirname(dir) !== tmpdir() || !/^megalens-[A-Za-z0-9_-]{6,}$/.test(path.basename(dir))) return false;
+    const st = lstatSync(dir); return st.isDirectory() && !st.isSymbolicLink();
+  } catch { return false; }
+}
 
 function runBin(bin, args, { env, cwd }) {
   return new Promise((resolve) => {
@@ -27,16 +41,21 @@ function runBin(bin, args, { env, cwd }) {
 
 const privateDir = () => mkdtempSync(path.join(tmpdir(), 'megalens-'), { mode: 0o700 });
 
-export async function main(argv, { env = process.env, cwd = process.cwd(), out = (s) => process.stdout.write(s), err = (s) => process.stderr.write(s) } = {}) {
+export async function main(argv, { env = process.env, cwd = process.cwd(), out = (s) => process.stdout.write(s), err = (s) => process.stderr.write(s), stdin = () => readStdin(), flags = {} } = {}) {
   const [cmd, ...rest] = argv;
   const say = (t) => out(scrub(t, env));
   try {
-    if (cmd === 'first-review-path') {
-      const d = privateDir(); say(path.join(d, 'first-review.json') + '\n'); return 0;
+    if (cmd === 'first-review-write') {
+      const raw = await stdin();
+      if (Buffer.byteLength(raw) > MAX_FIRST_REVIEW) throw new UsageError('the first review is over 1 MB');
+      const clean = normalizeFirstReview(raw, env); // throws before any file exists
+      const d = privateDir(); const p = path.join(d, FIRST_REVIEW_NAME);
+      writeFileSync(p, JSON.stringify(clean), { mode: 0o600 });
+      say(p + '\n'); return 0;
     }
     if (!['review', 'status', 'result'].includes(cmd)) throw new UsageError('usage: engine.mjs review|status|result ...');
 
-    const auth = chooseAuth(env);
+    const auth = chooseAuth(env, flags);
     if (auth.error) { say(`MegaLens engine not started: ${auth.error}\n`); return 4; }
     const bin = env.MEGALENS_REVIEW_BIN || 'megalens-review';
     const base = { env: childEnv(env, auth.mode), cwd };
@@ -46,10 +65,16 @@ export async function main(argv, { env = process.env, cwd = process.cwd(), out =
       const r = await runBin(bin, ['status', id], base);
       if (r.code === 127) { say(missingBin()); return 4; }
       let j; try { j = JSON.parse(r.stdout); } catch { j = null; }
-      if (r.code !== 0 || !j) { say(`Could not read the status of ${id}: ${firstLine(r.stderr) || 'no answer from the engine'}. This is not a finished review.\n`); return 4; }
-      const state = String(j.state);
-      const next = state === 'running' ? 'Still running. Check again with /megalens:status ' + id + '.' : `Finished (${state.slice(0, 30)}). Fetch it with /megalens:result ${id}.${j.reason ? ` Reason: ${String(j.reason).slice(0, 100)}.` : ''}`;
-      say(`Review ${id} (${String(j.tier ?? 'unknown tier').slice(0, 20)}): ${state.slice(0, 30)}. ${next}\n`); return 0;
+      if (r.code !== 0 || !j || typeof j.state !== 'string' || !STATES.includes(j.state)) { say(`Could not read the status of ${id}: ${firstLine(r.stderr) || 'no usable answer from the engine'}. This is not a finished review.\n`); return 4; }
+      const tier = flat(j.tier ?? 'unknown tier', 20); const reason = j.reason ? ` Reason: ${flat(j.reason, 100)}.` : '';
+      const msg = {
+        running: `Still running. Check again with /megalens:status ${id}.`,
+        complete: `Finished. Fetch it with /megalens:result ${id}.`,
+        partial: `PARTIAL: part of the review did not finish, so it is not a clean review.${reason} Fetch what exists with /megalens:result ${id}.`,
+        failed: `FAILED: the review did not complete, so it is not a clean review and says nothing about your change.${reason} /megalens:result ${id} shows what the engine recorded.`,
+        cancelled: `CANCELLED: the review did not complete, so it says nothing about your change.${reason}`,
+      }[j.state];
+      say(`Review ${id} (${tier}): ${j.state}. ${msg}\n`); return 0;
     }
 
     if (cmd === 'result') {
@@ -62,19 +87,16 @@ export async function main(argv, { env = process.env, cwd = process.cwd(), out =
     if (o.base !== null) args.push('--target', 'range', '--base', o.base, '--head', o.head);
     if (o.quiet) args.push('--quiet');
 
-    let tmpDirs = [];
+    let tmpDirs = []; const p = o.firstReview !== null ? path.resolve(cwd, o.firstReview) : null;
     try {
       if (o.firstReview !== null) {
-        const p = path.resolve(cwd, o.firstReview);
         const st = lstatSync(p);
         if (!st.isFile()) throw new UsageError('the first review path must be a regular file, not a link or folder');
         if (st.size > MAX_FIRST_REVIEW) throw new UsageError('the first review file is over 1 MB');
-        const clean = normalizeFirstReview(readFileSync(p, 'utf8'));
+        const clean = normalizeFirstReview(readFileSync(p, 'utf8'), env);
         const d = privateDir(); tmpDirs.push(d);
         const np = path.join(d, 'first-review.json'); writeFileSync(np, JSON.stringify(clean), { mode: 0o600 });
         args.push('--first-review', np);
-        // delete only the file we asked the host to create (inside a megalens- temp dir), never an arbitrary user path
-        try { if (path.basename(path.dirname(p)).startsWith('megalens-') && path.dirname(p).startsWith(tmpdir())) { rmSync(p, { force: true }); rmSync(path.dirname(p), { recursive: false, force: true }); } } catch { /* best effort */ }
         say(`Using your own review (${clean.findings.length} finding${clean.findings.length === 1 ? '' : 's'}) as context for the engine.\n`);
       } else if (o.tier === 'double') {
         say('Note: no review of your own was supplied, so the engine runs its own cheap first pass instead.\n');
@@ -89,7 +111,11 @@ export async function main(argv, { env = process.env, cwd = process.cwd(), out =
         return 0;
       }
       return await fetchAndRender(bin, args, base, say, env);
-    } finally { for (const d of tmpDirs) rmSync(d, { recursive: true, force: true }); }
+    } finally {
+      for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
+      // the host's file is deleted whether or not it validated, but only if it is exactly the file first-review-write made
+      if (p !== null && isOurFirstReview(p)) rmSync(path.dirname(p), { recursive: true, force: true });
+    }
   } catch (e) {
     if (e instanceof UsageError) { say(`${e.message}\n`); return 4; }
     err(scrub(`megalens engine front end error: ${String(e?.message ?? e).slice(0, 200)}\n`, env)); return 4;
@@ -116,7 +142,7 @@ async function fetchAndRender(bin, args, base, say, env) {
     if (!doc && /still running/i.test(r.stderr)) { say('That review is still running, so there is no result yet. Nothing has been found or ruled out. Check with /megalens:status.\n'); return 4; }
     if (!doc && /unknown review id/i.test(r.stderr)) { say('The engine does not know that review id (wrong id, or it was cleaned up). No result.\n'); return 4; }
     say(renderResult(doc, { exit: r.code, stderrText: scrub(firstLine(r.stderr), env) }));
-    return r.code;
+    return r.code !== 0 ? r.code : (!doc || doc.status === 'failed' || !doc.passes?.some?.((x) => x?.status === 'ok' && x.name !== 'first-review') ? 4 : 0);
   } finally { rmSync(d, { recursive: true, force: true }); }
 }
 
