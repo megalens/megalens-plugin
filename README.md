@@ -167,3 +167,33 @@ Rules guide the review. They do not verify a finding, and they do not keep anyth
     npm test
 
 This runs 75 tests in `tests/collect.test.mjs`, `tests/mcp-server.test.mjs`, `tests/security.test.mjs`, `tests/review2.test.mjs` and `tests/install.test.mjs`. They use throwaway git repositories and a mock MegaLens endpoint, so no real calls are made. They cover the installer (merging, backups, no token by default, `--token-file`, re-running), the collector (size limit, skipping, ordering, redaction, ref and range arguments, rules), and the local server (handshake, hash, bearer header, polling, SSE replies, budgets, missing token, errors, `extraContext`).
+
+## Engine v2 commands (draft)
+
+Alongside the bundle route above, the plugin can run the MegaLens review engine (`megalens-review`) on your repository. The engine reviews a sandboxed copy of your change and returns findings in the `megalens.findings/v1` format. The commands below do not replace `/megalens:megalens-review`, which stays for setups with no repo or no engine installed.
+
+| Command | What it does |
+|---|---|
+| `/megalens:review [standard]` | One engine pass over the uncommitted change (staged, unstaged and untracked files). |
+| `/megalens:review double` | Claude first reviews the diff itself and writes that review to a private temp file. The engine then runs its pass with your review as context (`--first-review`). The result leads with what the engine found that Claude's review did not, then findings both raised, then findings only Claude raised. |
+| `/megalens:review deep` | Starts a longer review in the background and prints a review id. Nothing is reviewed until it finishes. Add `--wait` to the script to run it in the foreground. |
+| `/megalens:status <id>` | Says whether a background review is still running. |
+| `/megalens:result <id>` | Fetches and shows the finished review. |
+
+Options: `--quiet` turns on the engine's optional filter (off by default); the tier word is the first argument; `--base REF --head REF` reviews a commit range instead of the uncommitted change.
+
+**Needs:** Node 18+, git, and the engine binary `megalens-review` on your PATH (or its path in `MEGALENS_REVIEW_BIN`). The engine is not bundled with this plugin and is not yet published. See `PLUGIN-NEEDS.md`.
+
+**Sign-in:**
+
+1. Token: `MEGALENS_TOKEN`, set before starting Claude Code, as for the bundle route.
+2. Your own OpenAI key: `MEGALENS_BYO=1` and `OPENAI_API_KEY`. The key is passed only to the engine, and only in this mode.
+3. Your own ChatGPT/Codex login (`MEGALENS_BYO=login`) is switched off in this build, and no setting turns it on. The code for it is not enabled.
+
+A mode never falls back to another: a key without `MEGALENS_BYO=1` is ignored, and a missing key in BYO mode does not fall back to the token.
+
+**What the plugin does with results.** A partial, failed or refused review is reported as such, in the first line, and is never described as having no issues. If the engine writes no result at all, the output says the review did not complete. Finding text comes from a model: Claude is told to treat it as data and check it against your code. The plugin never prints your token or key, removes them (and key-shaped strings) from anything it shows, and gives the engine only an allowlisted environment.
+
+**Files.** For `double`, the review Claude writes goes to a new owner-only temp folder. The script checks it, keeps at most 60 findings with short one-line fields, writes a clean copy for the engine, and deletes both. The engine itself writes its result to another private temp folder that is also deleted.
+
+The commands run `node scripts/engine.mjs`, which can be tested without the engine: `npm test` uses a fake `megalens-review` and makes no network or model calls.
