@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Front end for the engine v2 CLI (`megalens-review`), used by /megalens:review, /megalens:status, /megalens:result.
-//   engine.mjs review [standard|double|deep] [--quiet] [--first-review FILE] [--base REF --head REF] [--wait]
+//   engine.mjs review [standard|deep]   (double exists but is off: DOUBLE_TIER_ENABLED) [--quiet] [--first-review FILE] [--base REF --head REF] [--wait]
 //   engine.mjs status <review-id>      engine.mjs result <review-id>
 //   engine.mjs first-review-write      (reads the host's review JSON on stdin, writes a clean 0600 file in a private folder, prints its path)
 // Prints text for the user. Never prints credentials. Needs the engine binary: MEGALENS_REVIEW_BIN, else `megalens-review` on PATH.
@@ -10,7 +10,7 @@ import { secretPath } from './lib/safety.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { REF_RE, UsageError, parseReviewArgs, assertReviewId, chooseAuth, childEnv, scrub, normalizeFirstReview, renderResult } from './lib/engine-core.mjs';
+import { DOUBLE_TIER_ENABLED, DOUBLE_OFF_MESSAGE, REF_RE, UsageError, parseReviewArgs, assertReviewId, chooseAuth, childEnv, scrub, normalizeFirstReview, renderResult } from './lib/engine-core.mjs';
 
 const MAX_OUT = 1 << 22; // bytes we keep from the engine's output streams
 const MAX_FIRST_REVIEW = 1 << 20;
@@ -106,6 +106,7 @@ export async function main(argv, { env = process.env, cwd = process.cwd(), out =
     }
     if (!['review', 'status', 'result'].includes(cmd)) throw new UsageError('usage: engine.mjs review|status|result|show-change|install|verify ...');
 
+    if (cmd === 'review' && rest.some((a, i) => a === 'double' && !['--base', '--head', '--first-review'].includes(rest[i - 1])) && !(flags.double ?? DOUBLE_TIER_ENABLED)) { say(DOUBLE_OFF_MESSAGE + '\n'); return 4; } // before auth: nothing else is touched
     const auth = chooseAuth(env, flags);
     if (auth.error) { say(`MegaLens engine not started: ${auth.error}\n`); return 4; }
     const bin = env.MEGALENS_REVIEW_BIN || 'megalens-review';
@@ -133,7 +134,7 @@ export async function main(argv, { env = process.env, cwd = process.cwd(), out =
       return await fetchAndRender(bin, ['result', id], base, say, env);
     }
 
-    const o = parseReviewArgs(rest);
+    const o = parseReviewArgs(rest, flags);
     const args = ['run', '--tier', o.tier];
     if (o.base !== null) args.push('--target', 'range', '--base', o.base, '--head', o.head);
     if (o.quiet) args.push('--quiet');

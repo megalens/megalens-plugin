@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync, symlinkSync, mkdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { parseReviewArgs, chooseAuth, childEnv, scrub, normalizeFirstReview, renderResult, BYO_LOGIN_ENABLED, BYO_KEY_ENABLED, UsageError } from '../scripts/lib/engine-core.mjs';
+import { parseReviewArgs, chooseAuth, childEnv, scrub, normalizeFirstReview, renderResult, BYO_LOGIN_ENABLED, BYO_KEY_ENABLED, DOUBLE_TIER_ENABLED, UsageError } from '../scripts/lib/engine-core.mjs';
 import { main, cleanupFirstReview } from '../scripts/engine.mjs';
 import { execFileSync } from 'node:child_process';
 
@@ -33,7 +33,9 @@ process.exit(s.exit || 0);
   const calls = () => (existsSync(path.join(d, 'calls.jsonl')) ? readFileSync(path.join(d, 'calls.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : []);
   return { bin, calls, dir: d };
 }
-async function run(argv, { scenario = {}, env = {}, flags = {}, stdin, cwd } = {}) {
+// Double is off in production; the existing double tests turn it on through the test-only `flags` argument.
+async function run(argv, { scenario = {}, env = {}, flags: fl = {}, stdin, cwd } = {}) {
+  const flags = { double: true, ...fl };
   const f = fake(scenario); let text = ''; let errText = '';
   const code = await main(argv, { env: { PATH: process.env.PATH, HOME: tmpdir(), MEGALENS_TOKEN: TOKEN, MEGALENS_REVIEW_BIN: f.bin, ...env }, cwd: cwd ?? tmpdir(), out: (s) => { text += s; }, err: (s) => { errText += s; }, flags, ...(stdin !== undefined ? { stdin: async () => stdin } : {}) });
   return { code, text, errText, calls: f.calls(), f };
@@ -45,9 +47,9 @@ test('command parsing: tiers, quiet, range, rejects junk', () => {
   assert.deepEqual(parseReviewArgs([]), { tier: 'standard', quiet: false, firstReview: null, base: null, head: null, wait: false });
   assert.equal(parseReviewArgs(['deep', '--quiet']).tier, 'deep');
   assert.equal(parseReviewArgs(['deep', '--quiet']).quiet, true);
-  assert.equal(parseReviewArgs(['double', '--first-review', '/t/x.json']).firstReview, '/t/x.json');
+  assert.equal(parseReviewArgs(['double', '--first-review', '/t/x.json'], { double: true }).firstReview, '/t/x.json');
   assert.deepEqual([parseReviewArgs(['--base', 'main', '--head', 'abc123']).base, parseReviewArgs(['--base', 'main', '--head', 'abc123']).head], ['main', 'abc123']);
-  for (const bad of [['triple'], ['--model', 'x'], ['standard', 'double'], ['--base', 'main'], ['--base', '--evil', '--head', 'x'], ['--base', '-x', '--head', 'y'], ['--base', 'a;rm', '--head', 'b'], ['standard', '--first-review', 'f']])
+  for (const bad of [['triple'], ['--model', 'x'], ['standard', 'deep'], ['--base', 'main'], ['--base', '--evil', '--head', 'x'], ['--base', '-x', '--head', 'y'], ['--base', 'a;rm', '--head', 'b'], ['standard', '--first-review', 'f']])
     assert.throws(() => parseReviewArgs(bad), UsageError, JSON.stringify(bad));
 });
 
@@ -307,10 +309,11 @@ test('R6: rendering cannot be broken out of by file, line numbers, separators or
 
 test('R7: command files: staged changes, no secret files, stdin writer instead of a Write tool, ids checked in status/result', () => {
   const rd = (n) => readFileSync(new URL(`../commands/${n}.md`, import.meta.url), 'utf8');
-  const rv = rd('review');
+  const rv = readFileSync(new URL('../docs/double-tier-later.md', import.meta.url), 'utf8'); // the double steps live here while the tier is off
+  const rc = rd('review'); assert.ok(!/first-review-write|show-change|double/i.test(rc.replace(/If the user asks for `double`[^.]*\.[^.]*\./, '')), 'the command file no longer carries the double flow');
   assert.match(rv, /engine\.mjs show-change/);
   assert.match(rv, /never read credential or secret files[^.]*\.env/i); assert.match(rv, /untrusted data/); assert.match(rv, /first-review-write/);
-  assert.ok(!/first-review-path/.test(rv)); assert.ok(!/allowed-tools:[^\n]*Write/.test(rv)); assert.match(rv.split('\n').find((l) => l.startsWith('allowed-tools')), /engine\.mjs:\*/);
+  assert.ok(!/first-review-path/.test(rv)); assert.match(rc.split('\n').find((l) => l.startsWith('allowed-tools')), /engine\.mjs:\*/); assert.ok(!/allowed-tools:[^\n]*Write/.test(rc));
   for (const n of ['status', 'result']) assert.match(rd(n), /exactly one review id of the form `rv_`[\s\S]*run nothing/, n);
 });
 
@@ -385,4 +388,31 @@ test('engine alignment: exit 3 from the engine (refusals, BYO) and a numeric san
   const t = renderResult(doc({ sandbox: { excluded_files: 3 }, notes: Array.from({ length: 10 }, (_, i) => `note ${i}`) }));
   assert.match(t, /3 file\(s\) were left out/); assert.match(t, /note 9/);
   assert.match(renderResult(null, { exit: 3, stderrText: 'refused by the MegaLens gateway: BYO key mode is not available yet' }), /NOT COMPLETED[\s\S]*refused/);
+});
+
+// ---- Owner decision: launch tiers are Standard and Deep only ----
+test('Double is OFF by constant: refused by default, engine never called, no env or flag switch', async () => {
+  assert.equal(DOUBLE_TIER_ENABLED, false);
+  const MSG = 'The Double tier is not available yet; use standard or deep.';
+  assert.throws(() => parseReviewArgs(['double']), (e) => e instanceof UsageError && e.message === MSG);
+  // main called exactly as production does: no flags at all
+  const f = fake({ run: { doc: doc({ tier: 'double' }) } }); let text = '';
+  const env = { PATH: process.env.PATH, HOME: tmpdir(), MEGALENS_TOKEN: TOKEN, MEGALENS_REVIEW_BIN: f.bin, MEGALENS_ENABLE_DOUBLE: '1', DOUBLE_TIER_ENABLED: 'true', MEGALENS_DOUBLE: '1' };
+  for (const argv of [['review', 'double'], ['review', 'double', '--quiet'], ['review', 'double', '--first-review', '/tmp/x.json']]) {
+    text = ''; const code = await main(argv, { env, cwd: tmpdir(), out: (s) => { text += s; } });
+    assert.equal(code, 4); assert.equal(text.trim(), MSG); }
+  assert.equal(f.calls().length, 0, 'the engine was never called');
+  // refused even with no credentials, and standard/deep are unaffected
+  text = ''; await main(['review', 'double'], { env: { PATH: process.env.PATH, MEGALENS_REVIEW_BIN: f.bin }, cwd: tmpdir(), out: (s) => { text += s; } }); assert.equal(text.trim(), MSG);
+  // a ref that is merely named double is not mistaken for the tier
+  const r = await run(['review', 'standard', '--base', 'double', '--head', 'main'], { flags: { double: false }, scenario: { run: { doc: doc() } } }); assert.equal(r.code, 0);
+  const s = await run(['review', 'standard'], { flags: { double: false }, scenario: { run: { doc: doc() } } }); assert.equal(s.code, 0);
+  const dp = await run(['review', 'deep'], { flags: { double: false }, scenario: { run: { stdout: '{"review_id":"rv_deep12345","state":"running"}' } } }); assert.equal(dp.code, 0);
+  const x = await run(['review', 'double'], { flags: { double: false } }); assert.equal(x.calls.length, 0); assert.equal(x.text.trim(), MSG);
+});
+
+test('Double usage text is gone from the command, the README launch section keeps a later note', () => {
+  const rc = readFileSync(new URL('../commands/review.md', import.meta.url), 'utf8'); const head = rc.split('\n').slice(0, 4).join('\n');
+  assert.ok(!/double/i.test(head)); assert.match(head, /\[standard\|deep\]/);
+  const rm = readFileSync(new URL('../README.md', import.meta.url), 'utf8'); assert.ok(!/\| `\/megalens:review double`/.test(rm)); assert.match(rm, /Double[^.\n]*later/i);
 });

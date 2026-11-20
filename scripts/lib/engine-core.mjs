@@ -7,6 +7,10 @@ export const BYO_LOGIN_ENABLED = false;
 // Owner decision 20 Nov 2026 (CONTRACT section 7): BYO OpenAI key mode is OFF for now. Same rule: a constant, no env or flag switch.
 // The code path stays; tests turn it on only through the `flags` argument that production code never passes.
 export const BYO_KEY_ENABLED = false;
+// Owner decision 20 Nov 2026: launch tiers are Standard and Deep only. Same rule: a constant, no env or flag switch.
+// Tests turn it on only through the `flags` argument that production code never passes. The double code paths stay.
+export const DOUBLE_TIER_ENABLED = false;
+export const DOUBLE_OFF_MESSAGE = 'The Double tier is not available yet; use standard or deep.';
 
 export const TIERS = ['standard', 'double', 'deep'];
 export const REVIEW_ID_RE = /^rv_[A-Za-z0-9_-]{6,64}$/;
@@ -15,7 +19,7 @@ export const REF_RE = /^[A-Za-z0-9][A-Za-z0-9._\/~^@-]{0,99}$/;
 export class UsageError extends Error {}
 
 /** `review [standard|double|deep] [--quiet] [--first-review FILE] [--base REF --head REF] [--wait]` */
-export function parseReviewArgs(argv) {
+export function parseReviewArgs(argv, flags = {}) {
   const o = { tier: 'standard', quiet: false, firstReview: null, base: null, head: null, wait: false };
   let tierSeen = false;
   for (let i = 0; i < argv.length; i++) {
@@ -29,6 +33,7 @@ export function parseReviewArgs(argv) {
     else if (a === '--head') o.head = val();
     else throw new UsageError(`unknown argument: ${String(a).slice(0, 40)}. Use: /megalens:review [standard|double|deep] [--quiet]`);
   }
+  if (o.tier === 'double' && !(flags.double ?? DOUBLE_TIER_ENABLED)) throw new UsageError(DOUBLE_OFF_MESSAGE);
   for (const [k, v] of [['--base', o.base], ['--head', o.head]]) if (v !== null && !REF_RE.test(v)) throw new UsageError(`${k} is not a plain git ref or sha`);
   if ((o.base === null) !== (o.head === null)) throw new UsageError('--base and --head go together');
   if (o.firstReview !== null && o.tier !== 'double') throw new UsageError('--first-review is for the double tier');

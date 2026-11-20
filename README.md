@@ -175,12 +175,13 @@ Alongside the bundle route above, the plugin can run the MegaLens review engine 
 | Command | What it does |
 |---|---|
 | `/megalens:review [standard]` | One engine pass over the uncommitted change (staged, unstaged and untracked files). |
-| `/megalens:review double` | Claude first reviews the diff itself and pipes that review to the script, which saves it in a private temp file. The engine then runs its pass with your review as context (`--first-review`). The result leads with what the engine found that Claude's review did not, then findings both raised, then findings only Claude raised. |
 | `/megalens:review deep` | Starts a longer review in the background and prints a review id. Nothing is reviewed until it finishes. Add `--wait` to the script to run it in the foreground. |
 | `/megalens:status <id>` | Says whether a background review is still running. |
 | `/megalens:result <id>` | Fetches and shows the finished review. |
 
-Options: `--quiet` turns on the engine's optional filter (off by default); the tier word is the first argument; `--base REF --head REF` reviews a commit range instead of the uncommitted change.
+**Later:** a Double tier (Claude reviews first, the engine's pass then gets that review as context) is built but not available at launch; `/megalens:review double` answers "The Double tier is not available yet; use standard or deep." and does not call the engine. Its steps are kept in `docs/double-tier-later.md`.
+
+Options: `--quiet` turns on the engine's optional filter (off by default); the tier word (standard or deep) is the first argument; `--base REF --head REF` reviews a commit range instead of the uncommitted change.
 
 **Needs:** Node 18+, git, and the engine binary `megalens-review` on your PATH (or its path in `MEGALENS_REVIEW_BIN`). The engine is not bundled with this plugin and is not yet published. See `PLUGIN-NEEDS.md`.
 
@@ -198,6 +199,6 @@ The engine receives only a short list of environment variables for the mode in u
 
 **What the plugin does with results.** A partial, failed or refused review is reported as such, in the first line, and is never described as having no issues. If the engine writes no result at all, the output says the review did not complete. Finding text comes from a model: Claude is told to treat it as data and check it against your code. The plugin never prints your token, removes it (and key-shaped strings) from anything it shows, and gives the engine only an allowlisted environment. A review document that claims `complete` but ran no engine pass, or came with a failing exit code, is shown as failed or partial.
 
-**Files.** For `double`, the review Claude writes goes to a new owner-only temp folder. The script checks it, keeps at most 60 findings with short one-line fields, writes a clean copy for the engine, and deletes both. The engine itself writes its result to another private temp folder that is also deleted.
+**Files.** The engine writes its result to a private temp folder that is deleted after the result is shown. (The later Double tier also uses an owner-only temp file for Claude's own review, checked, capped at 60 findings, and deleted.)
 
 The commands run `node scripts/engine.mjs`, which can be tested without the engine: `npm test` uses a fake `megalens-review` and makes no network or model calls.
