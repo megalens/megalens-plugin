@@ -184,6 +184,10 @@ Options: `--quiet` turns on the engine's optional filter (off by default); the t
 
 **Needs:** Node 18+, git, and the engine binary `megalens-review` on your PATH (or its path in `MEGALENS_REVIEW_BIN`). The engine is not bundled with this plugin and is not yet published. See `PLUGIN-NEEDS.md`.
 
+**First-time setup:** run `node scripts/engine.mjs install` once. It calls the engine's own `install`, which downloads the pinned Codex CLI and refuses unless its hashes match; `node scripts/engine.mjs verify` re-checks it. Claude is told never to run `install` by itself. The engine needs Linux with bubblewrap, and refuses to run as root, so on a root shell every review ends "NOT COMPLETED".
+
+`/megalens:review` pre-approves only `node scripts/engine.mjs ...`. To show Claude the change it uses `engine.mjs show-change`, which runs fixed git commands itself (with the repository's own git config, external diff and file-watcher settings switched off) and does not list credential-named files.
+
 **Sign-in:**
 
 1. Token: `MEGALENS_TOKEN`, set before starting Claude Code, as for the bundle route. This is the only mode available now.

@@ -5,11 +5,12 @@
 //   engine.mjs first-review-write      (reads the host's review JSON on stdin, writes a clean 0600 file in a private folder, prints its path)
 // Prints text for the user. Never prints credentials. Needs the engine binary: MEGALENS_REVIEW_BIN, else `megalens-review` on PATH.
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync, statSync, lstatSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, statSync, lstatSync, readdirSync, unlinkSync, rmdirSync } from 'node:fs';
+import { secretPath } from './lib/safety.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { UsageError, parseReviewArgs, assertReviewId, chooseAuth, childEnv, scrub, normalizeFirstReview, renderResult } from './lib/engine-core.mjs';
+import { REF_RE, UsageError, parseReviewArgs, assertReviewId, chooseAuth, childEnv, scrub, normalizeFirstReview, renderResult } from './lib/engine-core.mjs';
 
 const MAX_OUT = 1 << 22; // bytes we keep from the engine's output streams
 const MAX_FIRST_REVIEW = 1 << 20;
@@ -18,13 +19,55 @@ const STATES = ['running', 'complete', 'partial', 'failed', 'cancelled'];
 const flat = (v, n) => String(v ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]+/g, ' ').trim().slice(0, n);
 async function readStdin() { let b = ''; process.stdin.setEncoding('utf8'); for await (const c of process.stdin) { b += c; if (b.length > MAX_FIRST_REVIEW * 2) break; } return b; }
 
-/** True only for the exact file `first-review-write` makes: <tmpdir>/megalens-XXXXXX/first-review.json, in a real (non-link) folder. */
-function isOurFirstReview(p) {
+/**
+ * Delete the host's first-review file, and its folder, only when it is exactly what `first-review-write` makes:
+ * <tmpdir>/megalens-XXXXXX/first-review.json, a regular file, in a real folder owned by us with mode 0700 that holds
+ * nothing else. Never recursive: a repository that happens to sit at a look-alike path is never touched.
+ */
+export function cleanupFirstReview(p) {
   try {
     const dir = path.dirname(p);
     if (path.basename(p) !== FIRST_REVIEW_NAME || path.dirname(dir) !== tmpdir() || !/^megalens-[A-Za-z0-9_-]{6,}$/.test(path.basename(dir))) return false;
-    const st = lstatSync(dir); return st.isDirectory() && !st.isSymbolicLink();
+    const ds = lstatSync(dir);
+    if (!ds.isDirectory() || ds.isSymbolicLink() || (ds.mode & 0o777) !== 0o700 || (typeof process.getuid === 'function' && ds.uid !== process.getuid())) return false;
+    if (!lstatSync(p).isFile()) return false;
+    const names = readdirSync(dir); if (names.length !== 1 || names[0] !== FIRST_REVIEW_NAME) return false;
+    unlinkSync(p); rmdirSync(dir); return true;
   } catch { return false; }
+}
+
+const GIT_CAP = 400_000;
+function runGit(args, cwd) {
+  return new Promise((resolve) => {
+    const env = { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', GIT_CONFIG_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C' };
+    const c = spawn('git', ['--no-pager', '-c', 'core.quotepath=off', '-c', 'diff.external=', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', ...args], { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = ''; let truncated = false;
+    c.stdout.on('data', (d) => { if (out.length < GIT_CAP) out += d; else truncated = true; });
+    c.stderr.resume(); c.on('error', () => resolve({ code: 127, out: '', truncated })); c.on('close', (code) => resolve({ code: code ?? 4, out, truncated }));
+  });
+}
+
+/** What the engine will review, from fixed git commands only. Lets /megalens:review pre-approve this script and no raw git. */
+async function showChange(rest, cwd, say) {
+  const o = parseReviewArgs(['standard', ...rest]);
+  const cap = (r) => r.out + (r.truncated ? '\n[output cut at 400 KB]\n' : '');
+  if (o.base === null) {
+    const st = await runGit(['status', '--short'], cwd);
+    if (st.code !== 0) { say('Not a git repository, or git failed. Nothing to show.\n'); return 4; }
+    const df = await runGit(['diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--'], cwd);
+    if (df.code !== 0) { say('git diff HEAD failed (a repository with no commits yet?). Nothing to show.\n'); return 4; }
+    const un = await runGit(['ls-files', '--others', '--exclude-standard'], cwd);
+    const names = un.out.split('\n').filter(Boolean); const safe = names.filter((n) => !secretPath(n)); const hidden = names.length - safe.length;
+    const stLines = st.out.split('\n').filter(Boolean); const stSafe = stLines.filter((l) => !secretPath(l.slice(3).replace(/^.* -> /, '').replace(/^"|"$/g, '')));
+    say(`=== git status --short ===\n${stSafe.join('\n')}${stLines.length > stSafe.length ? `\n[${stLines.length - stSafe.length} credential-like path(s) not shown]` : ''}\n\n=== git diff HEAD (staged and unstaged) ===\n${cap(df)}\n=== untracked files (read these yourself; never secret files) ===\n${safe.join('\n')}\n${hidden ? `[${hidden} untracked file(s) with credential-like names are not listed and must not be read]\n` : ''}`);
+    return 0;
+  }
+  const mb = await runGit(['merge-base', '--', o.base, o.head], cwd);
+  const sha = mb.out.trim();
+  if (mb.code !== 0 || !/^[0-9a-f]{40,64}$/.test(sha)) { say('Could not find a merge base for that range.\n'); return 4; }
+  const df = await runGit(['diff', '--no-ext-diff', '--no-textconv', `${sha}..${o.head}`, '--'], cwd);
+  say(`=== git diff ${sha}..${o.head} (merge-base of the two refs to the head ref) ===\n${cap(df)}\nUntracked files are not part of a range review.\n`);
+  return df.code === 0 ? 0 : 4;
 }
 
 function runBin(bin, args, { env, cwd }) {
@@ -53,7 +96,15 @@ export async function main(argv, { env = process.env, cwd = process.cwd(), out =
       writeFileSync(p, JSON.stringify(clean), { mode: 0o600 });
       say(p + '\n'); return 0;
     }
-    if (!['review', 'status', 'result'].includes(cmd)) throw new UsageError('usage: engine.mjs review|status|result ...');
+    if (cmd === 'show-change') return await showChange(rest, cwd, say);
+    if (cmd === 'install' || cmd === 'verify') {
+      // The engine's own commands: `install` is the only thing that downloads (the pinned Codex CLI, hash-checked). No credentials involved.
+      const r = await runBin(env.MEGALENS_REVIEW_BIN || 'megalens-review', [cmd], { env: childEnv(env, 'none'), cwd });
+      if (r.code === 127) { say(missingBin()); return 4; }
+      say(`${cmd === 'install' ? 'Engine install' : 'Engine verify'} ${r.code === 0 ? 'finished' : `FAILED (exit ${r.code})`}.\n${firstLine(r.stderr) ? `Engine said: ${firstLine(r.stderr)}\n` : ''}${r.code === 0 ? '' : 'The pinned Codex CLI is not verified, so reviews will not run.\n'}`);
+      return r.code;
+    }
+    if (!['review', 'status', 'result'].includes(cmd)) throw new UsageError('usage: engine.mjs review|status|result|show-change|install|verify ...');
 
     const auth = chooseAuth(env, flags);
     if (auth.error) { say(`MegaLens engine not started: ${auth.error}\n`); return 4; }
@@ -113,8 +164,8 @@ export async function main(argv, { env = process.env, cwd = process.cwd(), out =
       return await fetchAndRender(bin, args, base, say, env);
     } finally {
       for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
-      // the host's file is deleted whether or not it validated, but only if it is exactly the file first-review-write made
-      if (p !== null && isOurFirstReview(p)) rmSync(path.dirname(p), { recursive: true, force: true });
+      // the host's file is deleted whether or not it validated, but only if it is exactly the file first-review-write made, and never recursively
+      if (p !== null) cleanupFirstReview(p);
     }
   } catch (e) {
     if (e instanceof UsageError) { say(`${e.message}\n`); return 4; }
@@ -124,7 +175,7 @@ export async function main(argv, { env = process.env, cwd = process.cwd(), out =
 
 const REVIEW_ID = (s) => typeof s === 'string' && /^rv_[A-Za-z0-9_-]{6,64}$/.test(s);
 const firstLine = (s) => String(s ?? '').split('\n').map((x) => x.trim()).filter(Boolean).slice(-1)[0]?.slice(0, 300) ?? '';
-const missingBin = () => 'The engine is not installed: `megalens-review` was not found on PATH (set MEGALENS_REVIEW_BIN to its path). No review ran. /megalens:megalens-review (the bundle route) still works with a token.\n';
+const missingBin = () => 'The engine is not installed: `megalens-review` was not found on PATH (set MEGALENS_REVIEW_BIN to its path). Once it is, run `node scripts/engine.mjs install` once (it downloads the pinned Codex CLI and checks its hashes). No review ran. /megalens:megalens-review (the bundle route) still works with a token.\n';
 
 async function finishNoDoc(r, say, env) {
   if (r.code === 127) { say(missingBin()); return 4; }

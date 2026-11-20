@@ -4,7 +4,8 @@ import { mkdtempSync, writeFileSync, readFileSync, existsSync, chmodSync, rmSync
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { parseReviewArgs, chooseAuth, childEnv, scrub, normalizeFirstReview, renderResult, BYO_LOGIN_ENABLED, BYO_KEY_ENABLED, UsageError } from '../scripts/lib/engine-core.mjs';
-import { main } from '../scripts/engine.mjs';
+import { main, cleanupFirstReview } from '../scripts/engine.mjs';
+import { execFileSync } from 'node:child_process';
 
 const TOKEN = 'ml_SECRETTOKEN1234567890';
 const KEY = 'sk-SECRETOPENAIKEY1234567890';
@@ -32,9 +33,9 @@ process.exit(s.exit || 0);
   const calls = () => (existsSync(path.join(d, 'calls.jsonl')) ? readFileSync(path.join(d, 'calls.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : []);
   return { bin, calls, dir: d };
 }
-async function run(argv, { scenario = {}, env = {}, flags = {}, stdin } = {}) {
+async function run(argv, { scenario = {}, env = {}, flags = {}, stdin, cwd } = {}) {
   const f = fake(scenario); let text = ''; let errText = '';
-  const code = await main(argv, { env: { PATH: process.env.PATH, HOME: tmpdir(), MEGALENS_TOKEN: TOKEN, MEGALENS_REVIEW_BIN: f.bin, ...env }, cwd: tmpdir(), out: (s) => { text += s; }, err: (s) => { errText += s; }, flags, ...(stdin !== undefined ? { stdin: async () => stdin } : {}) });
+  const code = await main(argv, { env: { PATH: process.env.PATH, HOME: tmpdir(), MEGALENS_TOKEN: TOKEN, MEGALENS_REVIEW_BIN: f.bin, ...env }, cwd: cwd ?? tmpdir(), out: (s) => { text += s; }, err: (s) => { errText += s; }, flags, ...(stdin !== undefined ? { stdin: async () => stdin } : {}) });
   return { code, text, errText, calls: f.calls(), f };
 }
 const finding = (o) => ({ id: 'f1', file: 'src/a.js', line_start: 3, line_end: 4, title: 'Null deref', claim: 'x is null', failure_scenario: 'call with no args', priority: 'P1', strength: 'strong', found_by: ['codex-standard'], ...o });
@@ -75,7 +76,7 @@ test('child environment: explicit per-mode allowlist, no MEGALENS_* wildcard', (
   const env = { PATH: '/bin', HOME: '/h', MEGALENS_TOKEN: 't', OPENAI_API_KEY: 'k', AWS_SECRET_ACCESS_KEY: 'a', GITHUB_TOKEN: 'g', ANTHROPIC_API_KEY: 'x', MEGALENS_REVIEW_BIN: '/b',
     MEGALENS_ALLOW_CUSTOM_API: '1', MEGALENS_API_URL: 'https://megalens.ai/api/v2', MEGALENS_REVIEW_KEY: 'rk', MEGALENS_REVIEW_ID: 'rv_x', MEGALENS_ALLOW_ROOT: '1', MEGALENS_PASS_PROXY: '1', MEGALENS_ISOLATION: 'off', MEGALENS_STATE_DIR: '/s', MEGALENS_CODEX_BIN: '/c', OPENAI_BASE_URL: 'https://x' };
   const gw = childEnv(env, 'gateway');
-  assert.equal(gw.MEGALENS_TOKEN, 't'); assert.equal(gw.MEGALENS_API_URL, 'https://megalens.ai/api/v2'); assert.equal(gw.MEGALENS_STATE_DIR, '/s'); assert.equal(gw.MEGALENS_CODEX_BIN, '/c');
+  assert.equal(gw.MEGALENS_TOKEN, 't'); assert.equal(gw.MEGALENS_API_URL, 'https://megalens.ai/api/v2'); assert.equal(gw.MEGALENS_STATE_DIR, '/s'); assert.equal(gw.MEGALENS_CODEX_BIN, undefined, 'the engine no longer reads it');
   for (const k of ['OPENAI_API_KEY', 'AWS_SECRET_ACCESS_KEY', 'GITHUB_TOKEN', 'ANTHROPIC_API_KEY', 'MEGALENS_REVIEW_BIN', 'MEGALENS_ALLOW_CUSTOM_API', 'MEGALENS_REVIEW_KEY', 'MEGALENS_REVIEW_ID', 'MEGALENS_ALLOW_ROOT', 'MEGALENS_PASS_PROXY', 'MEGALENS_ISOLATION', 'OPENAI_BASE_URL']) assert.equal(gw[k], undefined, k);
   const bk = childEnv(env, 'byo-key');
   assert.equal(bk.OPENAI_API_KEY, 'k'); assert.equal(bk.MEGALENS_BYO, '1');
@@ -307,8 +308,81 @@ test('R6: rendering cannot be broken out of by file, line numbers, separators or
 test('R7: command files: staged changes, no secret files, stdin writer instead of a Write tool, ids checked in status/result', () => {
   const rd = (n) => readFileSync(new URL(`../commands/${n}.md`, import.meta.url), 'utf8');
   const rv = rd('review');
-  assert.match(rv, /git diff --no-ext-diff --no-textconv HEAD/); assert.match(rv, /plain `git diff` would miss staged/); assert.match(rv, /untracked files are not part of a range review/);
-  assert.match(rv, /Never read credential or secret files[^.]*\.env/); assert.match(rv, /untrusted data/); assert.match(rv, /first-review-write/);
+  assert.match(rv, /engine\.mjs show-change/);
+  assert.match(rv, /never read credential or secret files[^.]*\.env/i); assert.match(rv, /untrusted data/); assert.match(rv, /first-review-write/);
   assert.ok(!/first-review-path/.test(rv)); assert.ok(!/allowed-tools:[^\n]*Write/.test(rv)); assert.match(rv.split('\n').find((l) => l.startsWith('allowed-tools')), /engine\.mjs:\*/);
   for (const n of ['status', 'result']) assert.match(rd(n), /exactly one review id of the form `rv_`[\s\S]*run nothing/, n);
+});
+
+// ---- Fable final review ----
+const sh = (cwd, ...a) => execFileSync('git', a, { cwd, encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+const mkrepo = () => { const d = mkdtempSync(path.join(tmpdir(), 'mlg-')); sh(d, 'init', '-q', '-b', 'main'); writeFileSync(path.join(d, 'a.js'), 'one\n'); sh(d, 'add', '-A'); sh(d, 'commit', '-qm', 'base'); return d; };
+
+test('F1: cleanup never deletes a repository or any folder that holds more than the one file', () => {
+  const T = tmpdir();
+  // a repo cloned at a look-alike path, with a first-review.json at its root
+  const repo = path.join(T, `megalens-claude-plugin${process.pid}`); mkdirSync(path.join(repo, '.git'), { recursive: true }); writeFileSync(path.join(repo, 'first-review.json'), '[]'); writeFileSync(path.join(repo, 'work.js'), 'uncommitted');
+  assert.equal(cleanupFirstReview(path.join(repo, 'first-review.json')), false); assert.ok(existsSync(path.join(repo, 'work.js')) && existsSync(path.join(repo, '.git')) && existsSync(path.join(repo, 'first-review.json')));
+  // a matching name, mode 0700, but a second file inside
+  const d = mkdtempSync(path.join(T, 'megalens-')); chmodSync(d, 0o700); writeFileSync(path.join(d, 'first-review.json'), '[]'); writeFileSync(path.join(d, 'other.txt'), 'keep');
+  assert.equal(cleanupFirstReview(path.join(d, 'first-review.json')), false); assert.ok(existsSync(path.join(d, 'other.txt')) && existsSync(path.join(d, 'first-review.json')));
+  // a matching name with the wrong mode
+  const w = mkdtempSync(path.join(T, 'megalens-')); chmodSync(w, 0o755); writeFileSync(path.join(w, 'first-review.json'), '[]');
+  assert.equal(cleanupFirstReview(path.join(w, 'first-review.json')), false); assert.ok(existsSync(path.join(w, 'first-review.json')));
+  // the real thing is removed, file and folder
+  const g = mkdtempSync(path.join(T, 'megalens-')); writeFileSync(path.join(g, 'first-review.json'), '[]'); assert.equal(cleanupFirstReview(path.join(g, 'first-review.json')), true); assert.ok(!existsSync(g));
+  for (const x of [repo, d, w]) rmSync(x, { recursive: true, force: true });
+});
+
+test('F1: end to end, a look-alike repo passed as --first-review survives the whole run', async () => {
+  const repo = path.join(tmpdir(), `megalens-repo${process.pid}`); mkdirSync(repo, { recursive: true }); writeFileSync(path.join(repo, 'first-review.json'), '{nope'); writeFileSync(path.join(repo, 'work.js'), 'x');
+  const r = await run(['review', 'double', '--first-review', path.join(repo, 'first-review.json')]); assert.equal(r.calls.length, 0);
+  assert.ok(existsSync(path.join(repo, 'work.js')) && existsSync(path.join(repo, 'first-review.json'))); rmSync(repo, { recursive: true, force: true });
+});
+
+test('F2: review.md never mentions the BYO modes or an OpenAI key', () => {
+  const t = readFileSync(new URL('../commands/review.md', import.meta.url), 'utf8');
+  assert.ok(!/MEGALENS_BYO|OPENAI_API_KEY|OPENAI/.test(t)); assert.match(t, /set `MEGALENS_TOKEN` and restart/);
+});
+
+test('F3: the only pre-approved tool is the script; no raw git rules in any command file', () => {
+  for (const n of ['review', 'status', 'result']) {
+    const line = readFileSync(new URL(`../commands/${n}.md`, import.meta.url), 'utf8').split('\n').find((l) => l.startsWith('allowed-tools:'));
+    assert.ok(!/git/.test(line), `${n}: ${line}`); assert.match(line, /^allowed-tools: Bash\(node \$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/engine\.mjs[^)]*:\*\)$/);
+  }
+  assert.ok(!/Write/.test(readFileSync(new URL('../commands/review.md', import.meta.url), 'utf8').split('\n').find((l) => l.startsWith('allowed-tools:'))));
+});
+
+test('F3: show-change prints staged, unstaged and untracked names; hides secret-named files; ignores repo fsmonitor and external diff', async () => {
+  const d = mkrepo(); const marker = path.join(d, 'PWNED');
+  writeFileSync(path.join(d, 'a.js'), 'two\n'); sh(d, 'add', 'a.js'); writeFileSync(path.join(d, 'staged-new.js'), 'new\n'); sh(d, 'add', 'staged-new.js');
+  writeFileSync(path.join(d, 'a.js'), 'three\n'); writeFileSync(path.join(d, 'fresh.js'), 'x'); writeFileSync(path.join(d, '.env'), 'SECRET=1'); writeFileSync(path.join(d, 'k.pem'), 'x');
+  sh(d, 'config', 'core.fsmonitor', `touch ${marker}; echo`); sh(d, 'config', 'diff.external', `touch ${marker}; true`); sh(d, 'config', 'core.pager', `touch ${marker}; cat`);
+  const r = await run(['show-change'], { cwd: d });
+  assert.equal(r.code, 0); assert.match(r.text, /\+three/); assert.match(r.text, /-one/); assert.match(r.text, /staged-new\.js/); assert.match(r.text, /fresh\.js/);
+  assert.ok(!/\.env\b|k\.pem/.test(r.text.replace(/\[\d+ [^\]]*\]/g, ''))); assert.match(r.text, /2 untracked file\(s\) with credential-like names/); assert.match(r.text, /2 credential-like path\(s\) not shown/);
+  assert.ok(!existsSync(marker), 'repo config must not run anything'); assert.equal(r.calls.length, 0, 'does not call the engine');
+  rmSync(d, { recursive: true, force: true });
+});
+
+test('F3: show-change range uses the merge base; bad refs and non-repos are refused', async () => {
+  const d = mkrepo(); sh(d, 'checkout', '-q', '-b', 'feat'); writeFileSync(path.join(d, 'a.js'), 'feat\n'); sh(d, 'commit', '-qam', 'f');
+  const r = await run(['show-change', '--base', 'main', '--head', 'feat'], { cwd: d }); assert.equal(r.code, 0); assert.match(r.text, /\+feat/); assert.match(r.text, /Untracked files are not part/);
+  for (const bad of [['--base', '--output=x', '--head', 'feat'], ['--base', 'main'], ['--base', 'a;b', '--head', 'c']]) { const x = await run(['show-change', ...bad], { cwd: d }); assert.equal(x.code, 4); assert.ok(!existsSync(path.join(d, 'x'))); }
+  const n = await run(['show-change'], { cwd: mkdtempSync(path.join(tmpdir(), 'notgit-')) }); assert.equal(n.code, 4); assert.match(n.text, /Not a git repository/);
+  rmSync(d, { recursive: true, force: true });
+});
+
+test('engine alignment: install and verify pass through without credentials; failure says reviews will not run; missing binary points to install', async () => {
+  let r = await run(['install'], { scenario: { install: { stdout: '{"installed":true}\n' } }, env: { MEGALENS_TOKEN: undefined } });
+  assert.equal(r.code, 0); assert.match(r.text, /Engine install finished/); assert.deepEqual(r.calls[0].a, ['install']); assert.equal(r.calls[0].hasToken, false);
+  r = await run(['verify'], { scenario: { verify: { exit: 4, stderr: `hash mismatch ${TOKEN}` } } });
+  assert.equal(r.code, 4); assert.match(r.text, /FAILED \(exit 4\)/); assert.match(r.text, /reviews will not run/); assert.ok(!r.text.includes(TOKEN));
+  r = await run(['review'], { env: { MEGALENS_REVIEW_BIN: '/nonexistent/x' } }); assert.match(r.text, /engine\.mjs install/);
+});
+
+test('engine alignment: exit 3 from the engine (refusals, BYO) and a numeric sandbox exclusion count are rendered; 12 notes are kept', () => {
+  const t = renderResult(doc({ sandbox: { excluded_files: 3 }, notes: Array.from({ length: 10 }, (_, i) => `note ${i}`) }));
+  assert.match(t, /3 file\(s\) were left out/); assert.match(t, /note 9/);
+  assert.match(renderResult(null, { exit: 3, stderrText: 'refused by the MegaLens gateway: BYO key mode is not available yet' }), /NOT COMPLETED[\s\S]*refused/);
 });
