@@ -200,6 +200,15 @@ Run: https://github.com/megalens/ml-e2e-review-test/actions/runs/44863951033
 
 The workflow file uses the MegaLens Action with the `workflow_dispatch` trigger. It has three jobs, as for pull requests: `create` (holds the token, no checkout), `review` (reads your code, `contents: read`, no token) and `publish` (checks the findings file, no write access, posts nothing because there is no pull request). Dispatch can only be started by someone with write access to the repository.
 
+### Release checklist (not done yet: needs the owner's GO after launch)
+
+`templates/megalens-dispatch.yml` pins `megalens/review-action@9d1a64e4ca7ceae4e79988a7af764f9483ee0483`, the tip of the unreleased `dispatch-test` branch of a private repository. Customers cannot load that. Before this plugin ships:
+
+1. Release the Action change (merged, tagged) in the public `megalens/review-action`.
+2. Re-pin all three `megalens/review-action@...` lines in `templates/megalens-dispatch.yml`, the Action README example and the test repository's copy to the released commit SHA.
+3. Change the pin check in `tests/gh-runner.test.mjs` to the released SHA.
+4. Run a real Standard review through the plugin once more.
+
 ## Tests
 
     npm test

@@ -91,7 +91,7 @@ class Plan {
   skip(file, why) { this.report.push(`skipped    ${file}: ${why}`); }
   note(s) { this.notes.push(s); }
   flush(host) {
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const stamp = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomBytes(3).toString('hex')}`; // random suffix: two installs in the same millisecond must not share a backup name
     const dir = path.join(this.backupRoot, host, stamp);
     let used = false;
     for (const { file, content, secret, st, old } of this.ops) {

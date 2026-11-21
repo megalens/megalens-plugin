@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { renderResult, scrub } from './engine-core.mjs';
+import { effectiveStatus, renderResult, scrub } from './engine-core.mjs';
 
 export const WORKFLOW_FILE = 'megalens-dispatch.yml';
 export const WORKFLOW_PATH = `.github/workflows/${WORKFLOW_FILE}`;
@@ -24,8 +24,9 @@ export class SetupError extends Error { constructor(msg, { needsUser = false } =
 /** Remove the exact secret values from text. The pattern scrub is applied to model-written text only: a repo called ml-something must not be redacted out of its own URL. */
 export function scrubExact(text, env = {}) {
   let t = String(text ?? '');
-  for (const k of ['MEGALENS_TOKEN', 'OPENAI_API_KEY', 'MEGALENS_REVIEW_KEY', 'GH_TOKEN', 'GITHUB_TOKEN']) { const v = env[k]; if (typeof v === 'string' && v.length >= 6) t = t.split(v).join('[redacted]'); }
-  return t;
+  for (const k of ['MEGALENS_TOKEN', 'OPENAI_API_KEY', 'MEGALENS_REVIEW_KEY', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN']) { const v = env[k]; if (typeof v === 'string' && v.length >= 6) t = t.split(v).join('[redacted]'); }
+  // GitHub token shapes cannot be a repo name that matters here, so they are safe to cut by pattern.
+  return t.replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, '[redacted]').replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, '[redacted]');
 }
 
 export const isRunnerId = (s) => typeof s === 'string' && RUN_ID_RE.test(s);
@@ -86,6 +87,10 @@ export const MSG = {
   noSecret: `The repository secret ${SECRET_NAME} is missing. Set it once with \`gh secret set ${SECRET_NAME}\` (gh asks for the value; paste your MegaLens token there, not into the chat), then run this again.`,
   secretUnknown: `Could not check the repository secret ${SECRET_NAME} (no permission to list secrets). Going on; if it is missing the run fails at its first job and no review is charged.`,
   uncommitted: 'Note: uncommitted changes are not reviewable on the GitHub runner path. Only commits that are on GitHub are reviewed. Commit and push them first if you want them reviewed.',
+  dirtyStop: 'You have uncommitted changes, and the GitHub runner can only review commits that are on GitHub, so it would review a different change than the one you are editing. Nothing was started and no credit was used. Commit and push your changes, then run this again. (On Linux with the local engine, `--runner local` reviews uncommitted changes. To review only the commits already on GitHub, name the range: `--base <ref> --head HEAD`.)',
+  secretCheckFailed: (why) => `Could not check the repository secret ${SECRET_NAME}: ${why || 'gh gave no reason'}. Nothing was started. Check your network and \`gh auth status\`, then run this again.`,
+  orgSecretUnknown: `${SECRET_NAME} is not a repository secret, and the organisation secrets could not be read. Going on; if it is missing the run fails at its first job and no review is charged.`,
+  notFound: (url) => `The workflow was started, but its run could not be found, so there is no id to give you. A review may have been started and charged: do NOT start another one. Open ${url} to find the run, then use its number as gh:<number> with /megalens:status and /megalens:result. Nothing has been reviewed yet.`,
 };
 
 export function workflowMissingMessage(branch) {
@@ -115,11 +120,20 @@ export async function preflight({ exec, cwd, env, base = null, head = null }) {
   if (wf.code !== 0 || wf.stdout.trim() !== 'file') throw new SetupError(workflowMissingMessage(defaultBranch));
 
   let note = '';
-  const sl = await run('gh', ['secret', 'list', '--json', 'name']);
+  const sl = await run('gh', ['secret', 'list', '--json', 'name', '-R', nwo]);
   const names = sl.code === 0 ? jsonOf(sl.stdout) : null;
-  if (Array.isArray(names)) { if (!names.some((s) => s?.name === SECRET_NAME)) throw new SetupError(MSG.noSecret); }
-  else if (/HTTP 403|HTTP 404|Resource not accessible|not accessible by integration|must have admin/i.test(sl.stderr)) note = `${MSG.secretUnknown}\n`;
-  else throw new SetupError(MSG.noSecret);
+  const NO_PERMISSION = /HTTP 403|HTTP 404|Resource not accessible|not accessible by integration|must have admin/i;
+  if (Array.isArray(names)) {
+    if (!names.some((s) => s?.name === SECRET_NAME)) {
+      // gh secret list shows repository secrets only. An organisation secret shared with this repository also works.
+      const og = await run('gh', ['api', '-X', 'GET', `repos/${nwo}/actions/organization-secrets`, '--jq', '[.secrets[].name]']);
+      const onames = og.code === 0 ? jsonOf(og.stdout) : null;
+      if (Array.isArray(onames)) { if (!onames.includes(SECRET_NAME)) throw new SetupError(MSG.noSecret); }
+      else note = `${MSG.orgSecretUnknown}\n`;
+    }
+  }
+  else if (NO_PERMISSION.test(sl.stderr)) note = `${MSG.secretUnknown}\n`;
+  else throw new SetupError(MSG.secretCheckFailed(scrub(firstLine(sl.stderr), env)));
 
   // The change: HEAD against the merge-base with the default branch (or the range the user named).
   const headRef = head ?? 'HEAD';
@@ -135,31 +149,49 @@ export async function preflight({ exec, cwd, env, base = null, head = null }) {
   if (baseSha === headSha) throw new SetupError(`Nothing to review: ${short(headSha)} is the same commit as the default branch (${defaultBranch}), so there is no change between them. Commit your work on a branch first.`);
 
   const dirty = await run('git', ['status', '--porcelain']);
-  if (dirty.code === 0 && dirty.stdout.trim()) note += `${MSG.uncommitted}\n`;
+  if (dirty.code === 0 && dirty.stdout.trim()) {
+    // No range named: the user means the change they are editing, which this route cannot review. Stop before anything is started.
+    if (base === null && head === null) throw new SetupError(MSG.dirtyStop);
+    note += `${MSG.uncommitted}\n`;
+  }
 
   const onGh = await run('gh', ['api', `repos/${nwo}/commits/${headSha}`, '--jq', '.sha']);
   if (onGh.code !== 0 || onGh.stdout.trim() !== headSha) {
     const br = await run('git', ['branch', '--show-current']);
-    throw new SetupError(notPushedMessage(headSha, br.stdout.trim()), { needsUser: true });
+    const bn = br.stdout.trim();
+    throw new SetupError(notPushedMessage(headSha, /^[\w./-]{1,100}$/.test(bn) ? bn : ''), { needsUser: true });
   }
   return { nwo, defaultBranch, baseSha, headSha, note };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** Start the run and find the id it created: workflow runs of the dispatch file, created after we asked, titled with our head sha. */
-export async function startRun({ exec, cwd, env, tier, pre, sleepMs = 2000, tries = 15, now = () => Date.now() }) {
+export const runTitle = (tier, baseSha, headSha) => `MegaLens ${tier} ${baseSha}..${headSha}`;
+const listRuns = async (run, nwo) => {
+  const l = await run('gh', ['run', 'list', '--workflow', WORKFLOW_FILE, '--event', 'workflow_dispatch', '--limit', '50', '--json', 'databaseId,displayTitle,createdAt,url', '-R', nwo]);
+  const rows = l.code === 0 ? jsonOf(l.stdout) : null;
+  return Array.isArray(rows) ? rows.filter((x) => x && Number.isInteger(x.databaseId)) : null;
+};
+
+/**
+ * Start the run and find the id it created. Run ids that exist before the dispatch are recorded; only a NEW run
+ * whose title is exactly "MegaLens <tier> <base>..<head>" counts. If the match is not certain (none found, or more than
+ * one new run with that title) nothing is started again: the caller reports "could not find the run".
+ */
+export async function startRun({ exec, cwd, env, tier, pre, sleepMs = 2000, tries = 15 }) {
   const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env) });
-  const t0 = now() - 10_000;
-  const r = await run('gh', ['workflow', 'run', WORKFLOW_FILE, '--ref', pre.defaultBranch, '-f', `tier=${tier}`, '-f', `base_sha=${pre.baseSha}`, '-f', `head_sha=${pre.headSha}`]);
+  const before = await listRuns(run, pre.nwo);
+  if (before === null) throw new SetupError('Could not list the existing workflow runs, so a new run could not be told apart. Nothing was started and no credit was used. Check `gh auth status` and your network, then run this again.');
+  const seen = new Set(before.map((x) => x.databaseId));
+  const title = runTitle(tier, pre.baseSha, pre.headSha);
+  const r = await run('gh', ['workflow', 'run', WORKFLOW_FILE, '--ref', pre.defaultBranch, '-f', `tier=${tier}`, '-f', `base_sha=${pre.baseSha}`, '-f', `head_sha=${pre.headSha}`, '-R', pre.nwo]);
   if (r.code !== 0) throw new SetupError(`GitHub did not start the workflow: ${scrub(firstLine(r.stderr), env) || 'no reason given'}. Check that ${WORKFLOW_PATH} is on ${pre.defaultBranch} and that you can run workflows in this repository.`);
   for (let i = 0; i < tries; i++) {
-    const l = await run('gh', ['run', 'list', '--workflow', WORKFLOW_FILE, '--event', 'workflow_dispatch', '--limit', '20', '--json', 'databaseId,displayTitle,createdAt,url']);
-    const rows = l.code === 0 ? jsonOf(l.stdout) : null;
-    if (Array.isArray(rows)) {
-      const hit = rows.filter((x) => x && Number.isInteger(x.databaseId) && String(x.displayTitle ?? '').includes(pre.headSha) && String(x.displayTitle).includes(tier) && Date.parse(x.createdAt) >= t0)
-        .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
-      if (hit) return { id: `gh:${hit.databaseId}`, url: typeof hit.url === 'string' ? hit.url : `https://github.com/${pre.nwo}/actions/runs/${hit.databaseId}` };
+    const rows = await listRuns(run, pre.nwo);
+    if (rows) {
+      const hits = rows.filter((x) => !seen.has(x.databaseId) && x.displayTitle === title);
+      if (hits.length === 1) { const hit = hits[0]; return { id: `gh:${hit.databaseId}`, url: typeof hit.url === 'string' ? hit.url : `https://github.com/${pre.nwo}/actions/runs/${hit.databaseId}` }; }
+      if (hits.length > 1) break; // two new runs with the same title: not certain which is ours
     }
     await sleep(sleepMs);
   }
@@ -175,8 +207,16 @@ export function mapState(status, conclusion) {
   return 'failed'; // anything unknown is never reported as fine
 }
 
-async function viewRun({ exec, cwd, env }, id) {
-  const r = await exec('gh', ['run', 'view', id, '--json', 'status,conclusion,url,workflowName,displayTitle'], { cwd, env: ghEnv(env) });
+/** The repository gh works in, resolved once; every later call names it with -R. Null when gh cannot tell (the call then runs without -R). */
+async function repoOf({ exec, cwd, env }) {
+  const rv = await exec('gh', ['repo', 'view', '--json', 'nameWithOwner'], { cwd, env: ghEnv(env) });
+  const j = rv.code === 0 ? jsonOf(rv.stdout) : null;
+  return typeof j?.nameWithOwner === 'string' && /^[\w.-]+\/[\w.-]+$/.test(j.nameWithOwner) ? j.nameWithOwner : null;
+}
+const scoped = (args, nwo) => (nwo ? [...args, '-R', nwo] : args);
+
+async function viewRun({ exec, cwd, env }, id, nwo = null) {
+  const r = await exec('gh', scoped(['run', 'view', id, '--json', 'status,conclusion,url,workflowName,displayTitle'], nwo), { cwd, env: ghEnv(env) });
   const j = r.code === 0 ? jsonOf(r.stdout) : null;
   if (!j || typeof j.status !== 'string') return { error: `Could not read run gh:${id}: ${scrub(firstLine(r.stderr), env) || 'no usable answer from gh'}. Check the id, that you are in the same repository, and \`gh auth status\`. This is not a finished review.\n` };
   if (j.workflowName !== WORKFLOW_NAME) return { error: `gh:${id} is not a MegaLens review run. Nothing was read from it.\n` };
@@ -185,7 +225,7 @@ async function viewRun({ exec, cwd, env }, id) {
 
 export async function runnerStatus(ctx, rawId) {
   const id = runIdOf(rawId);
-  const v = await viewRun(ctx, id); if (v.error) return { text: v.error, code: 4 };
+  const v = await viewRun(ctx, id, await repoOf(ctx)); if (v.error) return { text: v.error, code: 4 };
   const state = mapState(v.j.status, v.j.conclusion); const url = String(v.j.url ?? '').slice(0, 300);
   const words = {
     queued: 'Queued: GitHub has not started it yet. Check again in a minute.',
@@ -198,18 +238,22 @@ export async function runnerStatus(ctx, rawId) {
 
 export async function runnerResult(ctx, rawId) {
   const id = runIdOf(rawId);
-  const v = await viewRun(ctx, id); if (v.error) return { text: v.error, code: 4 };
+  const nwo = await repoOf(ctx);
+  const v = await viewRun(ctx, id, nwo); if (v.error) return { text: v.error, code: 4 };
   const state = mapState(v.j.status, v.j.conclusion);
   if (state === 'queued' || state === 'running') return { text: `That review is still ${state === 'queued' ? 'queued' : 'running'}, so there is no result yet. Nothing has been found or ruled out. Check with /megalens:status gh:${id}.\n`, code: 4 };
   const dir = mkdtempSync(path.join(tmpdir(), 'megalens-'), { mode: 0o700 });
   try {
-    const d = await ctx.exec('gh', ['run', 'download', id, '-n', ARTIFACT_NAME, '-D', dir], { cwd: ctx.cwd, env: ghEnv(ctx.env) });
+    const d = await ctx.exec('gh', scoped(['run', 'download', id, '-n', ARTIFACT_NAME, '-D', dir], nwo), { cwd: ctx.cwd, env: ghEnv(ctx.env) });
     let doc = null;
     const file = path.join(dir, 'findings.json');
     if (d.code === 0) { try { if (statSync(file).size <= MAX_FINDINGS) doc = JSON.parse(readFileSync(file, 'utf8')); } catch { doc = null; } }
     // A run that did not succeed is never rendered as complete: exit 4 downgrades the document to FAILED.
     const text = scrub(renderResult(doc, { exit: state === 'done' ? 0 : 4, stderrText: doc ? '' : firstLine(d.stderr) || `no ${ARTIFACT_NAME} artifact on that run (it may have expired or never been written)` }), ctx.env);
-    const ok = state === 'done' && doc && doc.status !== 'failed';
+    // Same rule as the local path: the exit code follows the validated, effective status, not the raw field.
+    const valid = doc && typeof doc === 'object' && doc.schema === 'megalens.findings/v1' && Array.isArray(doc.findings);
+    const passes = valid && Array.isArray(doc.passes) ? doc.passes : [];
+    const ok = state === 'done' && valid && effectiveStatus(doc, passes, passes.filter((p) => p && p.status === 'failed'), 0) !== 'failed';
     return { text: `${text}Run: ${String(v.j.url ?? '').slice(0, 300)}\n`, code: ok ? 0 : 4, doc };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
@@ -222,7 +266,7 @@ export async function runnerReview({ exec = realExec, cwd, env, tier, base = nul
   let started;
   try { started = await startRun({ exec, cwd, env, tier, pre, sleepMs, tries }); } catch (e) { if (e instanceof SetupError) return { text: `${e.message}\n`, code: 4, setup: true }; throw e; }
   const intro = `${pre.note}Review of ${short(pre.baseSha)}..${short(pre.headSha)} in ${pre.nwo}, tier ${tier}, runs on your GitHub runner.\n`;
-  if (!started.id) return { text: `${intro}The run was started, but its id could not be found yet. Open ${started.url} to see it. Nothing has been reviewed yet.\n`, code: 0 };
+  if (!started.id) return { text: `${intro}${MSG.notFound(started.url)}\n`, code: 4 };
   const how = `Check with /megalens:status ${started.id}, then fetch with /megalens:result ${started.id}.`;
   if (!wait || tier === 'deep') {
     return { text: `${intro}Review started on GitHub: ${started.id}\nRun: ${started.url}\n${tier === 'deep' ? 'A deep review can take about 20 minutes. ' : 'A standard review usually takes a few minutes. '}${how} Nothing has been reviewed yet.\n`, code: 0, id: started.id };

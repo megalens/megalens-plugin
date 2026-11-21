@@ -2,7 +2,7 @@
 # Add this file once, on your default branch: .github/workflows/megalens-dispatch.yml
 # Needs the repository secret MEGALENS_TOKEN (gh secret set MEGALENS_TOKEN).
 name: MegaLens Dispatch
-run-name: MegaLens ${{ inputs.tier }} ${{ inputs.head_sha }}
+run-name: MegaLens ${{ inputs.tier }} ${{ inputs.base_sha }}..${{ inputs.head_sha }}
 
 on:
   workflow_dispatch:
@@ -31,7 +31,7 @@ jobs:
       base_sha: ${{ steps.create.outputs.base_sha }}
     steps:
       - id: create
-        uses: megalens/review-action@e11a2b8e65d4bd7bb440add47ac074d5589751bc # dispatch-test
+        uses: megalens/review-action@9d1a64e4ca7ceae4e79988a7af764f9483ee0483 # dispatch-test
         with:
           mode: create
           tier: ${{ inputs.tier }}
@@ -60,7 +60,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: megalens/review-action@e11a2b8e65d4bd7bb440add47ac074d5589751bc # dispatch-test
+      - uses: megalens/review-action@9d1a64e4ca7ceae4e79988a7af764f9483ee0483 # dispatch-test
         env:
           MEGALENS_REVIEW_ID: ${{ needs.create.outputs.review_id }}
           MEGALENS_REVIEW_KEY: ${{ needs.create.outputs.review_key }}
@@ -91,7 +91,7 @@ jobs:
           name: megalens-findings
           path: ${{ runner.temp }}
 
-      - uses: megalens/review-action@e11a2b8e65d4bd7bb440add47ac074d5589751bc # dispatch-test
+      - uses: megalens/review-action@9d1a64e4ca7ceae4e79988a7af764f9483ee0483 # dispatch-test
         with:
           mode: publish
           tier: ${{ inputs.tier }}

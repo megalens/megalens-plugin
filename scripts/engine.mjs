@@ -10,7 +10,7 @@ import { secretPath } from './lib/safety.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { scrubExact, chooseRoute, isRunnerId, runnerReview, runnerStatus, runnerResult, realExec, SetupError } from './lib/gh-runner.mjs';
+import { scrubExact, chooseRoute, shouldFallBack, isRunnerId, runnerReview, runnerStatus, runnerResult, realExec, SetupError } from './lib/gh-runner.mjs';
 import { DOUBLE_TIER_ENABLED, DOUBLE_OFF_MESSAGE, REF_RE, UsageError, parseReviewArgs, assertReviewId, chooseAuth, childEnv, scrub, normalizeFirstReview, renderResult } from './lib/engine-core.mjs';
 
 const MAX_OUT = 1 << 22; // bytes we keep from the engine's output streams
@@ -85,7 +85,7 @@ function runBin(bin, args, { env, cwd }) {
 
 const privateDir = () => mkdtempSync(path.join(tmpdir(), 'megalens-'), { mode: 0o700 });
 
-export async function main(argv, { env = process.env, cwd = process.cwd(), out = (s) => process.stdout.write(s), err = (s) => process.stderr.write(s), stdin = () => readStdin(), flags = {}, exec = realExec, platform = process.platform } = {}) {
+export async function main(argv, { env = process.env, cwd = process.cwd(), out = (s) => process.stdout.write(s), err = (s) => process.stderr.write(s), stdin = () => readStdin(), flags = {}, exec = realExec, platform = process.platform, probe = null } = {}) {
   const [cmd, ...rest0] = argv;
   let rest = rest0; let runnerFlag = null;
   if (cmd === 'review') {
@@ -133,9 +133,13 @@ export async function main(argv, { env = process.env, cwd = process.cwd(), out =
       };
       if (route.route === 'github') return await viaRunner();
       if (route.fallbackAllowed) {
-        let buf = '';
-        const code = await main(['review', ...rest, '--runner', 'local'], { env, cwd, out: (t) => { buf += t; }, err, stdin, flags, exec, platform });
-        if ((code === 4 || code === 127) && (buf.includes(missingBin()) || /blocks nested sandboxes/i.test(buf) || /No MegaLens credentials\./.test(buf))) return await viaRunner('The local engine cannot run here (missing, no sandbox, or no local token), so the review runs on your GitHub runner instead.\n', buf);
+        const FALLBACK_NOTE = 'The local engine cannot run here (missing, no sandbox, or no local token), so the review runs on your GitHub runner instead.\n';
+        // No credentials at all (no token, no BYO mode asked for): decided from the environment, before the engine is launched.
+        if (!env.MEGALENS_TOKEN && !String(env.MEGALENS_BYO ?? '').trim()) return await viaRunner(FALLBACK_NOTE, chooseAuth(env, flags).error ?? '');
+        // Otherwise the engine's own exit code and stderr say so, before any review exists. Rendered findings text is never searched.
+        let buf = ''; const sig = { setup: false };
+        const code = await main(['review', ...rest, '--runner', 'local'], { env, cwd, out: (t) => { buf += t; }, err, stdin, flags, exec, platform, probe: sig });
+        if (sig.setup) return await viaRunner(FALLBACK_NOTE, buf);
         out(buf); return code;
       }
     }
@@ -147,7 +151,7 @@ export async function main(argv, { env = process.env, cwd = process.cwd(), out =
     if (cmd === 'status') {
       const id = assertReviewId(rest[0]);
       const r = await runBin(bin, ['status', id], base);
-      if (r.code === 127) { say(missingBin()); return 4; }
+      if (r.code === 127) { if (probe) probe.setup = true; say(missingBin()); return 4; }
       let j; try { j = JSON.parse(r.stdout); } catch { j = null; }
       if (r.code !== 0 || !j || typeof j.state !== 'string' || !STATES.includes(j.state)) { say(`Could not read the status of ${id}: ${firstLine(r.stderr) || 'no usable answer from the engine'}. This is not a finished review.\n`); return 4; }
       const tier = flat(j.tier ?? 'unknown tier', 20); const reason = j.reason ? ` Reason: ${flat(j.reason, 100)}.` : '';
@@ -188,13 +192,13 @@ export async function main(argv, { env = process.env, cwd = process.cwd(), out =
       if (o.tier === 'deep' && !o.wait) {
         args.push('--background');
         const r = await runBin(bin, args, base);
-        if (r.code === 127) { say(missingBin()); return 4; }
+        if (r.code === 127) { if (probe) probe.setup = true; say(missingBin()); return 4; }
         let j; try { j = JSON.parse(r.stdout); } catch { j = null; }
-        if (r.code !== 0 || !j || !REVIEW_ID(j.review_id)) return await finishNoDoc(r, say, env);
+        if (r.code !== 0 || !j || !REVIEW_ID(j.review_id)) return await finishNoDoc(r, say, env, probe);
         say(`Deep review started in the background: ${j.review_id}\nIt can take about 20 minutes. Check with /megalens:status ${j.review_id}, then fetch with /megalens:result ${j.review_id}. Nothing has been reviewed yet.\n`);
         return 0;
       }
-      return await fetchAndRender(bin, args, base, say, env);
+      return await fetchAndRender(bin, args, base, say, env, probe);
     } finally {
       for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
       // the host's file is deleted whether or not it validated, but only if it is exactly the file first-review-write made, and never recursively
@@ -210,19 +214,21 @@ const REVIEW_ID = (s) => typeof s === 'string' && /^rv_[A-Za-z0-9_-]{6,64}$/.tes
 const firstLine = (s) => String(s ?? '').split('\n').map((x) => x.trim()).filter(Boolean).slice(-1)[0]?.slice(0, 300) ?? '';
 const missingBin = () => 'The engine is not installed: `megalens-review` was not found on PATH (set MEGALENS_REVIEW_BIN to its path). Once it is, run `node scripts/engine.mjs install` once (it downloads the pinned Codex CLI and checks its hashes). No review ran. /megalens:megalens-review (the bundle route) still works with a token.\n';
 
-async function finishNoDoc(r, say, env) {
-  if (r.code === 127) { say(missingBin()); return 4; }
+async function finishNoDoc(r, say, env, probe = null) {
+  if (r.code === 127) { if (probe) probe.setup = true; say(missingBin()); return 4; }
+  if (probe && shouldFallBack({ code: r.code, stderr: r.stderr })) probe.setup = true; // engine refused before any review existed
   say(renderResult(null, { exit: r.code, stderrText: scrub(firstLine(r.stderr), env) })); return r.code === 0 ? 4 : r.code;
 }
 
-async function fetchAndRender(bin, args, base, say, env) {
+async function fetchAndRender(bin, args, base, say, env, probe = null) {
   const d = privateDir();
   try {
     const outFile = path.join(d, 'findings.json');
     const r = await runBin(bin, [...args, '--out', outFile], base);
-    if (r.code === 127) { say(missingBin()); return 4; }
+    if (r.code === 127) { if (probe) probe.setup = true; say(missingBin()); return 4; }
     let doc = null;
     try { if (statSync(outFile).size <= MAX_OUT) doc = JSON.parse(readFileSync(outFile, 'utf8')); } catch { doc = null; }
+    if (!doc && probe && shouldFallBack({ code: r.code, stderr: r.stderr })) probe.setup = true; // sandbox pre-check failed, no document written
     if (!doc && /still running/i.test(r.stderr)) { say('That review is still running, so there is no result yet. Nothing has been found or ruled out. Check with /megalens:status.\n'); return 4; }
     if (!doc && /unknown review id/i.test(r.stderr)) { say('The engine does not know that review id (wrong id, or it was cleaned up). No result.\n'); return 4; }
     say(renderResult(doc, { exit: r.code, stderrText: scrub(firstLine(r.stderr), env) }));

@@ -84,10 +84,10 @@ export function childEnv(env, mode) {
 /** Remove secret values and secret-shaped strings from any text we are about to show. */
 export function scrub(text, env = {}) {
   let t = String(text ?? '');
-  for (const k of ['MEGALENS_TOKEN', 'OPENAI_API_KEY', 'MEGALENS_REVIEW_KEY']) {
+  for (const k of ['MEGALENS_TOKEN', 'OPENAI_API_KEY', 'MEGALENS_REVIEW_KEY', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN']) {
     const v = env[k]; if (typeof v === 'string' && v.length >= 6) t = t.split(v).join('[redacted]');
   }
-  return t.replace(/\b(?:sk|ml|mlk|rk)[-_][A-Za-z0-9_-]{12,}/g, '[redacted]').replace(/\b(Bearer\s+)[A-Za-z0-9._~+\/-]{12,}/gi, '$1[redacted]');
+  return t.replace(/\b(?:sk|ml|mlk|rk)[-_][A-Za-z0-9_-]{12,}/g, '[redacted]').replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, '[redacted]').replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, '[redacted]').replace(/\b(Bearer\s+)[A-Za-z0-9._~+\/-]{12,}/gi, '$1[redacted]');
 }
 
 const oneLine = (s, n) => String(s ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]+/g, ' ').trim().slice(0, n);
@@ -162,7 +162,7 @@ export function renderResult(doc, { exit = 0, stderrText = '' } = {}) {
   const status = effectiveStatus(doc, passes, failedPasses, exit);
   const out = [];
   const head = { complete: 'complete', partial: 'PARTIAL', failed: 'FAILED' }[status];
-  out.push(`## MegaLens ${oneLine(doc.tier, 20)} review: ${head}`, '');
+  out.push(`## MegaLens ${['standard', 'deep', 'double'].includes(doc.tier) ? `${doc.tier} ` : ''}review: ${head}`, '');
   if (status === 'partial') out.push(`**This review is partial.** ${failedPasses.length ? `Pass${failedPasses.length > 1 ? 'es' : ''} that did not finish: ${failedPasses.map((p) => `${oneLine(p.name, 40)}${p.reason ? ` (${oneLine(p.reason, 40)})` : ''}`).join(', ')}. ` : ''}The findings below come from the passes that did finish. Having few or no findings here does not mean the change is clean, because part of the review did not run.`, '');
   if (status === 'failed') out.push(`**This review failed.** ${doc.refused ? 'The gateway refused it. ' : ''}No review of your change took place, so this is not "no issues". ${failedPasses.length ? `Failed: ${failedPasses.map((p) => `${oneLine(p.name, 40)}${p.reason ? ` (${oneLine(p.reason, 40)})` : ''}`).join(', ')}.` : ''}`.trim(), '');
   const fs = doc.findings.filter((f) => f && typeof f === 'object');
