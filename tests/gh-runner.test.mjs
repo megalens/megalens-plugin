@@ -131,6 +131,12 @@ test('start: dispatch args, run id found by head sha, tier and time, printed as 
   assert.equal(refused.code, 4); assert.match(refused.text, /did not start the workflow/);
 });
 
+test('a repo named like a token prefix (ml-...) keeps its name and URL in the output', async () => {
+  const exec = fakeExec({ 'gh repo': ok(JSON.stringify({ nameWithOwner: 'megalens/ml-e2e-review-test', defaultBranchRef: { name: 'main' } })) }, { runs: [{ databaseId: 5, displayTitle: `MegaLens standard ${H}`, createdAt: new Date().toISOString(), url: 'https://github.com/megalens/ml-e2e-review-test/actions/runs/5' }] }).exec;
+  const r = await viaMain(['review', 'standard'], { platform: 'darwin', exec });
+  assert.match(r.text, /megalens\/ml-e2e-review-test/); assert.match(r.text, /actions\/runs\/5/); assert.equal(r.text.includes('[redacted]'), false);
+});
+
 test('deep prints the id and stops, even with --wait', async () => {
   const runs = [{ databaseId: 77, displayTitle: `MegaLens deep ${H}`, createdAt: new Date().toISOString(), url: 'https://github.com/acme/widget/actions/runs/77' }];
   const f = fakeExec({}, { runs });

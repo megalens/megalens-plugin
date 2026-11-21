@@ -10,7 +10,7 @@ import { secretPath } from './lib/safety.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chooseRoute, isRunnerId, runnerReview, runnerStatus, runnerResult, realExec, SetupError } from './lib/gh-runner.mjs';
+import { scrubExact, chooseRoute, isRunnerId, runnerReview, runnerStatus, runnerResult, realExec, SetupError } from './lib/gh-runner.mjs';
 import { DOUBLE_TIER_ENABLED, DOUBLE_OFF_MESSAGE, REF_RE, UsageError, parseReviewArgs, assertReviewId, chooseAuth, childEnv, scrub, normalizeFirstReview, renderResult } from './lib/engine-core.mjs';
 
 const MAX_OUT = 1 << 22; // bytes we keep from the engine's output streams
@@ -120,7 +120,7 @@ export async function main(argv, { env = process.env, cwd = process.cwd(), out =
     if ((cmd === 'status' || cmd === 'result') && rest[0] !== undefined && /^gh:/.test(rest[0])) {
       if (!isRunnerId(rest[0]) || rest.length !== 1) throw new UsageError('that is not a GitHub review id (they look like gh:123456789)');
       const r = await (cmd === 'status' ? runnerStatus : runnerResult)({ exec, cwd, env }, rest[0]);
-      say(r.text); return r.code;
+      out(scrubExact(r.text, env)); return r.code;
     }
     if (cmd === 'review') {
       const route = chooseRoute({ platform, runner: runnerFlag });
@@ -128,7 +128,8 @@ export async function main(argv, { env = process.env, cwd = process.cwd(), out =
         const o = parseReviewArgs(rest, flags);
         const r = await runnerReview({ exec, cwd, env, tier: o.tier, base: o.base, head: o.head, wait: o.wait, ...(flags.runnerTiming ?? {}) });
         // When the runner cannot start either, the user also needs to hear why the local engine did not run.
-        say(note + r.text + (r.setup && localText ? `\nThe local engine said:\n${localText}` : '')); return r.code;
+        out(scrubExact(note + r.text, env) + (r.setup && localText ? scrub(`\nThe local engine said:\n${localText}`, env) : ''));
+        return r.code;
       };
       if (route.route === 'github') return await viaRunner();
       if (route.fallbackAllowed) {

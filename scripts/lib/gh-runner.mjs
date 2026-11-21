@@ -21,6 +21,13 @@ export const workflowText = () => readFileSync(templatePath(), 'utf8');
 
 export class SetupError extends Error { constructor(msg, { needsUser = false } = {}) { super(msg); this.needsUser = needsUser; } }
 
+/** Remove the exact secret values from text. The pattern scrub is applied to model-written text only: a repo called ml-something must not be redacted out of its own URL. */
+export function scrubExact(text, env = {}) {
+  let t = String(text ?? '');
+  for (const k of ['MEGALENS_TOKEN', 'OPENAI_API_KEY', 'MEGALENS_REVIEW_KEY', 'GH_TOKEN', 'GITHUB_TOKEN']) { const v = env[k]; if (typeof v === 'string' && v.length >= 6) t = t.split(v).join('[redacted]'); }
+  return t;
+}
+
 export const isRunnerId = (s) => typeof s === 'string' && RUN_ID_RE.test(s);
 export const runIdOf = (s) => { const m = RUN_ID_RE.exec(String(s ?? '')); if (!m) throw new SetupError('that is not a GitHub review id (they look like gh:123456789)'); return m[1]; };
 
@@ -201,7 +208,7 @@ export async function runnerResult(ctx, rawId) {
     const file = path.join(dir, 'findings.json');
     if (d.code === 0) { try { if (statSync(file).size <= MAX_FINDINGS) doc = JSON.parse(readFileSync(file, 'utf8')); } catch { doc = null; } }
     // A run that did not succeed is never rendered as complete: exit 4 downgrades the document to FAILED.
-    const text = renderResult(doc, { exit: state === 'done' ? 0 : 4, stderrText: doc ? '' : scrub(firstLine(d.stderr) || `no ${ARTIFACT_NAME} artifact on that run (it may have expired or never been written)`, ctx.env) });
+    const text = scrub(renderResult(doc, { exit: state === 'done' ? 0 : 4, stderrText: doc ? '' : firstLine(d.stderr) || `no ${ARTIFACT_NAME} artifact on that run (it may have expired or never been written)` }), ctx.env);
     const ok = state === 'done' && doc && doc.status !== 'failed';
     return { text: `${text}Run: ${String(v.j.url ?? '').slice(0, 300)}\n`, code: ok ? 0 : 4, doc };
   } finally { rmSync(dir, { recursive: true, force: true }); }
