@@ -10,7 +10,7 @@ import { secretPath } from './lib/safety.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { scrubExact, chooseRoute, shouldFallBack, isRunnerId, runnerReview, runnerStatus, runnerResult, realExec, SetupError } from './lib/gh-runner.mjs';
+import { scrubExact, chooseRoute, shouldFallBack, isSandboxPrecheckDoc, isRunnerId, runnerReview, runnerStatus, runnerResult, realExec, SetupError } from './lib/gh-runner.mjs';
 import { DOUBLE_TIER_ENABLED, DOUBLE_OFF_MESSAGE, REF_RE, UsageError, parseReviewArgs, assertReviewId, chooseAuth, childEnv, scrub, normalizeFirstReview, renderResult } from './lib/engine-core.mjs';
 
 const MAX_OUT = 1 << 22; // bytes we keep from the engine's output streams
@@ -228,7 +228,7 @@ async function fetchAndRender(bin, args, base, say, env, probe = null) {
     if (r.code === 127) { if (probe) probe.setup = true; say(missingBin()); return 4; }
     let doc = null;
     try { if (statSync(outFile).size <= MAX_OUT) doc = JSON.parse(readFileSync(outFile, 'utf8')); } catch { doc = null; }
-    if (!doc && probe && shouldFallBack({ code: r.code, stderr: r.stderr })) probe.setup = true; // sandbox pre-check failed, no document written
+    if (probe && (doc ? isSandboxPrecheckDoc(doc, r.code) : shouldFallBack({ code: r.code, stderr: r.stderr }))) probe.setup = true; // sandbox pre-check failed: the engine's own rv_none document, or no document at all
     if (!doc && /still running/i.test(r.stderr)) { say('That review is still running, so there is no result yet. Nothing has been found or ruled out. Check with /megalens:status.\n'); return 4; }
     if (!doc && /unknown review id/i.test(r.stderr)) { say('The engine does not know that review id (wrong id, or it was cleaned up). No result.\n'); return 4; }
     say(renderResult(doc, { exit: r.code, stderrText: scrub(firstLine(r.stderr), env) }));

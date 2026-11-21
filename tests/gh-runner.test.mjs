@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, mkdtempSync, writeFileSync, existsSync, readdirSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { chooseRoute, shouldFallBack, ghEnv, preflight, startRun, mapState, runnerStatus, runnerResult, runnerReview, isRunnerId, runIdOf, workflowText, MSG, WORKFLOW_FILE } from '../scripts/lib/gh-runner.mjs';
+import { chooseRoute, shouldFallBack, isSandboxPrecheckDoc, ghEnv, preflight, startRun, mapState, runnerStatus, runnerResult, runnerReview, isRunnerId, runIdOf, workflowText, MSG, WORKFLOW_FILE } from '../scripts/lib/gh-runner.mjs';
 import { main } from '../scripts/engine.mjs';
 
 const TOKEN = 'ml_SECRETTOKEN1234567890';
@@ -80,6 +80,13 @@ test('secret check: an organisation secret counts; unreadable org list continues
   assert.equal(good.note, '');
   const neither = await msgOf(pf(withOrg(ok('["OTHER"]'))));
   assert.equal(neither.message, MSG.noSecret);
+  const userOwned = await msgOf(pf(withOrg(bad('gh: Not Found (HTTP 404)'))));
+  assert.equal(userOwned.message, MSG.noSecret);
+  const paged = await pf(withOrg(ok('["A"]\n[]\n["MEGALENS_TOKEN"]\n')));
+  assert.equal(paged.note, '');
+  const seenOrg = []; const spy = fakeExec({ 'gh secret': ok('[]'), 'gh api': (a) => { if (a.some((x) => x.includes('organization-secrets'))) { seenOrg.push(a.join(' ')); return ok('["MEGALENS_TOKEN"]'); } return a.some((x) => x.includes('/contents/')) ? ok('file') : ok(H + '\n'); } });
+  await preflight({ exec: spy.exec, cwd: '/r', env });
+  assert.match(seenOrg[0], /per_page=100/); assert.match(seenOrg[0], /--paginate/);
   const unread = await pf(withOrg(bad('HTTP 403')));
   assert.match(unread.note, /organisation secrets could not be read/);
   const net = await msgOf(pf({ 'gh secret': bad('dial tcp: lookup api.github.com: no such host') }));
@@ -311,6 +318,27 @@ test('main: marker words inside findings or engine text never start a second pai
     await viaMain(['review', 'standard'], { exec: g.exec, bin: fakeBinDoc(4, 'x', 'Your runner blocks nested sandboxes') });
     assert.equal(g.calls.length, 0);
   }
+});
+
+// The real engine's sandbox pre-check document (engine-v2 failureDoc: rv_none, no findings, pass reason sandbox_unusable), written to --out, exit 4.
+function fakeBinPrecheck(reviewId = 'rv_none', extra = {}) {
+  const d = mkdtempSync(path.join(tmpdir(), 'mlfake-')); const bin = path.join(d, 'megalens-review');
+  const document = { schema: 'megalens.findings/v1', review_id: reviewId, tier: 'standard', status: 'failed', target: { kind: 'uncommitted', base: null, head: null, snapshot_sha256: '0'.repeat(64) }, passes: [{ name: 'engine', model: '-', effort: '-', status: 'failed', minutes: 0, reason: 'sandbox_unusable' }], findings: [], dropped_by_quiet_mode: 0, dropped_findings: [], usage: { requests: 0, input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 }, notes: ['Your runner blocks nested sandboxes'], ...extra };
+  writeFileSync(bin, `#!/usr/bin/env node\nconst a=process.argv;const i=a.indexOf('--out');if(i>0)require('fs').writeFileSync(a[i+1],${JSON.stringify(JSON.stringify(document))});process.stderr.write('error: Your runner blocks nested sandboxes\\n');process.exit(4);\n`);
+  chmodSync(bin, 0o755); return bin;
+}
+test('main: the engine\'s own sandbox pre-check document (rv_none) falls back to the runner; a real review id or findings never do', async () => {
+  const f = fakeExec({}, { runs: runList });
+  const r = await viaMain(['review', 'standard'], { exec: f.exec, bin: fakeBinPrecheck() });
+  assert.match(r.text, /runs on your GitHub runner instead/); assert.match(r.text, /gh:5/);
+  const real = fakeExec({}, { runs: runList });
+  await viaMain(['review', 'standard'], { exec: real.exec, bin: fakeBinPrecheck('rv_abc12345') });
+  assert.equal(real.calls.length, 0);
+  const withFinding = fakeExec({}, { runs: runList });
+  await viaMain(['review', 'standard'], { exec: withFinding.exec, bin: fakeBinPrecheck('rv_none', { findings: [{ id: 'f' }] }) });
+  assert.equal(withFinding.calls.length, 0);
+  assert.equal(isSandboxPrecheckDoc({ review_id: 'rv_none', findings: [], passes: [{ reason: 'other' }] }, 4), false);
+  assert.equal(isSandboxPrecheckDoc({ review_id: 'rv_none', findings: [], passes: [{ reason: 'sandbox_unusable' }] }, 3), false);
 });
 
 test('main: engine error text that mentions a missing token does not trigger the fallback when a token is set', async () => {

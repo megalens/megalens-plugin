@@ -51,6 +51,16 @@ export function shouldFallBack({ code, stderr = '', docNotes = '' }) {
   return code === 4 && /blocks nested sandboxes|sandbox_unusable|nested sandbox/i.test(`${stderr}\n${docNotes}`);
 }
 
+/**
+ * The engine's own sandbox pre-check document (engine-v2 failureDoc with reason sandbox_unusable), judged by structured fields only:
+ * exit 4, no real review id (rv_none), no findings, and a pass whose reason is exactly sandbox_unusable. Never searches text.
+ */
+export function isSandboxPrecheckDoc(doc, code) {
+  return code === 4 && !!doc && typeof doc === 'object' && doc.review_id === 'rv_none'
+    && Array.isArray(doc.findings) && doc.findings.length === 0
+    && Array.isArray(doc.passes) && doc.passes.some((p) => p && p.reason === 'sandbox_unusable');
+}
+
 /** Environment for gh and git: an allowlist. No MegaLens or OpenAI secrets are passed. GH_TOKEN / GITHUB_TOKEN are for gh itself. */
 export function ghEnv(env) {
   const out = {};
@@ -126,9 +136,15 @@ export async function preflight({ exec, cwd, env, base = null, head = null }) {
   if (Array.isArray(names)) {
     if (!names.some((s) => s?.name === SECRET_NAME)) {
       // gh secret list shows repository secrets only. An organisation secret shared with this repository also works.
-      const og = await run('gh', ['api', '-X', 'GET', `repos/${nwo}/actions/organization-secrets`, '--jq', '[.secrets[].name]']);
-      const onames = og.code === 0 ? jsonOf(og.stdout) : null;
+      const og = await run('gh', ['api', '-X', 'GET', `repos/${nwo}/actions/organization-secrets`, '-f', 'per_page=100', '--paginate', '--jq', '[.secrets[].name]']);
+      // --paginate prints one JSON array per page: join them
+      let onames = null;
+      if (og.code === 0) {
+        const pages = og.stdout.split('\n').map((l) => l.trim()).filter(Boolean).map(jsonOf);
+        if (pages.length && pages.every(Array.isArray)) onames = pages.flat();
+      }
       if (Array.isArray(onames)) { if (!onames.includes(SECRET_NAME)) throw new SetupError(MSG.noSecret); }
+      else if (og.code !== 0 && /HTTP 404|not an organization|not found/i.test(og.stderr)) throw new SetupError(MSG.noSecret); // user-owned repo: no organisation, so the repository list is the whole answer
       else note = `${MSG.orgSecretUnknown}\n`;
     }
   }
