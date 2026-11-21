@@ -216,6 +216,12 @@ test('main: Linux with a missing engine, or a failed sandbox pre-check, falls ba
   assert.equal(other.code, 4); assert.equal(f3.calls.length, 0); assert.doesNotMatch(other.text, /GitHub runner/);
 });
 
+test('main: Linux with no local MEGALENS_TOKEN cannot run the engine, so it uses the runner (which needs no local token)', async () => {
+  const f = fakeExec({}, { runs: runList });
+  const r = await viaMain(['review', 'standard'], { exec: f.exec, bin: fakeBin(0, ''), env: { MEGALENS_TOKEN: undefined } });
+  assert.match(r.text, /runs on your GitHub runner instead/); assert.match(r.text, /gh:5/);
+});
+
 test('main: the runner failing too still says why the local engine did not run', async () => {
   const f = fakeExec({ 'gh --version': bad('', 127) });
   const r = await viaMain(['review', 'standard'], { exec: f.exec, env: { MEGALENS_REVIEW_BIN: '/nonexistent/megalens-review' } });

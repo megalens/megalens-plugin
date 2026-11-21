@@ -134,7 +134,7 @@ export async function main(argv, { env = process.env, cwd = process.cwd(), out =
       if (route.fallbackAllowed) {
         let buf = '';
         const code = await main(['review', ...rest, '--runner', 'local'], { env, cwd, out: (t) => { buf += t; }, err, stdin, flags, exec, platform });
-        if ((code === 4 || code === 127) && (buf.includes(missingBin()) || /blocks nested sandboxes/i.test(buf))) return await viaRunner('The local engine cannot run here, so the review runs on your GitHub runner instead.\n', buf);
+        if ((code === 4 || code === 127) && (buf.includes(missingBin()) || /blocks nested sandboxes/i.test(buf) || /No MegaLens credentials\./.test(buf))) return await viaRunner('The local engine cannot run here (missing, no sandbox, or no local token), so the review runs on your GitHub runner instead.\n', buf);
         out(buf); return code;
       }
     }
