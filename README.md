@@ -162,6 +162,44 @@ A plain text file in the repository, shared by the team. Up to 8 KB is sent with
 
 Rules guide the review. They do not verify a finding, and they do not keep anything out of the upload. Never put secrets in this file.
 
+## Review on your own GitHub runner (macOS, Windows, Linux)
+
+`/megalens:review standard` and `/megalens:review deep` can run the review in **your own GitHub Actions runner** instead of on your machine. Nothing is kept on our side. The code goes only where the MegaLens Action already sends it (the diff and the code excerpts the reviewer reads go through the MegaLens gateway), and it costs the same credits as the Action.
+
+**When this route is used.** On macOS and Windows always. On Linux when the local engine is missing, has no working sandbox, or no local `MEGALENS_TOKEN` is set. `--runner github` forces it, `--runner local` forces the local engine (no fallback).
+
+**Setup, once per repository (3 steps).**
+
+1. Install the GitHub CLI and sign in: `gh auth login`. The folder must be a git repository with a GitHub remote.
+2. Add the workflow file `.github/workflows/megalens-dispatch.yml` to your **default branch** and push it. The file is `templates/megalens-dispatch.yml` in this plugin; if it is missing, the command prints it. GitHub starts a manually triggered workflow only from the default branch.
+3. Store your MegaLens token as a repository secret: `gh secret set MEGALENS_TOKEN` (gh asks for the value; the plugin never reads or prints it).
+
+**What you type.**
+
+| Command | What it does |
+|---|---|
+| `/megalens:review standard` or `deep` | Checks the setup, starts the run and prints an id like `gh:44863951033`. Both tiers are background runs: nothing has been reviewed when it returns. |
+| `/megalens:status gh:<id>` | `queued`, `running`, `done` or `failed`, with the run URL. |
+| `/megalens:result gh:<id>` | Downloads the findings artifact, shows it, and deletes the temporary folder. |
+
+The change reviewed is your latest commit against the merge base with the default branch (or `--base REF --head REF`). **Only commits that are on GitHub are reviewed.** If your latest commit is not pushed, nothing is pushed for you: Claude asks, and only your yes runs `git push`. Uncommitted changes are not reviewed on this route, and the command says so. A `partial` or `failed` review is never described as clean.
+
+**What you see** (real output from the test repository; this run was refused at its first job because the test account had no credits, which is why the status is `failed`):
+
+```
+The local engine cannot run here (missing, no sandbox, or no local token), so the review runs on your GitHub runner instead.
+Review of 71f8628..d63836b in megalens/ml-e2e-review-test, tier standard, runs on your GitHub runner.
+Review started on GitHub: gh:44863951033
+Run: https://github.com/megalens/ml-e2e-review-test/actions/runs/44863951033
+A standard review usually takes a few minutes. Check with /megalens:status gh:44863951033, then fetch with /megalens:result gh:44863951033. Nothing has been reviewed yet.
+
+> /megalens:status gh:44863951033
+Review gh:44863951033: failed. FAILED: the run did not finish successfully (failure). It is not a clean review and says nothing about your change. /megalens:result gh:44863951033 shows what was recorded, if anything.
+Run: https://github.com/megalens/ml-e2e-review-test/actions/runs/44863951033
+```
+
+The workflow file uses the MegaLens Action with the `workflow_dispatch` trigger. It has three jobs, as for pull requests: `create` (holds the token, no checkout), `review` (reads your code, `contents: read`, no token) and `publish` (checks the findings file, no write access, posts nothing because there is no pull request). Dispatch can only be started by someone with write access to the repository.
+
 ## Tests
 
     npm test
