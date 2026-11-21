@@ -389,7 +389,7 @@ test('workflow template: pinned shas, run-name carries tier, base and head, publ
   assert.equal((y.match(/megalens\/review-action@[0-9a-f]{40}/g) || []).length, 3);
   for (const sha of ['11bd71901bbe5b1630ceea73d27597364c9af683', 'ea165f8d65b6e75b540449e92b4886f43607fa02', 'd3f86a106a0bac45b974a628896c90dbdf5c8093']) assert.ok(y.includes(sha));
   const pins = y.match(/megalens\/review-action@[0-9a-f]{40}/g); assert.equal(new Set(pins).size, 1, 'one Action pin in all three jobs');
-  assert.equal(pins[0], 'megalens/review-action@9d1a64e4ca7ceae4e79988a7af764f9483ee0483', 'unreleased dispatch-test commit: re-pin at release (README release checklist)');
+  assert.equal(pins[0], 'megalens/review-action@7eeb537b5cf8f45655b56c0c4b6f1b05058eaa11', 'unreleased v11-candidate commit: re-pin at release (README release checklist)');
   assert.match(readFileSync(new URL('../README.md', import.meta.url), 'utf8'), /Release checklist/);
   assert.match(y, /apparmor_restrict_unprivileged_userns=0/);
   assert.equal(/pull-requests: write|contents: write|actions: write/.test(y), false);

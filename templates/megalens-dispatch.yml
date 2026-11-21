@@ -31,7 +31,7 @@ jobs:
       base_sha: ${{ steps.create.outputs.base_sha }}
     steps:
       - id: create
-        uses: megalens/review-action@9d1a64e4ca7ceae4e79988a7af764f9483ee0483 # dispatch-test
+        uses: megalens/review-action@7eeb537b5cf8f45655b56c0c4b6f1b05058eaa11 # v11-candidate
         with:
           mode: create
           tier: ${{ inputs.tier }}
@@ -60,7 +60,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: megalens/review-action@9d1a64e4ca7ceae4e79988a7af764f9483ee0483 # dispatch-test
+      - uses: megalens/review-action@7eeb537b5cf8f45655b56c0c4b6f1b05058eaa11 # v11-candidate
         env:
           MEGALENS_REVIEW_ID: ${{ needs.create.outputs.review_id }}
           MEGALENS_REVIEW_KEY: ${{ needs.create.outputs.review_key }}
@@ -91,7 +91,7 @@ jobs:
           name: megalens-findings
           path: ${{ runner.temp }}
 
-      - uses: megalens/review-action@9d1a64e4ca7ceae4e79988a7af764f9483ee0483 # dispatch-test
+      - uses: megalens/review-action@7eeb537b5cf8f45655b56c0c4b6f1b05058eaa11 # v11-candidate
         with:
           mode: publish
           tier: ${{ inputs.tier }}

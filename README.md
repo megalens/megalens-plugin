@@ -216,7 +216,7 @@ The workflow file uses the MegaLens Action with the `workflow_dispatch` trigger.
 
 ### Release checklist (not done yet: needs the owner's GO after launch)
 
-`templates/megalens-dispatch.yml` pins `megalens/review-action@9d1a64e4ca7ceae4e79988a7af764f9483ee0483`, the tip of the unreleased `dispatch-test` branch of a private repository. Customers cannot load that. Before this plugin ships:
+`templates/megalens-dispatch.yml` pins `megalens/review-action@7eeb537b5cf8f45655b56c0c4b6f1b05058eaa11`, the tip of the `v11-candidate` branch of the public megalens/review-action repository, not yet on main or tagged. It is not a released ref yet. Before this plugin ships:
 
 1. Release the Action change (merged, tagged) in the public `megalens/review-action`.
 2. Re-pin all three `megalens/review-action@...` lines in `templates/megalens-dispatch.yml`, the Action README example and the test repository's copy to the released commit SHA.
