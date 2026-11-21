@@ -72,6 +72,17 @@ test('precondition messages name the exact fix', async () => {
   assert.equal((await msgOf(pf({ 'gh secret': ok('[]') }))).message, MSG.noSecret);
 });
 
+test('login check uses --active (a stale second account is fine); old gh without the flag is retried plain', async () => {
+  const seen = [];
+  const f = fakeExec({ 'gh auth': (a) => { seen.push(a.join(' ')); return a.includes('--active') ? ok() : bad('account serpreach invalid'); } });
+  await preflight({ exec: f.exec, cwd: '/r', env });
+  assert.deepEqual(seen, ['auth status --active']);
+  const seen2 = [];
+  const g = fakeExec({ 'gh auth': (a) => { seen2.push(a.join(' ')); return a.includes('--active') ? bad('unknown flag: --active') : ok(); } });
+  await preflight({ exec: g.exec, cwd: '/r', env });
+  assert.deepEqual(seen2, ['auth status --active', 'auth status']);
+});
+
 test('secret check: only the name is asked for; no permission to list is a note, not a stop; the value is never read or printed', async () => {
   const f = fakeExec();
   const r = await preflight({ exec: f.exec, cwd: '/r', env });

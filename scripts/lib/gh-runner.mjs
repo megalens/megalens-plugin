@@ -94,7 +94,9 @@ export async function preflight({ exec, cwd, env, base = null, head = null }) {
   const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env) });
   const v = await run('gh', ['--version']);
   if (v.code === 127) throw new SetupError(MSG.noGh);
-  const au = await run('gh', ['auth', 'status']);
+  // --active: a stale second account must not make a working login look broken. Older gh has no such flag, so retry plain.
+  let au = await run('gh', ['auth', 'status', '--active']);
+  if (au.code !== 0 && /unknown flag/i.test(au.stderr)) au = await run('gh', ['auth', 'status']);
   if (au.code !== 0) throw new SetupError(MSG.noLogin);
   const rv = await run('gh', ['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef,url']);
   const repo = rv.code === 0 ? jsonOf(rv.stdout) : null;
