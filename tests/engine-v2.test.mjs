@@ -37,7 +37,7 @@ process.exit(s.exit || 0);
 async function run(argv, { scenario = {}, env = {}, flags: fl = {}, stdin, cwd } = {}) {
   const flags = { double: true, ...fl };
   const f = fake(scenario); let text = ''; let errText = '';
-  const code = await main(argv, { env: { PATH: process.env.PATH, HOME: tmpdir(), MEGALENS_TOKEN: TOKEN, MEGALENS_REVIEW_BIN: f.bin, ...env }, cwd: cwd ?? tmpdir(), out: (s) => { text += s; }, err: (s) => { errText += s; }, flags, ...(stdin !== undefined ? { stdin: async () => stdin } : {}) });
+  const code = await main(argv, { env: { PATH: process.env.PATH, HOME: tmpdir(), MEGALENS_TOKEN: TOKEN, MEGALENS_REVIEW_BIN: f.bin, ...env }, cwd: cwd ?? tmpdir(), out: (s) => { text += s; }, err: (s) => { errText += s; }, flags, exec: async () => ({ code: 127, stdout: '', stderr: 'gh not found' }), ...(stdin !== undefined ? { stdin: async () => stdin } : {}) });
   return { code, text, errText, calls: f.calls(), f };
 }
 const finding = (o) => ({ id: 'f1', file: 'src/a.js', line_start: 3, line_end: 4, title: 'Null deref', claim: 'x is null', failure_scenario: 'call with no args', priority: 'P1', strength: 'strong', found_by: ['codex-standard'], ...o });

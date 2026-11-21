@@ -1,0 +1,102 @@
+# MegaLens review on your own GitHub runner, started by /megalens:review (no pull request needed).
+# Add this file once, on your default branch: .github/workflows/megalens-dispatch.yml
+# Needs the repository secret MEGALENS_TOKEN (gh secret set MEGALENS_TOKEN).
+name: MegaLens Dispatch
+run-name: MegaLens ${{ inputs.tier }} ${{ inputs.head_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: 'standard or deep'
+        required: true
+        default: 'standard'
+      base_sha:
+        description: 'Base commit (40 hex characters)'
+        required: true
+      head_sha:
+        description: 'Head commit (40 hex characters)'
+        required: true
+
+permissions: {}
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      review_id: ${{ steps.create.outputs.review_id }}
+      review_key: ${{ steps.create.outputs.review_key }}
+      head_sha: ${{ steps.create.outputs.head_sha }}
+      base_sha: ${{ steps.create.outputs.base_sha }}
+    steps:
+      - id: create
+        uses: megalens/review-action@e11a2b8e65d4bd7bb440add47ac074d5589751bc # dispatch-test
+        with:
+          mode: create
+          tier: ${{ inputs.tier }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          megalens-token: ${{ secrets.MEGALENS_TOKEN }}
+
+  review:
+    needs: create
+    if: ${{ needs.create.outputs.review_id != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Mask review key
+        env:
+          REVIEW_KEY: ${{ needs.create.outputs.review_key }}
+        run: echo "::add-mask::$REVIEW_KEY"
+
+      - name: Install bubblewrap for engine isolation
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap && (sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true) && for p in /etc/apparmor.d/bwrap-userns-restrict /etc/apparmor.d/unprivileged_userns; do [ -f $p ] && sudo apparmor_parser -R $p || true; done
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.create.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: megalens/review-action@e11a2b8e65d4bd7bb440add47ac074d5589751bc # dispatch-test
+        env:
+          MEGALENS_REVIEW_ID: ${{ needs.create.outputs.review_id }}
+          MEGALENS_REVIEW_KEY: ${{ needs.create.outputs.review_key }}
+        with:
+          mode: review
+          tier: ${{ inputs.tier }}
+          head-sha: ${{ needs.create.outputs.head_sha }}
+          base-sha: ${{ needs.create.outputs.base_sha }}
+          artifact-name: megalens-findings
+          findings-path: ${{ runner.temp }}/findings.json
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: megalens-findings
+          path: ${{ runner.temp }}/findings.json
+          if-no-files-found: ignore
+
+  publish:
+    needs: [create, review]
+    if: always() && needs.review.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: megalens-findings
+          path: ${{ runner.temp }}
+
+      - uses: megalens/review-action@e11a2b8e65d4bd7bb440add47ac074d5589751bc # dispatch-test
+        with:
+          mode: publish
+          tier: ${{ inputs.tier }}
+          head-sha: ${{ needs.create.outputs.head_sha }}
+          base-sha: ${{ needs.create.outputs.base_sha }}
+          artifact-name: megalens-findings
+          findings-path: ${{ runner.temp }}/findings.json
+          fail-on: none

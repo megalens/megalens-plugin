@@ -10,6 +10,7 @@ import { secretPath } from './lib/safety.mjs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { chooseRoute, isRunnerId, runnerReview, runnerStatus, runnerResult, realExec, SetupError } from './lib/gh-runner.mjs';
 import { DOUBLE_TIER_ENABLED, DOUBLE_OFF_MESSAGE, REF_RE, UsageError, parseReviewArgs, assertReviewId, chooseAuth, childEnv, scrub, normalizeFirstReview, renderResult } from './lib/engine-core.mjs';
 
 const MAX_OUT = 1 << 22; // bytes we keep from the engine's output streams
@@ -84,8 +85,17 @@ function runBin(bin, args, { env, cwd }) {
 
 const privateDir = () => mkdtempSync(path.join(tmpdir(), 'megalens-'), { mode: 0o700 });
 
-export async function main(argv, { env = process.env, cwd = process.cwd(), out = (s) => process.stdout.write(s), err = (s) => process.stderr.write(s), stdin = () => readStdin(), flags = {} } = {}) {
-  const [cmd, ...rest] = argv;
+export async function main(argv, { env = process.env, cwd = process.cwd(), out = (s) => process.stdout.write(s), err = (s) => process.stderr.write(s), stdin = () => readStdin(), flags = {}, exec = realExec, platform = process.platform } = {}) {
+  const [cmd, ...rest0] = argv;
+  let rest = rest0; let runnerFlag = null;
+  if (cmd === 'review') {
+    const i = rest0.indexOf('--runner');
+    if (i !== -1) {
+      runnerFlag = rest0[i + 1];
+      if (runnerFlag !== 'github' && runnerFlag !== 'local') { out('--runner needs github or local.\n'); return 4; }
+      rest = [...rest0.slice(0, i), ...rest0.slice(i + 2)];
+    }
+  }
   const say = (t) => out(scrub(t, env));
   try {
     if (cmd === 'first-review-write') {
@@ -107,6 +117,27 @@ export async function main(argv, { env = process.env, cwd = process.cwd(), out =
     if (!['review', 'status', 'result'].includes(cmd)) throw new UsageError('usage: engine.mjs review|status|result|show-change|install|verify ...');
 
     if (cmd === 'review' && rest.some((a, i) => a === 'double' && !['--base', '--head', '--first-review'].includes(rest[i - 1])) && !(flags.double ?? DOUBLE_TIER_ENABLED)) { say(DOUBLE_OFF_MESSAGE + '\n'); return 4; } // before auth: nothing else is touched
+    if ((cmd === 'status' || cmd === 'result') && rest[0] !== undefined && /^gh:/.test(rest[0])) {
+      if (!isRunnerId(rest[0]) || rest.length !== 1) throw new UsageError('that is not a GitHub review id (they look like gh:123456789)');
+      const r = await (cmd === 'status' ? runnerStatus : runnerResult)({ exec, cwd, env }, rest[0]);
+      say(r.text); return r.code;
+    }
+    if (cmd === 'review') {
+      const route = chooseRoute({ platform, runner: runnerFlag });
+      const viaRunner = async (note = '', localText = '') => {
+        const o = parseReviewArgs(rest, flags);
+        const r = await runnerReview({ exec, cwd, env, tier: o.tier, base: o.base, head: o.head, wait: o.wait, ...(flags.runnerTiming ?? {}) });
+        // When the runner cannot start either, the user also needs to hear why the local engine did not run.
+        say(note + r.text + (r.setup && localText ? `\nThe local engine said:\n${localText}` : '')); return r.code;
+      };
+      if (route.route === 'github') return await viaRunner();
+      if (route.fallbackAllowed) {
+        let buf = '';
+        const code = await main(['review', ...rest, '--runner', 'local'], { env, cwd, out: (t) => { buf += t; }, err, stdin, flags, exec, platform });
+        if ((code === 4 || code === 127) && (buf.includes(missingBin()) || /blocks nested sandboxes/i.test(buf))) return await viaRunner('The local engine cannot run here, so the review runs on your GitHub runner instead.\n', buf);
+        out(buf); return code;
+      }
+    }
     const auth = chooseAuth(env, flags);
     if (auth.error) { say(`MegaLens engine not started: ${auth.error}\n`); return 4; }
     const bin = env.MEGALENS_REVIEW_BIN || 'megalens-review';
