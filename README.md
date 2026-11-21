@@ -184,19 +184,33 @@ Rules guide the review. They do not verify a finding, and they do not keep anyth
 
 The change reviewed is your latest commit against the merge base with the default branch (or `--base REF --head REF`). **Only commits that are on GitHub are reviewed.** If your latest commit is not pushed, nothing is pushed for you: Claude asks, and only your yes runs `git push`. Uncommitted changes are not reviewed on this route, and the command says so. A `partial` or `failed` review is never described as clean.
 
-**What you see** (real output from the test repository; this run was refused at its first job because the test account had no credits, which is why the status is `failed`):
+**What you see** (real output from the test repository, a completed Standard review):
 
 ```
-The local engine cannot run here (missing, no sandbox, or no local token), so the review runs on your GitHub runner instead.
-Review of 71f8628..d63836b in megalens/ml-e2e-review-test, tier standard, runs on your GitHub runner.
-Review started on GitHub: gh:44863951033
-Run: https://github.com/megalens/ml-e2e-review-test/actions/runs/44863951033
-A standard review usually takes a few minutes. Check with /megalens:status gh:44863951033, then fetch with /megalens:result gh:44863951033. Nothing has been reviewed yet.
+> /megalens:review standard
+Review of 71f8628..b326c97 in megalens/ml-e2e-review-test, tier standard, runs on your GitHub runner.
+Review started on GitHub: gh:44867820388
+Run: https://github.com/megalens/ml-e2e-review-test/actions/runs/44867820388
+A standard review usually takes a few minutes. Check with /megalens:status gh:44867820388, then fetch with /megalens:result gh:44867820388. Nothing has been reviewed yet.
 
-> /megalens:status gh:44863951033
-Review gh:44863951033: failed. FAILED: the run did not finish successfully (failure). It is not a clean review and says nothing about your change. /megalens:result gh:44863951033 shows what was recorded, if anything.
-Run: https://github.com/megalens/ml-e2e-review-test/actions/runs/44863951033
+> /megalens:status gh:44867820388
+Review gh:44867820388: running. Running. Check again with /megalens:status gh:44867820388.
+(a few minutes later)
+Review gh:44867820388: done. Done. Fetch it with /megalens:result gh:44867820388.
+
+> /megalens:result gh:44867820388
+## MegaLens standard review: complete
+
+### Strong findings (1)
+
+- **P1** `.github/workflows/plugin-b1-matrix.yml:62`: Use a review base available in the checkout
+  - Problem: ...
+
+### Other findings (3)
+...
 ```
+
+If a run fails (for example the account has no credits), `status` says `failed ... It is not a clean review` and `result` says `NOT COMPLETED`.
 
 The workflow file uses the MegaLens Action with the `workflow_dispatch` trigger. It has three jobs, as for pull requests: `create` (holds the token, no checkout), `review` (reads your code, `contents: read`, no token) and `publish` (checks the findings file, no write access, posts nothing because there is no pull request). Dispatch can only be started by someone with write access to the repository.
 
