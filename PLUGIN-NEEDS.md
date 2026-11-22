@@ -1,6 +1,6 @@
 # What the plugin needs from the engine CLI (engine-v2, not modified here)
 
-1. **A way to get `megalens-review` itself.** The engine now has `install` / `verify` for the pinned Codex CLI (the plugin passes them through as `engine.mjs install|verify`), but the `megalens-review` package is not published. Needed: a release path and an install line for the README.
+1. **Engine installation.** With Node 20 or later, install the engine with `npm install -g megalens-review@0.1.3`. The plugin passes through the engine's `install` and `verify` commands for the pinned Codex CLI.
 2. **A stable "still running" signal.** `result` on a running review exits 4 with the stderr text `review is still running`; `unknown review id` likewise. The plugin matches those strings. A distinct exit code, or `state` in a JSON body on stdout, would be sturdier.
 3. **A refusal document.** A gateway refusal at prepare time exits 3 with stderr only and no findings file. The plugin renders that as "not completed". If the engine wrote a `status: failed, refused: true` document in that case too, the wording could name the cause (quota, spend cap, sign-in) without parsing stderr.
 4. **Background-run hand-off.** `run --background` prints `{review_id, state}` on stdout. Confirm that the review id and state directory survive a Claude Code restart (the plugin assumes `status` and `result` work from any later session and any working directory).

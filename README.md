@@ -214,20 +214,15 @@ If a run fails (for example the account has no credits), `status` says `failed .
 
 The workflow file uses the MegaLens Action with the `workflow_dispatch` trigger. It has three jobs, as for pull requests: `create` (holds the token, no checkout), `review` (reads your code, `contents: read`, no token) and `publish` (checks the findings file, no write access, posts nothing because there is no pull request). Dispatch can only be started by someone with write access to the repository.
 
-### Release checklist (not done yet: needs the owner's GO after launch)
+### Action version
 
-`templates/megalens-dispatch.yml` pins `megalens/review-action@7eeb537b5cf8f45655b56c0c4b6f1b05058eaa11`, the tip of the `v11-candidate` branch of the public megalens/review-action repository, not yet on main or tagged. It is not a released ref yet. Before this plugin ships:
-
-1. Release the Action change (merged, tagged) in the public `megalens/review-action`.
-2. Re-pin all three `megalens/review-action@...` lines in `templates/megalens-dispatch.yml`, the Action README example and the test repository's copy to the released commit SHA.
-3. Change the pin check in `tests/gh-runner.test.mjs` to the released SHA.
-4. Run a real Standard review through the plugin once more.
+`templates/megalens-dispatch.yml` pins `megalens/review-action@950eb5f1eeff21008fcf585587b88fc83546cdcf` (tag `v1.2.0`) in all three jobs. The Action uses `megalens-review` version `0.1.3`. If you already set up a dispatch workflow, update the copy on your repository's default branch from this template.
 
 ## Tests
 
     npm test
 
-This runs 75 tests in `tests/collect.test.mjs`, `tests/mcp-server.test.mjs`, `tests/security.test.mjs`, `tests/review2.test.mjs` and `tests/install.test.mjs`. They use throwaway git repositories and a mock MegaLens endpoint, so no real calls are made. They cover the installer (merging, backups, no token by default, `--token-file`, re-running), the collector (size limit, skipping, ordering, redaction, ref and range arguments, rules), and the local server (handshake, hash, bearer header, polling, SSE replies, budgets, missing token, errors, `extraContext`).
+The tests cover the installer, collector, local server, engine commands and GitHub runner commands. They use temporary repositories and mock services, so they make no calls to MegaLens or GitHub Actions.
 
 ## Engine v2 commands (draft)
 
@@ -244,7 +239,7 @@ Alongside the bundle route above, the plugin can run the MegaLens review engine 
 
 Options: `--quiet` turns on the engine's optional filter (off by default); the tier word (standard or deep) is the first argument; `--base REF --head REF` reviews a commit range instead of the uncommitted change.
 
-**Needs:** Node 18+, git, and the engine binary `megalens-review` on your PATH (or its path in `MEGALENS_REVIEW_BIN`). The engine is not bundled with this plugin and is not yet published. See `PLUGIN-NEEDS.md`.
+**Local runner requirements.** Use Git and Node 20 or later. Run `npm install -g megalens-review@0.1.3` to install the engine separately. Keep `megalens-review` on your PATH or set `MEGALENS_REVIEW_BIN` to its path. See `PLUGIN-NEEDS.md`.
 
 **First-time setup:** run `node scripts/engine.mjs install` once. It calls the engine's own `install`, which downloads the pinned Codex CLI and refuses unless its hashes match; `node scripts/engine.mjs verify` re-checks it. Claude is told never to run `install` by itself. The engine needs Linux with bubblewrap, and refuses to run as root, so on a root shell every review ends "NOT COMPLETED".
 
