@@ -1521,7 +1521,7 @@ test('LC4 NEW #1: Standard dispatches once when a workflow is configured and App
     {
       label: 'selected organization installation with a closed PR and inaccessible repo list',
       orgInstallations: [{ id: 22, app_slug: 'megalens', repository_selection: 'selected' }],
-      openPrs: [14],
+      openPrs: [{ number: 14, state: 'closed', closed_at: '2023-11-14T21:00:00Z' }],
       suiteSlug: 'megalens', suiteAge: 300_000,
     },
     { label: 'commit on the default branch with a nonempty workflow range', branch: 'main' },
@@ -1563,6 +1563,70 @@ test('LC4 NEW #1: an active MegaLens suite guards a slow App enqueue when instal
   const result = await runMain(['review'], { exec, timing: { ...clock, sleepMs: 2000 } });
   assert.equal(result.code, 0);
   assert.match(result.text, /MegaLens standard review: complete/);
+  assert.equal(sc.calls.some(({ args }) => args[0] === 'workflow'), false);
+});
+
+test('LC1 NEW #1 reopened: delayed App checks take precedence when suite evidence is old or unreadable', async (t) => {
+  for (const [label, suiteResponse] of [
+    ['old pre-PR suite', (startedAt) => ok(JSON.stringify({ check_suites: [{
+      app: { slug: 'megalens' }, status: 'queued', created_at: new Date(startedAt - 300_000).toISOString(),
+    }] }))],
+    ['forbidden suites', () => bad('HTTP 403')],
+    ['malformed suites', () => ok('{"unexpected":[]}')],
+    ['suite appears during the grace period', (startedAt, elapsed) => ok(JSON.stringify({ check_suites: elapsed ? [{
+      app: { slug: 'megalens' }, status: 'queued', created_at: new Date(startedAt).toISOString(),
+    }] : [] }))],
+  ]) {
+    await t.test(label, async () => {
+      const sc = makeScenario({ nwo: 'alice/my-app', workflowPresent: true, openPrs: [{ number: 12, state: 'open' }] });
+      const clock = fakeClock();
+      const startedAt = clock.now();
+      const exec = (cmd, args, opts) => {
+        const elapsed = clock.now() - startedAt;
+        if (args.some((arg) => arg.endsWith('/check-suites'))) return suiteResponse(startedAt, elapsed);
+        if (args.some((arg) => arg.endsWith('/check-runs')) && elapsed >= 5000) {
+          return ok(JSON.stringify({ check_runs: [makeAppCheckRun({
+            output: { title: '1 strong finding', summary: 'Delayed App finding' },
+          })] }));
+        }
+        return sc.exec(cmd, args, opts);
+      };
+      const result = await runMain(['review'], { exec, timing: { ...clock, sleepMs: 1000, appearWaitMs: 10_000 } });
+      assert.equal(sc.calls.some(({ args }) => args[0] === 'workflow'), false);
+      assert.equal(result.code, 0);
+      assert.match(result.text, /Delayed App finding/);
+    });
+  }
+});
+
+test('LC1 NEW #1 reopened: unreadable suites also prevent dispatch when the App check never appears', async () => {
+  const sc = makeScenario({ workflowPresent: true, openPrs: [12] });
+  const clock = fakeClock();
+  const exec = (cmd, args, opts) => args.some((arg) => arg.endsWith('/check-suites'))
+    ? bad('HTTP 503')
+    : sc.exec(cmd, args, opts);
+  const result = await runMain(['review'], { exec, timing: { ...clock, sleepMs: 1000, appearWaitMs: 5000 } });
+  assert.equal(sc.calls.some(({ args }) => args[0] === 'workflow'), false);
+  assert.equal(result.code, 4);
+  assert.match(result.text, /No MegaLens review check has appeared/);
+});
+
+test('SOL #1 and #2: App-only personal repository follows an initial suite before its first check is published', async () => {
+  const sc = makeScenario({ nwo: 'alice/my-app', openPrs: [12] });
+  const clock = fakeClock();
+  const startedAt = clock.now();
+  const exec = (cmd, args, opts) => {
+    if (args.some((arg) => arg.endsWith('/check-suites'))) {
+      return ok(JSON.stringify({ check_suites: [{ app: { slug: 'megalens' }, status: 'queued', created_at: new Date(startedAt).toISOString() }] }));
+    }
+    if (args.some((arg) => arg.endsWith('/check-runs')) && clock.now() - startedAt >= 5000) {
+      return ok(JSON.stringify({ check_runs: [makeAppCheckRun()] }));
+    }
+    return sc.exec(cmd, args, opts);
+  };
+  const result = await runMain(['review'], { exec, timing: { ...clock, sleepMs: 1000, appearWaitMs: 10_000 } });
+  assert.equal(result.code, 0);
+  assert.match(result.text, /## MegaLens standard review: complete/);
   assert.equal(sc.calls.some(({ args }) => args[0] === 'workflow'), false);
 });
 

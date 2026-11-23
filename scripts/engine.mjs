@@ -374,7 +374,7 @@ export async function main(argv, {
     };
 
     const runAutoRemote = async ({ allowLocalFallback = false } = {}) => {
-      const detected = await prepare((callSignal) => detectRemoteRunner({ exec, cwd, env, signal: callSignal }));
+      const detected = await prepare((callSignal) => detectRemoteRunner({ exec, cwd, env, now: nowFn, signal: callSignal }));
       if (detected.runner === 'app' || (detected.guardApp && o.tier === 'standard' && o.base === null)) {
         const hasWf = detected.hasWorkflow;
         if (o.tier === 'deep') {

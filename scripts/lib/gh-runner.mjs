@@ -21,7 +21,8 @@ export const RUN_ID_RE = /^gh:([1-9][0-9]{0,17})$/;
 export const APP_ID_RE = /^app:([1-9][0-9]{0,17})$/;
 const MAX_FINDINGS = 1 << 22;
 const UNVERIFIED_APP_GRACE_MS = 2000;
-const RECENT_APP_SUITE_MS = 120_000;
+const RECENT_APP_ACTIVITY_MS = 120_000;
+const APP_EVIDENCE_PAGE_SIZE = 100;
 
 export const templatePath = () => path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'templates', WORKFLOW_FILE);
 export const workflowText = () => readFileSync(templatePath(), 'utf8');
@@ -340,7 +341,7 @@ export async function isAppInstalled(opts) {
  *   2. Else the user's GitHub Actions runner when `.github/workflows/megalens-dispatch.yml` is present;
  *   3. Else `none` with one clear setup line.
  */
-export async function detectRemoteRunner({ exec, cwd, env, headSha = null, signal = null }) {
+export async function detectRemoteRunner({ exec, cwd, env, headSha = null, now = Date.now, signal = null }) {
   let repo;
   try { repo = await ghRepoPreflight({ exec, cwd, env, signal }); }
   catch (e) {
@@ -363,6 +364,12 @@ export async function detectRemoteRunner({ exec, cwd, env, headSha = null, signa
     return { runner: 'app', nwo, defaultBranch, hasWorkflow, appSource: active ? 'head-active-check' : 'head-check' };
   }
   if (hasWorkflow) return { runner: 'github', nwo, defaultBranch, hasWorkflow: true, guardApp: unknown && !check };
+  if (unknown && sha) {
+    const suites = await listAppCheckSuites({ exec, cwd, env, nwo, headSha: sha, signal });
+    const recentPending = suites?.some((suite) => ['queued', 'running'].includes(mapCheckState(suite))
+      && suiteTimestamp(suite) > now() - RECENT_APP_ACTIVITY_MS);
+    if (recentPending) return { runner: 'app', nwo, defaultBranch, hasWorkflow, appSource: 'head-pending-suite' };
+  }
   const message = unknown
     ? `Could not verify whether MegaLens is installed for ${nwo}. If you already installed the GitHub App at ${APP_INSTALL_URL}, run /megalens:review --runner app. You can also add ${WORKFLOW_PATH} to use your own GitHub runner.`
     : MSG.notSetup(nwo);
@@ -783,17 +790,23 @@ export async function findAppCheckRun(opts) {
   return (await findAppCheckRunWithStatus(opts)).cr;
 }
 
-async function hasRecentAppSuite({ exec, cwd, env, nwo, headSha, now, signal }) {
+const suiteTimestamp = (suite) => parseTs(suite.updated_at) || parseTs(suite.created_at);
+
+async function listAppCheckSuites({ exec, cwd, env, nwo, headSha, signal }) {
   const r = await exec('gh', [
-    'api', '-X', 'GET', `repos/${nwo}/commits/${headSha}/check-suites`, '-f', 'per_page=100',
-    '--jq', '[.check_suites[]? | {app: {slug: .app.slug}, status, created_at, updated_at}]',
+    'api', '-X', 'GET', `repos/${nwo}/commits/${headSha}/check-suites`, '-f', `per_page=${APP_EVIDENCE_PAGE_SIZE}`,
+    '--jq', '.check_suites | map({app: {slug: .app.slug}, status, created_at, updated_at})',
   ], { cwd, env: ghEnv(env), signal });
   const suites = r.code === 0 ? parsePaginatedList(r.stdout, 'check_suites') : null;
-  return suites?.some((suite) => {
-    if (!isMegaLensAppSlug(suite?.app?.slug, env) || !['queued', 'running'].includes(mapCheckState(suite))) return false;
-    const updatedAt = parseTs(suite.updated_at) || parseTs(suite.created_at);
-    return updatedAt > 0 && Math.abs(now() - updatedAt) < RECENT_APP_SUITE_MS;
-  }) ?? false;
+  if (!suites || suites.length >= APP_EVIDENCE_PAGE_SIZE || suites.some((suite) => typeof suite?.status !== 'string')) return null;
+  return suites.filter((suite) => isMegaLensAppSlug(suite.app?.slug, env));
+}
+
+function suiteAllowsFallback(suites, historicalCutoff) {
+  return suites !== null && suites.every((suite) => {
+    const timestamp = suiteTimestamp(suite);
+    return timestamp > 0 && timestamp < historicalCutoff;
+  });
 }
 
 async function viewCheckRun({ exec, cwd, env, signal = null }, checkRunId, nwo) {
@@ -990,7 +1003,8 @@ export async function appReview({
     }
 
     const prWrapped = await bounded((callSignal) => exec('gh', [
-      'api', '-X', 'GET', `repos/${pre.nwo}/commits/${pre.headSha}/pulls`, '-f', 'per_page=1', '--jq', '[.[]?.number]',
+      'api', '-X', 'GET', `repos/${pre.nwo}/commits/${pre.headSha}/pulls`, '-f', `per_page=${APP_EVIDENCE_PAGE_SIZE}`,
+      '--jq', 'map({state, closed_at})',
     ], { cwd, env: ghEnv(env), signal: callSignal }));
     if (prWrapped.interrupted) return stopBeforeCheck(prWrapped.interrupted);
     const prRes = prWrapped.value;
@@ -999,18 +1013,24 @@ export async function appReview({
     const mayBeTriggeredByApp = defaultMayContainHead || associatedPrs?.length !== 0 || !initialCheckOk;
     let canFallback = allowNoCheckFallback && !mayBeTriggeredByApp;
     if (allowNoCheckFallback && unverifiedApp && initialCheckOk && mayBeTriggeredByApp) {
-      const suite = await bounded((callSignal) => hasRecentAppSuite({ exec, cwd, env, nwo: pre.nwo, headSha: pre.headSha, now, signal: callSignal }));
-      if (suite.interrupted) return stopBeforeCheck(suite.interrupted);
-      // GitHub can expose a new suite before the App publishes a run. Old suites survive app removal.
-      canFallback = !suite.value;
-      if (canFallback) {
+      const readSuites = (signal) => listAppCheckSuites({ exec, cwd, env, nwo: pre.nwo, headSha: pre.headSha, signal });
+      const cutoff = now() - RECENT_APP_ACTIVITY_MS;
+      const onlyHistoricalPrs = !defaultMayContainHead && associatedPrs?.length < APP_EVIDENCE_PAGE_SIZE
+        && associatedPrs.every((pr) => pr?.state === 'closed' && parseTs(pr.closed_at) > 0 && parseTs(pr.closed_at) < cutoff);
+      // An older suite on this SHA can predate a newer PR event. Age only disambiguates closed PR history.
+      const historicalCutoff = onlyHistoricalPrs ? cutoff : 0;
+      const suites = await bounded(readSuites);
+      if (suites.interrupted) return stopBeforeCheck(suites.interrupted);
+      if (suiteAllowsFallback(suites.value, historicalCutoff)) {
         const rechecked = await bounded(async (callSignal) => {
           await sleep(Math.min(appearWaitMs, UNVERIFIED_APP_GRACE_MS), callSignal);
-          return findAppCheckRunWithStatus({ exec, cwd, env, nwo: pre.nwo, headSha: pre.headSha, signal: callSignal });
+          const check = await findAppCheckRunWithStatus({ exec, cwd, env, nwo: pre.nwo, headSha: pre.headSha, signal: callSignal });
+          const safe = check.ok && !check.cr && suiteAllowsFallback(await readSuites(callSignal), historicalCutoff);
+          return { cr: check.cr, safe };
         });
         if (rechecked.interrupted) return stopBeforeCheck(rechecked.interrupted);
         cr = rechecked.value.cr;
-        canFallback = rechecked.value.ok;
+        canFallback = rechecked.value.safe;
       }
     }
 
