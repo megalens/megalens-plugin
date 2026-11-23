@@ -238,3 +238,22 @@ Fixed both plugin findings in [LOOP-CONFIRM3.md](/root/review-input/rv-plugin-ap
 
 - `npm test` passed all 203 tests. All four new regression tests failed against the pre-fix runner and passed with the fix.
 - `git diff --check` passed. The plugin tests required no Postgres instance.
+
+## Fix round
+
+Fixed both open plugin findings from the latest review after reading the earlier rounds in chronological order. [LOOP-CONFIRM1.md](/root/review-input/rv-plugin-app-path/LOOP-CONFIRM1.md)
+
+1. **High — A branch tracking its base skipped its own PR.** The App checks the upstream branch when its remote resolves to the selected GitHub repository. If that branch has no eligible open PR, it checks the local branch name. An upstream in a different repository goes directly to the local branch lookup. The regression covers both cases in automatic and explicit App mode, checks that the submission uses the PR number, and verifies that the bookmark includes the base SHA. The renamed and numeric upstream cases still pass. [PR selection](scripts/lib/gh-runner.mjs#L1421) · [Regression](tests/app-path.test.mjs#L330)
+2. **High — Auth-status failure disabled PR discovery on repository fallback.** A validated GitHub.com origin can supply the repository after a `gh auth status` or `gh repo view` failure. When `gh` is installed, the App still queries the PR in that repository. An inconclusive lookup exits 4, identifies the branch and error, and stops before a review submission or a saved-result read. Tests cover an auth-status error with working PR lookup, a 502 after auth failure, and a 502 on the local lookup after the upstream has no PR. [Repository fallback](scripts/lib/gh-runner.mjs#L473) · [Lookup error handling](scripts/lib/gh-runner.mjs#L1477) · [Auth regression](tests/app-path.test.mjs#L392) · [Lookup regression](tests/app-path.test.mjs#L419)
+
+PR bookmarks continue to require a valid base SHA for reuse. The retained regression exercises missing or invalid GitHub base metadata and refreshes a legacy bookmark once it receives a valid base SHA. [Base validation](scripts/lib/gh-runner.mjs#L1513) · [Bookmark match](scripts/lib/gh-runner.mjs#L1401) · [Regression](tests/app-path.test.mjs#L456)
+
+### Server track
+
+- **FIRST #4.** Early credit or free-review settlement before delivery when `ONE_PATH_V1` is off. [worker-api.ts:599](/root/review-input/ws-ondemand-merge/src/lib/github-setup/worker-api.ts:599)
+- **LOOP-CONFIRM2 new high #1.** Server target resolution and queue deduplication after a PR base change. [on-demand.ts:117](/root/review-input/ws-ondemand-merge/src/lib/github-setup/on-demand.ts:117) · [20261123230000_github_app_on_demand.sql:113](/root/review-input/ws-ondemand-merge/supabase/migrations/20261123230000_github_app_on_demand.sql:113)
+
+### Verification
+
+- Both new regressions failed against the prior runner and passed with the fix.
+- `npm test` passed all 205 tests. `git diff --check` passed. The suite required no Postgres instance.

@@ -32,7 +32,7 @@ export const templatePath = () => path.join(path.dirname(fileURLToPath(import.me
 export const workflowText = () => readFileSync(templatePath(), 'utf8');
 
 export class SetupError extends Error { constructor(msg, { needsUser = false } = {}) { super(msg); this.needsUser = needsUser; } }
-class RepoLookupError extends SetupError {}
+class GhUnavailableError extends SetupError {}
 
 /** Remove exact secret values and token shapes from text while preserving repo names like megalens/ml-e2e-review-test. */
 export function scrubExact(text, env = {}) {
@@ -437,15 +437,15 @@ export function notPushedMessage(sha, branch) {
 async function ghRepoPreflight({ exec, cwd, env, signal = null }) {
   const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
   const v = await run('gh', ['--version']);
-  if (v.code === 127) throw new SetupError(MSG.noGh);
+  if (v.code === 127) throw new GhUnavailableError(MSG.noGh);
   let au = await run('gh', ['auth', 'status', '--active']);
   if (au.code !== 0 && /unknown flag/i.test(au.stderr)) au = await run('gh', ['auth', 'status']);
   if (au.code !== 0) throw new SetupError(MSG.noLogin);
   const rv = await run('gh', ['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef,url']);
   const repo = rv.code === 0 ? jsonOf(rv.stdout) : null;
-  if (!repo || typeof repo.nameWithOwner !== 'string' || !NWO_RE.test(repo.nameWithOwner) || typeof repo.defaultBranchRef?.name !== 'string') throw new RepoLookupError(MSG.noRemote);
+  if (!repo || typeof repo.nameWithOwner !== 'string' || !NWO_RE.test(repo.nameWithOwner) || typeof repo.defaultBranchRef?.name !== 'string') throw new SetupError(MSG.noRemote);
   const nwo = repo.nameWithOwner; const defaultBranch = repo.defaultBranchRef.name;
-  if (!/^[\w./-]{1,100}$/.test(defaultBranch)) throw new RepoLookupError(MSG.noRemote);
+  if (!/^[\w./-]{1,100}$/.test(defaultBranch)) throw new SetupError(MSG.noRemote);
   const envHost = typeof env?.GH_HOST === 'string' && env.GH_HOST.trim() ? env.GH_HOST.trim().toLowerCase() : '';
   let host = null;
   let isGithubCom = false;
@@ -469,14 +469,14 @@ async function ghRepoPreflight({ exec, cwd, env, signal = null }) {
   return { nwo, defaultBranch, host, isGithubCom, hasGh: true };
 }
 
-/** Resolve the App repository from origin, keeping authenticated gh available if only `gh repo view` failed. */
+/** Resolve the App repository from origin. An installed gh can still look up PRs even if auth status fails for another host. */
 async function gitRepoFallback({ exec, cwd, env, signal = null, ghError }) {
   const envHost = typeof env?.GH_HOST === 'string' && env.GH_HOST.trim() ? env.GH_HOST.trim().toLowerCase() : '';
   if (envHost && envHost !== 'github.com') return null;
   const r = await exec('git', ['remote', 'get-url', 'origin'], { cwd, env: ghEnv(env), signal });
   if (r.code !== 0) return null;
   const nwo = parseGitHubRemote(r.stdout.trim());
-  return nwo ? { nwo, defaultBranch: null, host: 'github.com', isGithubCom: true, hasGh: ghError instanceof RepoLookupError } : null;
+  return nwo ? { nwo, defaultBranch: null, host: 'github.com', isGithubCom: true, hasGh: !(ghError instanceof GhUnavailableError) } : null;
 }
 
 /**
@@ -1430,7 +1430,7 @@ async function detectOpenPr({ run, nwo, headSha, env = {} }) {
   }
   const localBranch = br.stdout.trim();
   if (!localBranch) return { state: 'none' }; // detached HEAD
-  const upstream = await run('git', ['for-each-ref', '--format=%(upstream:remoteref)', `refs/heads/${localBranch}`]);
+  const upstream = await run('git', ['for-each-ref', '--format=%(upstream:remotename)%09%(upstream:remoteref)', `refs/heads/${localBranch}`]);
   if (upstream.aborted) return { state: 'aborted' };
   if (upstream.code !== 0) {
     const detail = scrubExact(firstLine(upstream.stderr), env) || 'git for-each-ref failed';
@@ -1439,8 +1439,27 @@ async function detectOpenPr({ run, nwo, headSha, env = {} }) {
       error: `Could not read the upstream git branch (${detail}). Nothing was started and no credit was used. Resolve any Git errors and try again.`,
     };
   }
-  const upstreamRef = upstream.stdout.trim();
-  const branch = upstreamRef.startsWith('refs/heads/') ? upstreamRef.slice('refs/heads/'.length) : localBranch;
+  const [upstreamRemote, upstreamRef] = upstream.stdout.trimEnd().split('\t');
+  const upstreamBranch = upstreamRef?.startsWith('refs/heads/') ? upstreamRef.slice('refs/heads/'.length) : null;
+  if (upstreamRemote && upstreamRemote !== '.' && upstreamBranch && upstreamBranch !== localBranch) {
+    const remote = await run('git', ['remote', 'get-url', '--', upstreamRemote]);
+    if (remote.aborted) return { state: 'aborted' };
+    if (remote.code !== 0) {
+      return {
+        state: 'error',
+        error: 'Could not identify the upstream Git remote. Nothing was started and no credit was used. Check the Git remote configuration and try again.',
+      };
+    }
+    if (parseGitHubRemote(remote.stdout)?.toLowerCase() === nwo.toLowerCase()) {
+      const pr = await lookupOpenPr({ run, nwo, headSha, env, branch: upstreamBranch });
+      if (pr.state !== 'none') return pr;
+    }
+  }
+  // A pushed feature branch can still track its base branch.
+  return lookupOpenPr({ run, nwo, headSha, env, branch: localBranch });
+}
+
+async function lookupOpenPr({ run, nwo, headSha, env, branch }) {
   if (branch.startsWith('-') || !/^[\w./@+-]{1,100}$/.test(branch)) {
     return {
       state: 'error',
@@ -1557,14 +1576,15 @@ export async function appPreflight({ exec, cwd, env, tier = 'standard', preRepo 
   let prBaseSha = null;
   let prBaseRef = null;
   if (repo.hasGh) {
+    const prInfo = await detectOpenPr({ run, nwo: repo.nwo, headSha, env });
+    if (prInfo.state === 'error') throw new SetupError(prInfo.error);
+    if (prInfo.state === 'aborted') throw new SetupError('Interrupted before starting the review. Nothing was started and no credit was used.');
     const onGh = await run('gh', ['api', '--hostname', 'github.com', `repos/${repo.nwo}/commits/${headSha}`, '--jq', '.sha']);
     if (onGh.code !== 0 || onGh.stdout.trim().toLowerCase() !== headSha) {
       const br = await run('git', ['branch', '--show-current']);
       const bn = br.stdout.trim();
       throw new SetupError(notPushedMessage(headSha, /^[\w./-]{1,100}$/.test(bn) ? bn : ''), { needsUser: true });
     }
-    const prInfo = await detectOpenPr({ run, nwo: repo.nwo, headSha, env });
-    if (prInfo.state === 'error') throw new SetupError(prInfo.error);
     if (prInfo.state === 'head_mismatch' && head === null) {
       throw new SetupError(describePrHeadBehind({ tier, expectedSha: headSha, prHeadSha: prInfo.pr.headSha, nwo: repo.nwo, prNumber: prInfo.pr.number }));
     }

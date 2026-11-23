@@ -94,6 +94,9 @@ function makeGitGhExec({
   pushed = true,
   openPr = null,
   upstreamRef = '',
+  upstreamRemote = 'origin',
+  upstreamUrl = remoteUrl,
+  authError = null,
   repoLookupError = null,
   prLookupError = null,
   existingRuns = [],
@@ -106,7 +109,7 @@ function makeGitGhExec({
     const k = `${cmd} ${args.slice(0, 2).join(' ')}`;
     if (cmd === 'gh' && !hasGh) return bad('gh: command not found', 127);
     if (k.startsWith('gh --version')) return ok('gh version 2.60.0');
-    if (k.startsWith('gh auth')) return ok('Logged in');
+    if (k.startsWith('gh auth')) return authError ? bad(authError) : ok('Logged in');
     if (k.startsWith('gh repo')) return repoLookupError ? bad(repoLookupError) : ok(JSON.stringify({ nameWithOwner: nwo, defaultBranchRef: { name: defaultBranch }, url: repoUrl }));
     if (k.startsWith('gh pr') && prLookupError) return bad(prLookupError);
     if (k.startsWith('gh pr')) return openPr ? ok(JSON.stringify(openPr)) : bad('no pull requests found for branch');
@@ -128,9 +131,12 @@ function makeGitGhExec({
     if (k.startsWith('git branch') && args.includes('--show-current')) return ok('feat/payments\n');
     if (k.startsWith('git branch') && args.includes('--contains')) return ok(pushed ? '  origin/feat/payments\n' : '');
     if (cmd === 'git' && args[0] === 'for-each-ref') {
-      assert.deepEqual(args, ['for-each-ref', '--format=%(upstream:remoteref)', 'refs/heads/feat/payments']);
-      return ok(`${upstreamRef}\n`);
+      assert.deepEqual(args, [
+        'for-each-ref', '--format=%(upstream:remotename)%09%(upstream:remoteref)', 'refs/heads/feat/payments',
+      ]);
+      return ok(`${upstreamRef ? upstreamRemote : ''}\t${upstreamRef}\n`);
     }
+    if (k.startsWith('git remote') && args.at(-1) === upstreamRemote) return upstreamUrl ? ok(`${upstreamUrl}\n`) : bad('no such remote');
     if (k.startsWith('git remote')) return remoteUrl ? ok(`${remoteUrl}\n`) : bad('no such remote');
     return bad(`unexpected: ${k} ${args.join(' ')}`, 99);
   };
@@ -321,6 +327,44 @@ test('App finds the PR by the upstream branch name when the local branch has a d
   }
 });
 
+test('App finds the feature PR when its branch tracks a base or a different repository', async (t) => {
+  const cases = [
+    { upstreamRef: 'refs/heads/main', prBranches: ['main', 'feat/payments'] },
+    {
+      upstreamRef: 'refs/heads/release/payments',
+      upstreamRemote: 'upstream',
+      upstreamUrl: 'https://github.com/parent/widget.git',
+      prBranches: ['feat/payments'],
+    },
+  ];
+  for (const { prBranches, ...options } of cases) {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-upstream-base-'));
+    t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+    const gh = makeGitGhExec({ ...options, openPr: openPaymentPr });
+    const branches = [];
+    const exec = (cmd, args, opts) => {
+      if (cmd === 'gh' && args[0] === 'pr') {
+        branches.push(args[2]);
+        if (args[2] === 'main') return bad('no pull requests found for branch "main"');
+      }
+      return gh.exec(cmd, args, opts);
+    };
+    const srv = makeAppServer({ pollSequence: [makeJob({ pr_url: openPaymentPr.url })] });
+    const review = (argv) => runCli(argv, { exec, fetch: srv.fetch, stateDir });
+
+    for (const argv of [['review'], ['review', '--runner', 'app']]) {
+      const result = await review(argv);
+      assert.equal(result.code, 0, result.text);
+      assert.match(result.text, /Off-by-one in discount calculation/);
+    }
+    assert.deepEqual(branches, [...prBranches, ...prBranches]);
+    assert.deepEqual(srv.requests.filter((r) => r.method === 'POST').map((r) => r.body), [
+      { repo: 'acme/widget', tier: 'standard', pr: 42 },
+    ]);
+    assert.equal(loadLatestReview({ env: { MEGALENS_STATE_DIR: stateDir }, repoKey: '/repo-app' }).prBaseSha, B);
+  }
+});
+
 test('App repository lookup falls back to origin while keeping PR lookup and bookmark reuse', async (t) => {
   const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-repo-fallback-'));
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));
@@ -345,6 +389,33 @@ test('App repository lookup falls back to origin while keeping PR lookup and boo
   assert.deepEqual(enterpriseSrv.requests, []);
 });
 
+test('App retains PR discovery on origin when gh auth status fails', async (t) => {
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-auth-fallback-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const gh = makeGitGhExec({ authError: 'HTTP 502 checking another GitHub host', openPr: openPaymentPr });
+  const srv = makeAppServer({ pollSequence: [makeJob({ pr_url: openPaymentPr.url })] });
+  const review = (argv, exec = gh.exec) => runCli(argv, { exec, fetch: srv.fetch, stateDir });
+
+  assert.equal((await review(['review'])).code, 0);
+  assert.equal((await review(['review', '--runner', 'app'])).code, 0);
+  assert.deepEqual(srv.requests.filter((r) => r.method === 'POST').map((r) => r.body), [
+    { repo: 'acme/widget', tier: 'standard', pr: 42 },
+  ]);
+
+  const outage = makeGitGhExec({ authError: 'HTTP 502', prLookupError: 'GraphQL: HTTP 502', workflowPresent: true });
+  const requestCount = srv.requests.length;
+  for (const argv of [['review'], ['review', '--runner', 'app']]) {
+    const result = await review(argv, outage.exec);
+    assert.equal(result.code, 4, result.text);
+    assert.match(result.text, /Could not check whether branch feat\/payments has an open pull request on GitHub \(GraphQL: HTTP 502\)/);
+    assert.match(result.text, /Nothing was started and no credit was used/);
+  }
+  assert.equal(srv.requests.length, requestCount, 'the outage must not read a bookmark or submit');
+  assert.equal(outage.calls.filter((c) => c.cmd === 'gh' && c.args[0] === 'pr').length, 2);
+  assert.equal(outage.calls.some((c) => c.cmd === 'gh' && c.args.some((a) => a.includes('/commits/'))), false);
+  assert.equal(outage.calls.some((c) => c.cmd === 'gh' && c.args[0] === 'workflow'), false);
+});
+
 test('an unsuccessful PR lookup on the origin fallback stops before a submission or saved result read', async (t) => {
   const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-fallback-pr-error-'));
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));
@@ -366,6 +437,19 @@ test('an unsuccessful PR lookup on the origin fallback stops before a submission
   }), true);
   assertLookupError(await review(['review']));
   assert.equal(gh.calls.filter((c) => c.cmd === 'gh' && c.args[0] === 'pr').length, 3);
+
+  const branches = [];
+  const exec = (cmd, args, opts) => {
+    if (cmd === 'gh' && args[0] === 'pr') {
+      branches.push(args[2]);
+      if (args[2] === 'release/payments') return bad('no pull requests found for branch "release/payments"');
+    }
+    return gh.exec(cmd, args, opts);
+  };
+  const localLookupError = await runCli(['review'], { exec, fetch: srv.fetch, stateDir });
+  assert.equal(localLookupError.code, 4, localLookupError.text);
+  assert.match(localLookupError.text, /Could not check whether branch feat\/payments has an open pull request on GitHub \(GraphQL: HTTP 502\)/);
+  assert.deepEqual(branches, ['release/payments', 'feat/payments']);
   assert.equal(srv.requests.some((r) => r.pathname.startsWith('/api/github-app/review-now')), false);
 });
 
