@@ -1,0 +1,8 @@
+interface:
+  display_name: "MegaLens Review"
+  short_description: "Run an independent MegaLens code review and show findings inline"
+  brand_color: "#2563EB"
+  default_prompt: "Run $megalens-review on the current repository."
+
+policy:
+  allow_implicit_invocation: false
