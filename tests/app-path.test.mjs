@@ -1220,3 +1220,213 @@ test('LOOP-CONFIRM1 NEW High + #7 + #9 + #2: PR switch at same SHA, Enterprise c
   assert.match(resAfterPull.text, /Only applies to the moved head/);
   assert.equal(loadLatestReview({ env: { MEGALENS_STATE_DIR: stateDirMoved }, repoKey: '/repo-moved' })?.requestedHeadSha, null);
 });
+
+test('LOOP-CONFIRM2: moved PR rerun after no-ID result (#2), Enterprise no-ID result/status (#7), retargeted PR base (NEW High 1), and PR lookup outage (NEW High 2)', async (t) => {
+  const A = 'a'.repeat(40);
+  const B1 = 'b'.repeat(40);
+  const B2 = 'c'.repeat(40);
+  const D = 'd'.repeat(40);
+  const ID1 = '11111111-1111-4111-8111-111111111111';
+  const ID2 = '22222222-2222-4222-8222-222222222222';
+  const ID3 = '33333333-3333-4333-8333-333333333333';
+  const PR_URL = 'https://github.com/acme/widget/pull/41';
+  const cleanDoc = makeDoc({ findings: [] });
+  const diffDoc = makeDoc({
+    findings: [{
+      id: 'f-diff',
+      file: 'checkout.js',
+      line_start: 1,
+      title: 'Issue in the new PR diff',
+      claim: 'Earlier commit skipped verification',
+      priority: 'P1',
+      strength: 'strong',
+      found_by: ['codex-standard'],
+    }],
+  });
+
+  function makeLoop3Fixture({ moveAtSubmit = false, prLookupErr = null, hasGh = true } = {}) {
+    const dir = mkdtempSync(path.join(tmpdir(), 'mlapp-loop3-'));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    const state = {
+      host: 'github.com',
+      nwo: 'acme/widget',
+      localHead: A,
+      prHead: A,
+      baseSha: B1,
+      baseRef: 'main',
+      posts: [],
+      reads: [],
+      remoteUrl: 'https://github.com/acme/widget.git',
+    };
+    const jobs = new Map();
+    const exec = async (cmd, args) => {
+      if (cmd === 'gh' && !hasGh) return bad('gh: command not found', 127);
+      if (cmd === 'git' && args[0] === 'rev-parse') return ok(args.includes('--show-toplevel') ? '/fixture/widget\n' : `${state.localHead}\n`);
+      if (cmd === 'git' && args[0] === 'status') return ok('');
+      if (cmd === 'git' && args[0] === 'branch') return ok('feature\n');
+      if (cmd === 'git' && args[0] === 'remote') return ok(`${state.remoteUrl}\n`);
+      if (cmd === 'gh' && ['--version', 'auth'].includes(args[0])) return ok('');
+      if (cmd === 'gh' && args[0] === 'repo') {
+        return ok(JSON.stringify({ nameWithOwner: state.nwo, url: `https://${state.host}/${state.nwo}`, defaultBranchRef: { name: 'main' } }));
+      }
+      if (cmd === 'gh' && args[0] === 'pr') {
+        if (prLookupErr) return bad(prLookupErr);
+        return ok(JSON.stringify({
+          number: 41,
+          state: 'OPEN',
+          isDraft: false,
+          isCrossRepository: false,
+          headRefOid: state.prHead,
+          baseRefOid: state.baseSha,
+          baseRefName: state.baseRef,
+          url: `https://github.com/${state.nwo}/pull/41`,
+        }));
+      }
+      if (cmd === 'gh' && args[0] === 'api' && args.some((arg) => arg.includes('/commits/'))) return ok(`${state.localHead}\n`);
+      if (cmd === 'gh' && args[0] === 'api' && args.some((arg) => arg.includes('/contents/'))) return bad('HTTP 404');
+      if (cmd === 'gh' && args[0] === 'run') return ok('[]');
+      return bad(`unexpected: ${cmd} ${args.join(' ')}`);
+    };
+    const fetch = async (url, init = {}) => {
+      const route = new URL(String(url)).pathname;
+      if (route === '/api/github-app/status') {
+        return jsonResp(200, { installed: true, linked: true, notice_accepted: true, suspended: false });
+      }
+      if (route === '/api/github-app/review-now' && init.method === 'POST') {
+        const body = JSON.parse(String(init.body));
+        state.posts.push(body);
+        const id = body.pr ? (state.baseSha === B1 && state.baseRef === 'main' ? ID1 : ID3) : ID2;
+        if (body.pr && moveAtSubmit) state.prHead = D;
+        jobs.set(id, makeJob({
+          job_id: id,
+          head_sha: body.ref || state.prHead,
+          pr_url: body.pr ? PR_URL : null,
+          findings: (id === ID3 || (body.pr && moveAtSubmit)) ? diffDoc : cleanDoc,
+        }));
+        return jsonResp(202, { job_id: id, status_url: `${route}/${id}` });
+      }
+      const id = route.split('/').at(-1);
+      state.reads.push(id);
+      return jobs.has(id) ? jsonResp(200, jobs.get(id)) : jsonResp(404, { error: 'not_found' });
+    };
+    const run = (argv, extraEnv = {}) => runCli(argv, { exec, fetch, stateDir: dir, cwd: '/fixture/widget', env: extraEnv });
+    return { state, run, dir };
+  }
+
+  // 1. Finding #2 (High): Moved PR -> --no-wait -> no-ID result -> review rerun MUST stop with exit 4 and ZERO second POST (no fallback to {ref: A})
+  {
+    const f = makeLoop3Fixture({ moveAtSubmit: true });
+    const first = await f.run(['review', '--no-wait']);
+    assert.equal(first.code, 0, first.text);
+    const refused = await f.run(['result']);
+    assert.equal(refused.code, 4);
+    assert.match(refused.text, /Pull request #41 on GitHub moved to commit ddddddd/);
+    assert.equal(refused.text.includes('Issue in the new PR diff'), false);
+
+    // Rerunning /megalens:review while still on local commit A (PR #41 now at D on GitHub) must NOT submit { ref: A }
+    const repeated = await f.run(['review']);
+    assert.equal(repeated.code, 4);
+    assert.deepEqual(f.state.posts, [{ repo: 'acme/widget', tier: 'standard', pr: 41 }], 'must NEVER submit a second POST or fall back to commit ref');
+    assert.match(repeated.text, /Pull request #41 on GitHub moved to commit ddddddd/);
+    assert.equal(repeated.text.includes('Issue in the new PR diff'), false);
+
+    // Explicit --runner app on a moved PR also stops before POST
+    const forced = await f.run(['review', '--runner', 'app']);
+    assert.equal(forced.code, 4);
+    assert.equal(f.state.posts.length, 1);
+
+    // After git pull (local HEAD = D), no-ID result renders the moved PR's findings cleanly
+    f.state.localHead = D;
+    const afterPull = await f.run(['result']);
+    assert.equal(afterPull.code, 0, afterPull.text);
+    assert.match(afterPull.text, /Issue in the new PR diff/);
+  }
+
+  // 2. Finding #7 (Medium): Enterprise checkout on no-ID /megalens:result and /megalens:status MUST make ZERO App API calls
+  {
+    const f = makeLoop3Fixture();
+    const started = await f.run(['review', '--no-wait']);
+    assert.equal(started.code, 0, started.text);
+    f.state.host = 'github.enterprise.example';
+    f.state.reads.length = 0;
+
+    const res = await f.run(['result']);
+    assert.equal(res.code, 4);
+    assert.deepEqual(f.state.reads, [], 'Enterprise no-ID result must NOT query github.com App job');
+    assert.match(res.text, /No recent MegaLens review found/);
+
+    const st = await f.run(['status']);
+    assert.equal(st.code, 4);
+    assert.deepEqual(f.state.reads, [], 'Enterprise no-ID status must NOT query github.com App job');
+
+    // Also verify no-gh Enterprise origin remote and GH_HOST override reject github.com App bookmark
+    const fNoGh = makeLoop3Fixture({ hasGh: false });
+    await fNoGh.run(['review', '--no-wait']);
+    fNoGh.state.remoteUrl = 'git@github.enterprise.example:acme/widget.git';
+    fNoGh.state.reads.length = 0;
+    const resNoGh = await fNoGh.run(['result']);
+    assert.equal(resNoGh.code, 4);
+    assert.deepEqual(fNoGh.state.reads, []);
+  }
+
+  // 3. NEW High #1: Retargeting an open PR (changing base SHA or base branch while keeping head SHA unchanged) MUST NOT reuse stale clean result
+  {
+    const f = makeLoop3Fixture();
+    const first = await f.run(['review']);
+    assert.equal(first.code, 0, first.text);
+    assert.match(first.text, /No findings were reported/);
+    assert.equal(f.state.posts.length, 1);
+
+    // Retarget base SHA from B1 to B2 while head stays A -> must submit a fresh PR review and surface the new diff's finding
+    f.state.baseSha = B2;
+    const repeated = await f.run(['review']);
+    assert.equal(repeated.code, 0, repeated.text);
+    assert.equal(f.state.posts.length, 2, 'retargeted PR base must submit a new review instead of reusing stale clean bookmark');
+    assert.deepEqual(f.state.posts[1], { repo: 'acme/widget', tier: 'standard', pr: 41 });
+    assert.match(repeated.text, /Issue in the new PR diff/);
+
+    // Once reviewed at B2, repeating again with unchanged B2 reuses the bookmark with ZERO third POST
+    const reusedB2 = await f.run(['review']);
+    assert.equal(reusedB2.code, 0, reusedB2.text);
+    assert.equal(f.state.posts.length, 2);
+    assert.match(reusedB2.text, /Issue in the new PR diff/);
+
+    // Explicit --runner app also detects retargeted baseRef (e.g. main -> release) via Layer 1 dedupe
+    f.state.baseRef = 'release';
+    const retargetRef = await f.run(['review', '--runner', 'app']);
+    assert.equal(retargetRef.code, 0, retargetRef.text);
+    assert.equal(f.state.posts.length, 3);
+  }
+
+  // 4. NEW High #2: PR lookup outage (e.g. gh pr view returns GraphQL: HTTP 502) MUST fail closed with ZERO POST (never silently narrow to commit-only ref)
+  {
+    const f = makeLoop3Fixture({ prLookupErr: 'GraphQL: HTTP 502' });
+    const r = await f.run(['review']);
+    assert.equal(r.code, 4);
+    assert.deepEqual(f.state.posts, [], 'PR lookup outage must NOT submit a narrowed commit-only review');
+    assert.match(r.text, /Could not check whether branch feature has an open pull request/i);
+    assert.match(r.text, /HTTP 502/);
+    assert.match(r.text, /Nothing was started and no credit was used/i);
+
+    // Also fail closed when a saved bookmark already exists and gh pr view hits HTTP 502
+    const fWithBm = makeLoop3Fixture();
+    await fWithBm.run(['review', '--no-wait']);
+    const fOutage = makeLoop3Fixture({ prLookupErr: 'GraphQL: HTTP 502' });
+    saveLatestReview({
+      env: { MEGALENS_STATE_DIR: fOutage.dir },
+      repoKey: '/fixture/widget',
+      id: `app:${ID1}`,
+      runner: 'app',
+      nwo: 'acme/widget',
+      tier: 'standard',
+      headSha: A,
+      prNumber: 41,
+      prBaseSha: B1,
+    });
+    const rBm = await fOutage.run(['review']);
+    assert.equal(rBm.code, 4);
+    assert.deepEqual(fOutage.state.posts, []);
+    assert.deepEqual(fOutage.state.reads, [], 'must not serve a potentially-stale bookmark when PR lookup fails');
+    assert.match(rBm.text, /HTTP 502/);
+  }
+});

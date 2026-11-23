@@ -126,6 +126,7 @@ function makeScenario({
     if (k.startsWith('gh --version')) return ok('gh version 2.60.0');
     if (k.startsWith('gh auth')) return ok('Logged in');
     if (k.startsWith('gh repo')) return ok(JSON.stringify({ nameWithOwner: nwo, defaultBranchRef: { name: defaultBranch }, url: `https://github.com/${nwo}` }));
+    if (k.startsWith('gh pr')) return bad('no pull requests found for branch');
     if (k.startsWith('git rev-parse') && args.includes('--show-toplevel')) return ok(`${repoRoot}\n`);
     if (k.startsWith('git rev-parse')) return ok(`${H}\n`);
     if (k.startsWith('git merge-base')) return ok(`${B}\n`);
@@ -1123,7 +1124,8 @@ test('LC2-SOL4: appReview bounds submit request by waitMs and never accepts an o
     exec: async (cmd, args) => {
       if (cmd === 'git' && args[0] === 'rev-parse') return ok(`${H}\n`);
       if (cmd === 'git' && args[0] === 'status') return ok('');
-      if (cmd === 'gh' && args[0] === 'pr') return bad('no pr');
+      if (cmd === 'git' && args[0] === 'branch') return ok('feature\n');
+      if (cmd === 'gh' && args[0] === 'pr') return bad('no pull requests found for branch');
       if (args.some((a) => a === `repos/acme/widget/commits/${H}`)) return ok(`${H}\n`);
       return bad(`unexpected ${cmd} ${args.join(' ')}`);
     },

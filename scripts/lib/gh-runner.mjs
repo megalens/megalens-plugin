@@ -470,10 +470,35 @@ async function ghRepoPreflight({ exec, cwd, env, signal = null }) {
 
 /** Resolve owner/repo from `git remote get-url origin` when `gh` is unavailable (for App-only setups on github.com). */
 async function gitRepoFallback({ exec, cwd, env, signal = null }) {
+  const envHost = typeof env?.GH_HOST === 'string' && env.GH_HOST.trim() ? env.GH_HOST.trim().toLowerCase() : '';
+  if (envHost && envHost !== 'github.com') return null;
   const r = await exec('git', ['remote', 'get-url', 'origin'], { cwd, env: ghEnv(env), signal });
   if (r.code !== 0) return null;
   const nwo = parseGitHubRemote(r.stdout.trim());
   return nwo ? { nwo, defaultBranch: null, host: 'github.com', isGithubCom: true, hasGh: false } : null;
+}
+
+/**
+ * Verify that the current checkout still belongs to the saved `github.com` App repository before
+ * reading a saved App bookmark in no-ID `/megalens:status` or `/megalens:result`.
+ * Prevents a checkout moved to GitHub Enterprise (or another repo) from querying `https://megalens.ai`.
+ */
+export async function verifyAppBookmarkRepo({ exec = realExec, cwd, env, saved, signal = null }) {
+  if (!saved || saved.runner !== 'app') return { valid: true };
+  let repo = null;
+  try {
+    repo = await ghRepoPreflight({ exec, cwd, env, signal });
+  } catch (e) {
+    if (e instanceof SetupError) {
+      repo = await gitRepoFallback({ exec, cwd, env, signal });
+    } else {
+      throw e;
+    }
+  }
+  if (signal?.aborted) return { valid: false, aborted: true };
+  if (!repo || !repo.isGithubCom) return { valid: false };
+  if (saved.nwo && repo.nwo.toLowerCase() !== saved.nwo.toLowerCase()) return { valid: false };
+  return { valid: true, repo };
 }
 
 /** True when the dispatch workflow file is present on the default branch. */
@@ -1282,6 +1307,8 @@ async function checkBookmarkHeadDrift(ctx, job, rawId, savedBookmark, saveLatest
       tier: job?.tier || savedBookmark.tier,
       headSha: actualSha,
       prNumber: savedBookmark.prNumber,
+      prBaseSha: savedBookmark.prBaseSha,
+      prBaseRef: savedBookmark.prBaseRef,
     });
     return null;
   }
@@ -1293,6 +1320,8 @@ async function checkBookmarkHeadDrift(ctx, job, rawId, savedBookmark, saveLatest
     headSha: actualSha,
     requestedHeadSha: expectedSha,
     prNumber: savedBookmark.prNumber,
+    prBaseSha: savedBookmark.prBaseSha,
+    prBaseRef: savedBookmark.prBaseRef,
   });
   return {
     text: describeHeadMismatch({
@@ -1366,24 +1395,107 @@ export async function appResult(ctx, rawId, { showId = true, savedBookmark = nul
   return renderAppJob(v.job, `app:${id}`, { env: ctx.env, showId });
 }
 
-async function detectOpenPr({ run, nwo, headSha }) {
-  const br = await run('git', ['branch', '--show-current']);
-  const branch = br.code === 0 ? br.stdout.trim() : '';
-  if (!branch || branch.startsWith('-') || !/^[\w./-]{1,100}$/.test(branch)) return null;
-  const prRes = await run('gh', ['pr', 'view', branch, '-R', `github.com/${nwo}`, '--json', 'number,state,isDraft,headRefOid,isCrossRepository,url']);
-  if (prRes.code !== 0) return null;
-  const pr = jsonOf(prRes.stdout);
-  if (!pr || typeof pr !== 'object') return null;
-  const num = pr.number;
-  if (!Number.isInteger(num) || num <= 0 || num > 2_147_483_647) return null;
-  if (String(pr.state ?? '').toUpperCase() !== 'OPEN') return null;
-  if (pr.isDraft === true || pr.isCrossRepository === true) return null;
-  if (typeof pr.headRefOid !== 'string' || pr.headRefOid.toLowerCase() !== headSha) return null;
-  if (typeof pr.url !== 'string' || pr.url.trim().toLowerCase() !== `https://github.com/${nwo.toLowerCase()}/pull/${num}`) return null;
-  return num;
+const NO_PR_FOUND_RE = /no pull requests? found|could not resolve to a pullrequest/i;
+
+function bookmarkMatchesPrBase(saved, pr) {
+  if (!pr) return true;
+  if (pr.baseSha || saved?.prBaseSha) {
+    if (!pr.baseSha || !saved?.prBaseSha || saved.prBaseSha !== pr.baseSha) return false;
+  }
+  if (pr.baseRef || saved?.prBaseRef) {
+    if (!pr.baseRef || !saved?.prBaseRef || saved.prBaseRef !== pr.baseRef) return false;
+  }
+  return true;
 }
 
-export async function appPreflight({ exec, cwd, env, preRepo = null, base = null, head = null, signal = null }) {
+function describePrHeadBehind({ tier, expectedSha, prHeadSha, nwo, prNumber }) {
+  const tierPrefix = (tier === 'standard' || tier === 'deep') ? `${tier} ` : '';
+  return [
+    `## MegaLens ${tierPrefix}review: NOT COMPLETED`,
+    '',
+    `Pull request #${prNumber} on GitHub is at commit ${short(prHeadSha)}, while your local checkout is at ${short(expectedSha)}. Nothing was started and no credit was used. Pull the latest changes (\`git pull\`) or push your branch, then run /megalens:review again (or check https://github.com/${nwo}/pull/${prNumber}). This is not a clean review.`,
+  ].join('\n') + '\n';
+}
+
+/**
+ * Look up an open, non-draft, same-repo PR on `github.com/<nwo>` for the checked-out branch.
+ * Fails closed (`state: 'error'`) on transient GitHub/network errors (e.g. HTTP 502) so a PR lookup
+ * outage never silently narrows a paid review to a single commit. Also returns `state: 'head_mismatch'`
+ * when the open PR on GitHub has moved to a different head commit, and captures baseRefOid/baseRefName
+ * so retargeting a PR invalidates stale clean bookmarks.
+ */
+async function detectOpenPr({ run, nwo, headSha, env = {} }) {
+  const br = await run('git', ['branch', '--show-current']);
+  if (br.aborted) return { state: 'aborted' };
+  if (br.code !== 0) {
+    const detail = scrubExact(firstLine(br.stderr), env) || 'git branch failed';
+    return {
+      state: 'error',
+      error: `Could not read the current git branch (${detail}). Nothing was started and no credit was used. Resolve any Git errors and try again.`,
+    };
+  }
+  const branch = br.stdout.trim();
+  if (!branch) return { state: 'none' }; // detached HEAD
+  if (branch.startsWith('-') || !/^[\w./@+-]{1,100}$/.test(branch)) {
+    return {
+      state: 'error',
+      error: 'Could not look up an open pull request for this branch name. Nothing was started and no credit was used.',
+    };
+  }
+  const prRes = await run('gh', [
+    'pr', 'view', branch,
+    '-R', `github.com/${nwo}`,
+    '--json', 'number,state,isDraft,headRefOid,baseRefOid,baseRefName,isCrossRepository,url',
+  ]);
+  if (prRes.aborted) return { state: 'aborted' };
+  if (prRes.code !== 0) {
+    if (NO_PR_FOUND_RE.test(`${prRes.stderr}\n${prRes.stdout}`)) return { state: 'none' };
+    const detail = scrubExact(firstLine(prRes.stderr || prRes.stdout), env) || 'gh pr view failed';
+    return {
+      state: 'error',
+      error: `Could not check whether branch ${branch} has an open pull request on GitHub (${detail}). Nothing was started and no credit was used. Try again in a moment.`,
+    };
+  }
+  const pr = jsonOf(prRes.stdout);
+  if (!pr || typeof pr !== 'object' || Array.isArray(pr)) {
+    return {
+      state: 'error',
+      error: `Could not read the pull request details from GitHub for branch ${branch}. Nothing was started and no credit was used. Try again in a moment.`,
+    };
+  }
+  const num = pr.number;
+  if (!Number.isInteger(num) || num <= 0 || num > 2_147_483_647) {
+    return {
+      state: 'error',
+      error: `GitHub returned an invalid pull request number for branch ${branch}. Nothing was started and no credit was used. Try again in a moment.`,
+    };
+  }
+  if (String(pr.state ?? '').toUpperCase() !== 'OPEN') return { state: 'none' };
+  if (pr.isDraft === true || pr.isCrossRepository === true) return { state: 'none' };
+  if (typeof pr.url !== 'string' || pr.url.trim().toLowerCase() !== `https://github.com/${nwo.toLowerCase()}/pull/${num}`) {
+    return { state: 'none' };
+  }
+  const prHeadSha = typeof pr.headRefOid === 'string' && SHA_RE.test(pr.headRefOid.trim())
+    ? pr.headRefOid.trim().toLowerCase()
+    : null;
+  if (!prHeadSha) {
+    return {
+      state: 'error',
+      error: `GitHub returned an invalid head commit for pull request #${num}. Nothing was started and no credit was used. Try again in a moment.`,
+    };
+  }
+  const baseSha = typeof pr.baseRefOid === 'string' && SHA_RE.test(pr.baseRefOid.trim())
+    ? pr.baseRefOid.trim().toLowerCase()
+    : null;
+  const baseRef = typeof pr.baseRefName === 'string' && /^[\w./@+-]{1,100}$/.test(pr.baseRefName.trim())
+    ? pr.baseRefName.trim()
+    : null;
+  const info = { number: num, headSha: prHeadSha, baseSha, baseRef };
+  if (prHeadSha !== headSha) return { state: 'head_mismatch', pr: info };
+  return { state: 'open', pr: info };
+}
+
+export async function appPreflight({ exec, cwd, env, tier = 'standard', preRepo = null, base = null, head = null, signal = null }) {
   if (base !== null) throw new SetupError(MSG.appRangeUnsupported);
   const token = extractAppToken(env);
   if (!token) throw new SetupError(MSG.appNoToken);
@@ -1429,6 +1541,8 @@ export async function appPreflight({ exec, cwd, env, preRepo = null, base = null
   }
 
   let prNumber = null;
+  let prBaseSha = null;
+  let prBaseRef = null;
   if (repo.hasGh) {
     const onGh = await run('gh', ['api', '--hostname', 'github.com', `repos/${repo.nwo}/commits/${headSha}`, '--jq', '.sha']);
     if (onGh.code !== 0 || onGh.stdout.trim().toLowerCase() !== headSha) {
@@ -1436,10 +1550,19 @@ export async function appPreflight({ exec, cwd, env, preRepo = null, base = null
       const bn = br.stdout.trim();
       throw new SetupError(notPushedMessage(headSha, /^[\w./-]{1,100}$/.test(bn) ? bn : ''), { needsUser: true });
     }
-    prNumber = await detectOpenPr({ run, nwo: repo.nwo, headSha });
+    const prInfo = await detectOpenPr({ run, nwo: repo.nwo, headSha, env });
+    if (prInfo.state === 'error') throw new SetupError(prInfo.error);
+    if (prInfo.state === 'head_mismatch' && head === null) {
+      throw new SetupError(describePrHeadBehind({ tier, expectedSha: headSha, prHeadSha: prInfo.pr.headSha, nwo: repo.nwo, prNumber: prInfo.pr.number }));
+    }
+    if (prInfo.state === 'open') {
+      prNumber = prInfo.pr.number;
+      prBaseSha = prInfo.pr.baseSha;
+      prBaseRef = prInfo.pr.baseRef;
+    }
   }
 
-  return { nwo: repo.nwo, defaultBranch: repo.defaultBranch, host: repo.host, isGithubCom: true, hasGh: repo.hasGh, headSha, prNumber, note, origin: apiBase.origin, token };
+  return { nwo: repo.nwo, defaultBranch: repo.defaultBranch, host: repo.host, isGithubCom: true, hasGh: repo.hasGh, headSha, prNumber, prBaseSha, prBaseRef, note, origin: apiBase.origin, token };
 }
 
 /**
@@ -1701,13 +1824,76 @@ export async function resolveMatchingAppBookmark({
   const headRef = head ?? 'HEAD';
   const hs = await run('git', ['rev-parse', '--verify', `${headRef}^{commit}`]);
   const headSha = hs.stdout.trim().toLowerCase();
-  if (hs.code !== 0 || !SHA_RE.test(headSha) || headSha !== saved.headSha) {
+  const headMatchesSaved = headSha === saved.headSha;
+  const headMatchesRequested = Boolean(saved.requestedHeadSha && headSha === saved.requestedHeadSha);
+  if (hs.code !== 0 || !SHA_RE.test(headSha) || (!headMatchesSaved && !headMatchesRequested)) {
     return { action: 'continue', preRepo: reusablePreRepo };
   }
 
-  // Resolve the current open PR before reusing a bookmark: two PRs at the same SHA can target different bases.
-  const currentPrNumber = repo.hasGh ? await detectOpenPr({ run, nwo: repo.nwo, headSha }) : null;
-  if ((saved.prNumber ?? null) !== (currentPrNumber ?? null)) {
+  // Resolve the current open PR (including its base SHA/ref and head SHA) before reusing a bookmark:
+  // two PRs at the same SHA or a retargeted PR base have different diffs, and a moved PR or PR lookup
+  // outage must stop rather than fall through to a narrowed single-commit review.
+  let currentPr = null;
+  if (repo.hasGh) {
+    const prInfo = await detectOpenPr({ run, nwo: repo.nwo, headSha, env });
+    if (prInfo.state === 'aborted') return { action: 'aborted' };
+    if (prInfo.state === 'error') {
+      return { action: 'stop', code: 4, text: `${prInfo.error}\n` };
+    }
+    if (prInfo.state === 'head_mismatch') {
+      if (headMatchesRequested && saved.prNumber === prInfo.pr.number) {
+        return {
+          action: 'stop',
+          code: 4,
+          text: describeHeadMismatch({
+            tier,
+            expectedSha: headSha,
+            actualSha: saved.headSha,
+            nwo: repo.nwo,
+            prNumber: saved.prNumber,
+          }),
+        };
+      }
+      if (head === null) {
+        return {
+          action: 'stop',
+          code: 4,
+          text: describePrHeadBehind({
+            tier,
+            expectedSha: headSha,
+            prHeadSha: prInfo.pr.headSha,
+            nwo: repo.nwo,
+            prNumber: prInfo.pr.number,
+          }),
+        };
+      }
+      return { action: 'continue', preRepo: reusablePreRepo };
+    }
+    if (prInfo.state === 'open') currentPr = prInfo.pr;
+  }
+
+  if (headMatchesRequested) {
+    if (!repo.hasGh && saved.prNumber === null) {
+      return {
+        action: 'stop',
+        code: 4,
+        text: describeHeadMismatch({
+          tier,
+          expectedSha: headSha,
+          actualSha: saved.headSha,
+          nwo: repo.nwo,
+          prNumber: null,
+        }),
+      };
+    }
+    return { action: 'continue', preRepo: reusablePreRepo };
+  }
+
+  const currentPrNumber = currentPr?.number ?? null;
+  if ((saved.prNumber ?? null) !== currentPrNumber) {
+    return { action: 'continue', preRepo: reusablePreRepo };
+  }
+  if (currentPr && !bookmarkMatchesPrBase(saved, currentPr)) {
     return { action: 'continue', preRepo: reusablePreRepo };
   }
 
@@ -1758,6 +1944,8 @@ export async function resolveMatchingAppBookmark({
       headSha: actualSha,
       requestedHeadSha: headSha,
       prNumber: currentPrNumber,
+      prBaseSha: currentPr?.baseSha ?? saved.prBaseSha ?? null,
+      prBaseRef: currentPr?.baseRef ?? saved.prBaseRef ?? null,
     });
     return {
       action: 'stop',
@@ -1769,7 +1957,17 @@ export async function resolveMatchingAppBookmark({
   if (st === 'queued' || st === 'running') {
     return {
       action: 'resume',
-      resumeAttempt: { id: saved.id, job, headSha, nwo: repo.nwo, prNumber: currentPrNumber, note, initialSleptMs: read.sleptMs },
+      resumeAttempt: {
+        id: saved.id,
+        job,
+        headSha,
+        nwo: repo.nwo,
+        prNumber: currentPrNumber,
+        prBaseSha: currentPr?.baseSha ?? saved.prBaseSha ?? null,
+        prBaseRef: currentPr?.baseRef ?? saved.prBaseRef ?? null,
+        note,
+        initialSleptMs: read.sleptMs,
+      },
     };
   }
   if (st === 'done' && job.findings && ['complete', 'partial', 'too_large'].includes(String(job.result_status ?? ''))) {
@@ -1827,12 +2025,18 @@ export async function appReview({
     id = resumeAttempt.id;
     reused = true;
     initialSleptMs = Math.max(0, Number(resumeAttempt.initialSleptMs) || 0);
-    targetMeta = { nwo: resumeAttempt.nwo ?? null, headSha: resumeAttempt.headSha, prNumber: resumeAttempt.prNumber ?? null };
+    targetMeta = {
+      nwo: resumeAttempt.nwo ?? null,
+      headSha: resumeAttempt.headSha,
+      prNumber: resumeAttempt.prNumber ?? null,
+      prBaseSha: resumeAttempt.prBaseSha ?? null,
+      prBaseRef: resumeAttempt.prBaseRef ?? null,
+    };
     if (resumeAttempt.note) emit(resumeAttempt.note);
   } else {
     let pre;
     try {
-      const preRes = await bounded((callSignal) => appPreflight({ exec, cwd, env, preRepo, base, head, signal: callSignal }));
+      const preRes = await bounded((callSignal) => appPreflight({ exec, cwd, env, tier, preRepo, base, head, signal: callSignal }));
       if (preRes.interrupted === 'aborted') {
         return { text: 'Interrupted before starting the review. Nothing was started and no credit was used.\n', code: 4, aborted: true };
       }
@@ -1845,12 +2049,19 @@ export async function appReview({
       throw e;
     }
 
-    targetMeta = { nwo: pre.nwo, headSha: pre.headSha, prNumber: pre.prNumber };
+    targetMeta = {
+      nwo: pre.nwo,
+      headSha: pre.headSha,
+      prNumber: pre.prNumber,
+      prBaseSha: pre.prBaseSha ?? null,
+      prBaseRef: pre.prBaseRef ?? null,
+    };
     if (pre.note) emit(pre.note);
 
-    // Layer 1 dedupe: if we already bookmarked an App job for this exact repo + commit + PR + tier, check it first
+    // Layer 1 dedupe: if we already bookmarked an App job for this exact repo + commit + PR + PR base + tier, check it first
     // so re-running /megalens:review after a timeout or lost reply reuses the in-flight or retained job with no POST.
     const prev = loadLatest?.();
+    const currentPrTarget = pre.prNumber !== null ? { baseSha: pre.prBaseSha, baseRef: pre.prBaseRef } : null;
     if (
       prev
       && prev.runner === 'app'
@@ -1860,6 +2071,7 @@ export async function appReview({
       && prev.tier === tier
       && prev.headSha === pre.headSha
       && (prev.prNumber ?? null) === (pre.prNumber ?? null)
+      && bookmarkMatchesPrBase(prev, currentPrTarget)
     ) {
       const existing = await fetchAppJobWithRetry({
         env,
@@ -1895,6 +2107,8 @@ export async function appReview({
             headSha: actualSha,
             requestedHeadSha: pre.headSha,
             prNumber: pre.prNumber,
+            prBaseSha: pre.prBaseSha,
+            prBaseRef: pre.prBaseRef,
           });
           emit(describeHeadMismatch({ tier, expectedSha: pre.headSha, actualSha, nwo: pre.nwo, prNumber: pre.prNumber }));
           return { text: acc, code: 4, id: prev.id, reused: true };
@@ -1928,7 +2142,16 @@ export async function appReview({
       }
       id = started.id;
       if (saveLatest) {
-        bookmarkSaved = saveLatest({ id, runner: 'app', nwo: pre.nwo, tier, headSha: pre.headSha, prNumber: pre.prNumber }) !== false;
+        bookmarkSaved = saveLatest({
+          id,
+          runner: 'app',
+          nwo: pre.nwo,
+          tier,
+          headSha: pre.headSha,
+          prNumber: pre.prNumber,
+          prBaseSha: pre.prBaseSha,
+          prBaseRef: pre.prBaseRef,
+        }) !== false;
       }
     }
   }
@@ -1991,6 +2214,8 @@ export async function appReview({
         headSha: w.last.actualSha,
         requestedHeadSha: targetMeta.headSha,
         prNumber: targetMeta.prNumber,
+        prBaseSha: targetMeta.prBaseSha,
+        prBaseRef: targetMeta.prBaseRef,
       });
     }
     emit(describeHeadMismatch({

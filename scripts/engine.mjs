@@ -13,7 +13,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   scrubExact, shouldFallBack, isSandboxPrecheckDoc, isRunnerId, isAppId, APP_PATH_ENABLED, ghEnv,
-  extractAppToken, detectRemoteRunner, resolveMatchingAppBookmark, appReview, appStatus, appResult,
+  extractAppToken, detectRemoteRunner, resolveMatchingAppBookmark, verifyAppBookmarkRepo, appReview, appStatus, appResult,
   runnerReview, runnerStatus, runnerResult, findLatestRemoteReview, realExec, MSG,
 } from './lib/gh-runner.mjs';
 import { DOUBLE_TIER_ENABLED, DOUBLE_OFF_MESSAGE, UsageError, parseReviewArgs, assertReviewId, chooseAuth, childEnv, scrub, normalizeFirstReview, renderResult, effectiveStatus } from './lib/engine-core.mjs';
@@ -283,6 +283,17 @@ export async function main(argv, {
           saved = loadLatestReview({ env, repoKey: resolvedRepoKey });
         }
         if (!APP_PATH_ENABLED && isAppId(saved?.id)) saved = null;
+        if (saved?.runner === 'app') {
+          const repoCheck = await raceWithDeadline(
+            (callSignal) => verifyAppBookmarkRepo({ exec, cwd, env, saved, signal: callSignal }),
+            { signal, remainingMs: timing.latestLookupMs ?? LATEST_LOOKUP_MS },
+          );
+          if (repoCheck.interrupted === 'aborted' || repoCheck.value?.aborted) {
+            say('The latest review lookup did not finish. Try the command again or supply the review id.\n');
+            return 4;
+          }
+          if (repoCheck.interrupted || !repoCheck.value?.valid) saved = null;
+        }
         const remote = await raceWithDeadline(
           (callSignal) => findLatestRemoteReview({ exec, cwd, env, signal: callSignal }),
           { signal, remainingMs: timing.latestLookupMs ?? LATEST_LOOKUP_MS },

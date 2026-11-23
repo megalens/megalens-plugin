@@ -186,3 +186,36 @@ Addressed every open/new finding from `/root/review-input/rv-plugin-app-path/LOO
 ### Verification
 
 - Ran `npm test && git diff --check`: **198 / 198 tests passed** (0 failed, 0 skipped), zero whitespace/patch errors.
+
+
+## Fix round (LOOP-CONFIRM2)
+
+Addressed every open/new finding from `/root/review-input/rv-plugin-app-path/LOOP-CONFIRM2.md` (4 fixed in plugin code + tests in `/root/review-input/ws-plugin-app-path`; #4 confirmed as an external server-side launch gate outside this plugin-only workspace with `file:line` evidence):
+
+1. **Finding #2 (High — Moved PR: `--no-wait` -> no-ID `result` -> `/megalens:review` rerun fell back to a second billable commit-only `{ ref }` POST) — Fixed.**
+   - `detectOpenPr` in [scripts/lib/gh-runner.mjs](scripts/lib/gh-runner.mjs) now returns a structured state (`open`, `none`, `head_mismatch`, `error`, `aborted`) instead of silently returning `null` when an open, non-draft, same-repo PR exists on the current branch at a different `headRefOid`.
+   - `resolveMatchingAppBookmark` now matches bookmarks on both `saved.headSha` and `saved.requestedHeadSha`, and when `detectOpenPr` reports `head_mismatch` for the moved PR (including after no-ID `/megalens:result` updated `headSha` to the moved SHA and stored the local SHA in `requestedHeadSha`), it stops with exit 4 (`describeHeadMismatch` / `describePrHeadBehind`) and makes zero second `POST`. `appPreflight` also fails closed on `head_mismatch` so explicit `--runner app` or different-tier reruns never silently narrow a moved PR to a single-commit `{ ref }` submission.
+   - Test: `tests/app-path.test.mjs` (`LOOP-CONFIRM2: ...`) runs `review --no-wait` (PR moves at submit) -> no-ID `result` (exit 4) -> `review` rerun (asserts exit 4, zero second `POST`, no `{ ref }` fallback) -> `--runner app` (zero second `POST`) -> `result` after `git pull` (exit 0).
+
+2. **Finding #7 (Medium — Enterprise checkout on no-ID `/megalens:result` and `/megalens:status` still read a saved `github.com` App bookmark) — Fixed.**
+   - Added `verifyAppBookmarkRepo` in [scripts/lib/gh-runner.mjs](scripts/lib/gh-runner.mjs) (also guarding `GH_HOST` in `gitRepoFallback`) and wired it into no-ID `status` / `result` in [scripts/engine.mjs](scripts/engine.mjs) before `pickNewerReview` or any App API call. When the current checkout is on GitHub Enterprise (or a different repo), the stale `github.com` App bookmark is ignored, zero requests reach `https://megalens.ai`, and no-ID `status`/`result` returns exit 4 (or shows a real Enterprise workflow run if present).
+   - Test: `tests/app-path.test.mjs` (`LOOP-CONFIRM2: ...`) starts an App review on `github.com`, moves the checkout to `github.enterprise.example` (both with `gh` and via no-`gh` Enterprise remote), and asserts no-ID `result` and `status` exit 4 with zero reads to `https://megalens.ai`.
+
+3. **NEW High — Retargeting an open PR returned a stale clean result — Fixed.**
+   - `detectOpenPr` in [scripts/lib/gh-runner.mjs](scripts/lib/gh-runner.mjs) now requests `baseRefOid,baseRefName` from `gh pr view`, [scripts/lib/latest-review.mjs](scripts/lib/latest-review.mjs) persists validated `prBaseSha` and `prBaseRef` alongside `prNumber`, and `bookmarkMatchesPrBase` is enforced in both `resolveMatchingAppBookmark` and `appReview` Layer 1 dedupe (and preserved across head-drift bookmark updates). When an open PR's base commit SHA or base branch changes while its head SHA stays identical, `/megalens:review` (default and `--runner app`) skips the stale bookmark and submits a fresh PR review for the new diff.
+   - Test: `tests/app-path.test.mjs` (`LOOP-CONFIRM2: ...`) completes a clean PR review at base `B1`, retargets `baseRefOid` to `B2` (and separately `baseRefName` to `release`) with the same head `A`, and verifies `/megalens:review` submits a fresh `{ repo, tier, pr: 41 }` review and surfaces the new diff's finding (while still reusing the bookmark when the base is unchanged).
+
+4. **NEW High — A PR lookup outage (`gh pr view` HTTP 502) silently narrowed a paid review to one commit — Fixed.**
+   - `detectOpenPr` in [scripts/lib/gh-runner.mjs](scripts/lib/gh-runner.mjs) now distinguishes a definitive "no pull request" response (`no pull requests? found|could not resolve to a pullrequest`) and detached `HEAD` from transient/unexpected failures (`GraphQL: HTTP 502`, network/auth errors, malformed JSON, or failed `git branch`). Any non-definitive lookup failure returns `{ state: 'error' }`, causing both `resolveMatchingAppBookmark` and `appPreflight` to fail closed with exit 4 ("Nothing was started and no credit was used") and zero `POST` requests.
+   - Test: `tests/app-path.test.mjs` (`LOOP-CONFIRM2: ...`) makes `gh pr view` return `GraphQL: HTTP 502` while the commit lookup succeeds (both with no bookmark and with an existing bookmark) and verifies exit 4, zero `POST` requests, and zero stale bookmark reads.
+
+5. **Finding #4 (High — Server early settlement when `ONE_PATH_V1` is off) — External server-side launch gate (unreachable from this plugin-only workspace).**
+   - This workspace (`/root/review-input/ws-plugin-app-path`) contains only the Claude Code plugin; wallet hold/finalization and worker settlement live exclusively in the separate MegaLens server repository (`/root/review-input/ws-ondemand-merge`, outside our allowed working tree), and `GET /api/github-app/status` (`on-demand.ts:85-90`) does not expose `ONE_PATH_V1` or `defer_complete` to clients:
+     - `/root/review-input/ws-ondemand-merge/src/lib/github-setup/on-demand.ts:85-90,169-203` (`editorReviewNow` admits on-demand jobs whenever `GITHUB_APP_V1=on` without requiring `ONE_PATH_V1`; `editorStatus` returns only `{ installed, linked, notice_accepted, suspended }`).
+     - `/root/review-input/ws-ondemand-merge/src/lib/github-setup/worker-api.ts:374,408,435` (`prepare` sets `defer_complete` solely from `isOnePathEnabled()`).
+     - `/root/review-input/ws-ondemand-merge/src/lib/github-setup/worker-api.ts:599-614,714-738` (when `!deferSettlement`, `resultHandler` settles `closeReview(job.reviewId, closeStatus)` before GitHub publish and editor-result retention, so a permanent publish error marks the job `failed`/`publish_failed` with no editor findings after `/root/review-input/ws-ondemand-merge/src/lib/engine-v2/service.ts:338-347` has finalized the charge/free review).
+   - Remains documented as a mandatory server release gate in [PLUGIN-NEEDS.md](PLUGIN-NEEDS.md) (item 14), with client-side `publish_failed` handling tested in `tests/app-path.test.mjs`.
+
+### Verification
+
+- Ran `npm test && git diff --check`: **199 / 199 tests passed** (0 failed, 0 skipped), zero whitespace/patch errors.

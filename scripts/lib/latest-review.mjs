@@ -49,6 +49,7 @@ export async function resolveRepoKey({ exec, cwd, env, signal = null }) {
 
 const cleanSha = (v) => (typeof v === 'string' && SHA_RE.test(v) ? v.toLowerCase() : null);
 const cleanPr = (v) => (Number.isInteger(v) && v > 0 && v <= 2_147_483_647 ? v : null);
+const cleanBaseRef = (v) => (typeof v === 'string' && /^[\w./@+-]{1,100}$/.test(v.trim()) ? v.trim() : null);
 
 /**
  * Verify before starting a paid App review that the bookmark directory is writable and symlink-safe
@@ -83,6 +84,8 @@ export function saveLatestReview({
   headSha = null,
   requestedHeadSha = null,
   prNumber = null,
+  prBaseSha = null,
+  prBaseRef = null,
   startedAt = null,
   now = () => Date.now(),
 }) {
@@ -113,7 +116,13 @@ export function saveLatestReview({
     const reqSha = cleanSha(requestedHeadSha);
     if (reqSha && reqSha !== sha) rec.requestedHeadSha = reqSha;
     const pr = cleanPr(prNumber);
-    if (pr !== null) rec.prNumber = pr;
+    if (pr !== null) {
+      rec.prNumber = pr;
+      const baseSha = cleanSha(prBaseSha);
+      if (baseSha) rec.prBaseSha = baseSha;
+      const baseRef = cleanBaseRef(prBaseRef);
+      if (baseRef) rec.prBaseRef = baseRef;
+    }
     map[String(repoKey)] = rec;
     const entries = Object.entries(map)
       .filter(([, v]) => v && typeof v === 'object' && isAnyReviewId(v.id))
@@ -143,6 +152,8 @@ export function loadLatestReview({ env = process.env, repoKey, nwo = null }) {
       headSha: cleanSha(rec.headSha),
       requestedHeadSha: cleanSha(rec.requestedHeadSha),
       prNumber: cleanPr(rec.prNumber),
+      prBaseSha: cleanSha(rec.prBaseSha),
+      prBaseRef: cleanBaseRef(rec.prBaseRef),
       startedAt: Number(rec.startedAt) || 0,
     };
   };
