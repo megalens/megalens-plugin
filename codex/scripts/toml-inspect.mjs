@@ -1,11 +1,11 @@
-// Minimal zero-dependency TOML-aware path inspector for Codex config.toml.
+// Minimal zero-dependency TOML-aware path inspector & inline-table helper for Codex config.toml.
 // Collects defined table headers, dotted keys, and inline-table key paths while
 // skipping comments, basic/literal/multiline strings, and arrays.
 
-export function collectTomlPaths(src) {
-  if (typeof src !== 'string') return [];
-  if (src.charCodeAt(0) === 0xfeff) src = src.slice(1);
-  let i = 0;
+function inspectToml(src) {
+  if (typeof src !== 'string') return { paths: [], inlineTables: [] };
+  const hasBom = src.charCodeAt(0) === 0xfeff;
+  let i = hasBom ? 1 : 0;
   const eof = () => i >= src.length;
   const ws = () => { while (src[i] === ' ' || src[i] === '\t') i++; };
   const skipComment = () => { if (src[i] === '#') while (!eof() && src[i] !== '\n') i++; };
@@ -105,6 +105,7 @@ export function collectTomlPaths(src) {
   }
 
   const paths = [];
+  const inlineTables = [];
 
   function parseValue(prefix) {
     ws();
@@ -124,12 +125,30 @@ export function collectTomlPaths(src) {
       }
     }
     if (c === '{') {
+      const openIdx = i;
       i++;
       wsNl();
-      if (src[i] === '}') { i++; return; }
+      if (src[i] === '}') {
+        const closeIdx = i;
+        i++;
+        if (prefix) {
+          inlineTables.push({ path: prefix, openIdx, closeIdx, hasEntries: false, lastEntryEnd: openIdx + 1, trailingCommaIdx: -1 });
+        }
+        return;
+      }
+      let hasEntries = false;
+      let lastEntryEnd = openIdx + 1;
+      let trailingCommaIdx = -1;
       for (;;) {
         wsNl();
-        if (src[i] === '}') { i++; return; }
+        if (src[i] === '}') {
+          const closeIdx = i;
+          i++;
+          if (prefix) {
+            inlineTables.push({ path: prefix, openIdx, closeIdx, hasEntries, lastEntryEnd, trailingCommaIdx });
+          }
+          return;
+        }
         const k = dottedKey();
         ws();
         if (src[i] !== '=') throw new Error('expected = in inline table');
@@ -137,9 +156,19 @@ export function collectTomlPaths(src) {
         const nextPrefix = prefix ? [...prefix, ...k] : null;
         if (nextPrefix) paths.push(nextPrefix);
         parseValue(nextPrefix);
+        hasEntries = true;
+        lastEntryEnd = i;
+        trailingCommaIdx = -1;
         wsNl();
-        if (src[i] === ',') { i++; continue; }
-        if (src[i] === '}') { i++; return; }
+        if (src[i] === ',') { trailingCommaIdx = i; i++; continue; }
+        if (src[i] === '}') {
+          const closeIdx = i;
+          i++;
+          if (prefix) {
+            inlineTables.push({ path: prefix, openIdx, closeIdx, hasEntries, lastEntryEnd, trailingCommaIdx });
+          }
+          return;
+        }
         throw new Error('invalid inline table');
       }
     }
@@ -185,7 +214,11 @@ export function collectTomlPaths(src) {
     skipComment();
     if (!eof() && !nl()) throw new Error('unexpected trailing text');
   }
-  return paths;
+  return { paths, inlineTables };
+}
+
+export function collectTomlPaths(src) {
+  return inspectToml(src).paths;
 }
 
 /** True if `src` defines `targetPath` (or any sub-key/table under it). Returns false if `src` is not valid TOML. */
@@ -200,4 +233,36 @@ export function hasTomlPath(src, targetPath) {
   return paths.some(
     (p) => p.length >= targetPath.length && targetPath.every((seg, idx) => p[idx] === seg),
   );
+}
+
+/**
+ * Find the character span of an inline table assigned to `targetPath` (e.g. `mcp_servers = { ... }`).
+ * Returns `{ path, openIdx, closeIdx, hasEntries, lastEntryEnd, trailingCommaIdx }` or `null`.
+ */
+export function findTomlInlineTable(src, targetPath) {
+  if (!Array.isArray(targetPath) || targetPath.length === 0) return null;
+  let inlineTables;
+  try {
+    inlineTables = inspectToml(src).inlineTables;
+  } catch {
+    return null;
+  }
+  return inlineTables.find(
+    (t) => t.path.length === targetPath.length && targetPath.every((seg, idx) => t.path[idx] === seg),
+  ) ?? null;
+}
+
+/**
+ * Insert `key = value` into an inline table span returned by `findTomlInlineTable`.
+ * Preserves existing entries, formatting, and surrounding lines.
+ */
+export function insertIntoTomlInlineTable(src, span, key, valueExpr) {
+  if (!span.hasEntries) {
+    return `${src.slice(0, span.openIdx)}{ ${key} = ${valueExpr} }${src.slice(span.closeIdx + 1)}`;
+  }
+  if (span.trailingCommaIdx >= 0) {
+    const insertAt = span.trailingCommaIdx + 1;
+    return `${src.slice(0, insertAt)} ${key} = ${valueExpr}${src.slice(insertAt)}`;
+  }
+  return `${src.slice(0, span.lastEntryEnd)}, ${key} = ${valueExpr}${src.slice(span.lastEntryEnd)}`;
 }

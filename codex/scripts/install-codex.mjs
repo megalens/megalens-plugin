@@ -1,12 +1,15 @@
 #!/usr/bin/env node
 // Installs the MegaLens Codex plugin for Codex CLI and the Codex desktop app:
-//   - Self-contained plugin + runtime under ~/.codex/plugins/megalens/ (or <repo>/.codex/plugins/megalens/ with --project)
+//   - Self-contained plugin + runtime ALWAYS under user-owned ~/.codex/plugins/megalens/
+//     (or $CODEX_HOME/plugins/megalens/ for --project), NEVER inside the repository under review,
 //     including .codex-plugin/plugin.json, mcp.json, scripts/, runtime/, skills/, and persisted preview opt-in marker
 //   - Standalone Codex Skills ($megalens-review, $megalens-status, $megalens-result) under ~/.agents/skills/ (or <repo>/.agents/skills/)
 //   - Custom CLI prompts (/prompts:megalens-review, /prompts:megalens-status, /prompts:megalens-result) under $CODEX_HOME/prompts/ (global only)
-//   - Local marketplace entry under ~/.agents/plugins/marketplace.json (or <repo>/.agents/plugins/marketplace.json)
-//   - Optional --with-oauth-mcp: adds [mcp_servers.megalens] Streamable HTTP entry to config.toml only if not already configured
-//     (uses TOML-aware lookup; leaves existing `npx megalens-mcp setup` or custom config untouched).
+//   - Local marketplace entry under ~/.agents/plugins/marketplace.json (global only; never places executable code in a reviewed repo)
+//   - Project scope (--project): also records installed untracked skill paths in the repo's local .git/info/exclude so
+//     default GitHub reviews do not reject the installer's own files as uncommitted changes
+//   - Optional --with-oauth-mcp: adds [mcp_servers.megalens] Streamable HTTP OAuth entry to config.toml only if not already configured
+//     (uses TOML-aware lookup and inline-table insertion; leaves existing MegaLens config untouched).
 //
 // Gated behind CODEX_PLUGIN_ENABLED (default false; enable with MEGALENS_CODEX_PLUGIN=1).
 // Never writes tokens or secrets. Refuses symlinks. Creates owner-only backups outside any repo before overwriting.
@@ -19,6 +22,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   unlinkSync,
   writeSync,
@@ -29,7 +33,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkToml } from '../runtime/scripts/hosts/toml-check.mjs';
 import { CODEX_PLUGIN_OFF_MESSAGE, PREVIEW_OPT_IN_FILENAME, isCodexPluginEnabled } from './flags.mjs';
-import { hasTomlPath } from './toml-inspect.mjs';
+import { collectTomlPaths, findTomlInlineTable, hasTomlPath, insertIntoTomlInlineTable } from './toml-inspect.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CODEX_DIR = path.resolve(HERE, '..');
@@ -249,19 +253,105 @@ function mergeOauthMcpToml(plan, file) {
     plan.skip(file, 'already defines mcp_servers.megalens (keeping existing Codex MCP config)');
     return;
   }
-  const body = [
-    '[mcp_servers.megalens]',
-    `url = ${JSON.stringify(CODEX_MCP_URL)}`,
-    'startup_timeout_sec = 20',
-    'tool_timeout_sec = 1800  # reviews can take several minutes',
-  ];
-  const { text } = spliceBlock(old, BEGIN, END, body);
+
+  // If the user defines `mcp_servers = { ... }` as an inline table, TOML 1.0 forbids
+  // extending it with a `[mcp_servers.megalens]` table header; splice directly into the inline table.
+  const withoutManaged = String(old).replace(
+    new RegExp(`${escRe(BEGIN)}[\\s\\S]*?${escRe(END)}(\\r?\\n)?`, 'g'),
+    '',
+  );
+  const inlineSpan = findTomlInlineTable(withoutManaged, ['mcp_servers']);
+  let text;
+  if (inlineSpan) {
+    const inlineValue = `{ url = ${JSON.stringify(CODEX_MCP_URL)}, startup_timeout_sec = 20, tool_timeout_sec = 1800 }`;
+    text = insertIntoTomlInlineTable(withoutManaged, inlineSpan, 'megalens', inlineValue);
+  } else {
+    const body = [
+      '[mcp_servers.megalens]',
+      `url = ${JSON.stringify(CODEX_MCP_URL)}`,
+      'startup_timeout_sec = 20',
+      'tool_timeout_sec = 1800  # reviews can take several minutes',
+    ];
+    text = spliceBlock(old, BEGIN, END, body).text;
+  }
+
   try {
     checkToml(text);
   } catch (e) {
-    throw new Error(`${file} cannot take the MegaLens MCP block: ${e.message}. Nothing was changed.`);
+    // Allow pre-existing valid TOML 1.1 constructs (e.g. multiline inline tables) when both
+    // the original and updated configs parse cleanly with collectTomlPaths and contain our entry.
+    let ok11 = false;
+    try {
+      collectTomlPaths(old);
+      ok11 = hasTomlPath(text, ['mcp_servers', 'megalens']);
+    } catch {
+      ok11 = false;
+    }
+    if (!ok11) {
+      throw new Error(`${file} cannot take the MegaLens MCP block: ${e.message}. Nothing was changed.`);
+    }
   }
   plan.write(file, text);
+}
+
+/**
+ * Locate the repo's local `.git/info/exclude` for `--project` installs (never modifies tracked `.gitignore`).
+ * Supports standard `.git/` dirs and worktree/submodule `.git` files; returns null outside a git repo.
+ */
+function resolveGitInfoExclude(projectDir) {
+  let cur = path.resolve(projectDir);
+  let repoRoot = null;
+  for (;;) {
+    const dotGit = path.join(cur, '.git');
+    try {
+      const st = lstatSync(dotGit);
+      if (st.isSymbolicLink()) return null;
+      if (st.isDirectory() || st.isFile()) {
+        repoRoot = cur;
+        break;
+      }
+    } catch (e) {
+      if (e.code !== 'ENOENT') return null;
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) return null;
+    cur = parent;
+  }
+
+  const dotGit = path.join(repoRoot, '.git');
+  let gitDir = dotGit;
+  const st = lstatSync(dotGit);
+  if (st.isFile()) {
+    const raw = readFileSync(dotGit, 'utf8');
+    const m = /^gitdir:\s*(.+?)\s*$/m.exec(raw);
+    if (!m) return null;
+    gitDir = path.resolve(repoRoot, m[1]);
+  }
+  // Linked worktrees share info/exclude under commondir when present.
+  const commonDirFile = path.join(gitDir, 'commondir');
+  let commonGitDir = gitDir;
+  try {
+    const cst = lstatSync(commonDirFile);
+    if (cst.isFile() && !cst.isSymbolicLink()) {
+      const relCommon = readFileSync(commonDirFile, 'utf8').trim();
+      if (relCommon) commonGitDir = path.resolve(gitDir, relCommon);
+    }
+  } catch { /* normal repo without commondir */ }
+
+  const relFromRoot = path.relative(repoRoot, path.resolve(projectDir)).split(path.sep).filter(Boolean).join('/');
+  const prefix = relFromRoot ? `${relFromRoot}/` : '';
+  return {
+    excludeRoot: commonGitDir,
+    excludeFile: path.join(commonGitDir, 'info', 'exclude'),
+    prefix,
+  };
+}
+
+function mergeGitExclude(plan, excludeFile, patterns) {
+  plan.check(excludeFile);
+  const old = existsSync(excludeFile) ? readFileSync(excludeFile, 'utf8') : '';
+  const { text } = spliceBlock(old, BEGIN, END, patterns);
+  plan.write(excludeFile, text);
 }
 
 function mergeMarketplaceJson(plan, file, pluginRelPath, marketplaceName, displayName) {
@@ -308,6 +398,16 @@ function mergeMarketplaceJson(plan, file, pluginRelPath, marketplaceName, displa
 const SKILLS = ['megalens-review', 'megalens-status', 'megalens-result'];
 const PROMPTS = ['megalens-review.md', 'megalens-status.md', 'megalens-result.md'];
 
+function isMainModule(metaUrl, argv1) {
+  if (!argv1) return false;
+  const self = fileURLToPath(metaUrl);
+  try {
+    return realpathSync(argv1) === realpathSync(self);
+  } catch {
+    return path.resolve(argv1) === self;
+  }
+}
+
 export function installCodex(opts = {}, { env = process.env, flags = {} } = {}) {
   // Installer itself requires explicit enablement (never relies on an opt-in marker in source).
   if (!isCodexPluginEnabled(env, flags, { checkOptInMarker: false })) {
@@ -318,18 +418,25 @@ export function installCodex(opts = {}, { env = process.env, flags = {} } = {}) 
   const home = path.resolve(o.home || env.HOME || homedir());
   const project = path.resolve(o.dir || process.cwd());
   const codexHome = resolveCodexHome(env, home, o.codexHome);
-  const root = o.scope === 'global' ? home : project;
-  const pluginDir = path.join(root, '.codex', 'plugins', 'megalens');
+  const skillsRoot = o.scope === 'global' ? home : project;
+  // ALWAYS install executable runtime + opt-in marker in user-owned storage, NEVER inside the reviewed repo.
+  // In global mode, place under ~/.codex/plugins/megalens so ~/.agents/plugins/marketplace.json resolves `./.codex/plugins/megalens`.
+  const pluginDir = o.scope === 'global'
+    ? path.join(home, '.codex', 'plugins', 'megalens')
+    : path.join(codexHome, 'plugins', 'megalens');
   const installedRunner = path.join(pluginDir, 'scripts', 'codex-review.mjs');
   const scriptPath = assertSafeScriptPath(o.scriptPath || installedRunner);
-  const allowedRoots = o.scope === 'global' ? [home, codexHome] : [project];
+  const gitExclude = o.scope === 'project' ? resolveGitInfoExclude(project) : null;
+  const allowedRoots = o.scope === 'global'
+    ? [home, codexHome]
+    : [project, codexHome, ...(gitExclude ? [gitExclude.excludeRoot] : [])];
   const plan = new Plan({
     dryRun: Boolean(o.dryRun),
     allowedRoots,
     backupRoot: path.join(home, '.megalens', 'backups', 'codex-plugin'),
   });
 
-  // 1. Self-contained Codex plugin package + bundled runtime (<root>/.codex/plugins/megalens/)
+  // 1. Self-contained Codex plugin package + bundled runtime (ALWAYS user-owned, never inside reviewed repo).
   //    Works standalone even after a temporary npx cache or checkout is removed, and persists
   //    the user's explicit preview opt-in across CLI and Codex desktop app restarts.
   for (const rel of BUNDLED_PLUGIN_FILES) {
@@ -358,8 +465,9 @@ export function installCodex(opts = {}, { env = process.env, flags = {} } = {}) 
 
   // 2. Standalone Codex Skills (~/.agents/skills/ or <repo>/.agents/skills/)
   //    Works in Codex CLI ($megalens-review), Codex desktop app (Skills), and IDE extension.
+  //    Always invokes the user-owned runner outside the repository under review.
   for (const skill of SKILLS) {
-    const destDir = path.join(root, '.agents', 'skills', skill);
+    const destDir = path.join(skillsRoot, '.agents', 'skills', skill);
     plan.write(
       path.join(destDir, 'SKILL.md'),
       renderTemplate(path.join('skills', skill, 'SKILL.md'), scriptPath),
@@ -370,7 +478,8 @@ export function installCodex(opts = {}, { env = process.env, flags = {} } = {}) 
     );
   }
 
-  // 3. Codex CLI custom slash prompts ($CODEX_HOME/prompts/megalens-*.md, global only).
+  // 3. Codex CLI custom slash prompts ($CODEX_HOME/prompts/megalens-*.md, global only)
+  //    and user-scoped local marketplace entry (~/.agents/plugins/marketplace.json, global only).
   if (o.scope === 'global') {
     for (const p of PROMPTS) {
       plan.write(
@@ -378,38 +487,48 @@ export function installCodex(opts = {}, { env = process.env, flags = {} } = {}) 
         renderTemplate(path.join('prompts', p), scriptPath),
       );
     }
+    const marketplaceFile = path.join(home, '.agents', 'plugins', 'marketplace.json');
+    mergeMarketplaceJson(
+      plan,
+      marketplaceFile,
+      './.codex/plugins/megalens',
+      'personal-megalens',
+      'Personal Plugins',
+    );
   } else {
-    plan.note('Custom /prompts:* files only load from ~/.codex/prompts/ (use --global to install them alongside skills).');
+    plan.note(`Self-contained runtime and preview opt-in installed in user storage (${pluginDir}), never inside the repository under review.`);
+    plan.note('Custom /prompts:* and local marketplace entries are user-scoped (use --global to install them alongside skills).');
   }
 
-  // 4. Local marketplace entry (available only after explicit opt-in via this installer).
-  const marketplaceFile = path.join(root, '.agents', 'plugins', 'marketplace.json');
-  mergeMarketplaceJson(
-    plan,
-    marketplaceFile,
-    './.codex/plugins/megalens',
-    o.scope === 'global' ? 'personal-megalens' : 'local-repo',
-    o.scope === 'global' ? 'Personal Plugins' : 'Local Repo Plugins',
-  );
-
-  // 5. Optional Streamable HTTP OAuth MCP config in config.toml (never clobbers existing config).
+  // 4. Optional Streamable HTTP OAuth MCP config in config.toml (never clobbers existing config;
+  //    supports inline tables and quoted keys).
+  let projectCreatedConfig = false;
   if (o.withOauthMcp) {
     const configPath = o.scope === 'global'
       ? path.join(codexHome, 'config.toml')
       : path.join(project, '.codex', 'config.toml');
+    projectCreatedConfig = o.scope === 'project' && !existsSync(configPath);
     mergeOauthMcpToml(plan, configPath);
   }
 
+  // 5. Project scope: exclude only the installer's own untracked files in local `.git/info/exclude`
+  //    so default `$megalens-review` does not reject its own installation files as uncommitted changes.
+  if (o.scope === 'project' && gitExclude) {
+    const excludePatterns = SKILLS.map((s) => `/${gitExclude.prefix}.agents/skills/${s}/`);
+    if (projectCreatedConfig) excludePatterns.push(`/${gitExclude.prefix}.codex/config.toml`);
+    mergeGitExclude(plan, gitExclude.excludeFile, excludePatterns);
+  }
+
   plan.flush();
-  plan.note('Preview opt-in saved inside the installed plugin so it survives CLI and Codex desktop app restarts (set MEGALENS_CODEX_PLUGIN=0 anytime to disable).');
-  plan.note('Next: run `npx megalens-mcp setup` to sign in via browser for Codex MCP (if not already done), then restart Codex.');
+  plan.note('Preview opt-in saved inside user-owned plugin storage so it survives CLI and Codex desktop app restarts (set MEGALENS_CODEX_PLUGIN=0 anytime to disable).');
+  plan.note('Next: run `codex mcp login megalens` to sign in via browser OAuth (zero token paste; add `--with-oauth-mcp` first if `[mcp_servers.megalens]` is not in config.toml), then restart Codex.');
   plan.note('GitHub runs also need `gh auth login`, `.github/workflows/megalens-dispatch.yml` on your default branch, and repository secret `MEGALENS_TOKEN` while APP_PATH_ENABLED=false.');
   plan.note('In Codex CLI or Codex desktop app, run `$megalens-review` (or `/prompts:megalens-review` in Codex CLI).');
   plan.report.push(...plan.notes);
   return { code: 0, report: plan.report };
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isMainModule(import.meta.url, process.argv[1])) {
   try {
     const o = parseArgs(process.argv.slice(2));
     const res = installCodex(o);

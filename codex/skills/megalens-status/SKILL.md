@@ -3,7 +3,7 @@ name: megalens-status
 description: Check the status of the latest MegaLens review for this repository (or a specific review id). Use ONLY when the user explicitly invokes $megalens-status ($megalens:megalens-status) or asks for MegaLens review status.
 ---
 
-Resolve the bundled MegaLens runner from **this installed skill/plugin directory** (`<SKILL_DIR>/../../scripts/codex-review.mjs`) — **never** run a relative path inside the repository under review.
+Resolve the bundled MegaLens runner from **this installed skill/plugin directory** (`<SKILL_DIR>/../../scripts/codex-review.mjs`, resolving relative to the absolute directory containing this loaded `SKILL.md` file) — **never** resolve or run any script inside the repository under review.
 
 If the user did not supply a review id, run `node "<SKILL_DIR>/../../scripts/codex-review.mjs" status` in the repository under review to check the latest MegaLens review for this repository.
 

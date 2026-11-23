@@ -5,26 +5,26 @@ Independent multi-company code review inside **Codex CLI** and the **Codex deskt
 ## Install (2 lines, from any directory)
 
 ```sh
-npx megalens-mcp setup
-MEGALENS_CODEX_PLUGIN=1 npx --yes --package github:megalens/megalens-claude-plugin megalens-codex-install
+MEGALENS_CODEX_PLUGIN=1 npx --yes --package github:megalens/megalens-claude-plugin megalens-codex-install --with-oauth-mcp
+codex mcp login megalens
 ```
 
-*(From a local checkout of this repo, line 2 can be `MEGALENS_CODEX_PLUGIN=1 node /path/to/megalens-claude-plugin/codex/scripts/install-codex.mjs`.)*
+*(From a local checkout of this repo, line 1 can be `MEGALENS_CODEX_PLUGIN=1 node /path/to/megalens-claude-plugin/codex/scripts/install-codex.mjs --with-oauth-mcp`.)*
 
-> **Feature flag (default OFF):** Until release, both the installer and command runner are gated behind `CODEX_PLUGIN_ENABLED = false` (and the native marketplace policy ships as `"installation": "NOT_AVAILABLE"`). Running line 2 with `MEGALENS_CODEX_PLUGIN=1` saves an explicit preview opt-in inside `~/.codex/plugins/megalens/`, so `$megalens-review` works immediately after restarting **Codex CLI** or the **Codex desktop app** without exporting any shell variable. Set `MEGALENS_CODEX_PLUGIN=0` at any time to disable it again. Once `CODEX_PLUGIN_ENABLED` is flipped to `true` on release, line 2 drops the `MEGALENS_CODEX_PLUGIN=1` prefix.
+> **Feature flag (default OFF):** Until release, both the installer and command runner are gated behind `CODEX_PLUGIN_ENABLED = false` (and the native marketplace policy ships as `"installation": "NOT_AVAILABLE"`). Running line 1 with `MEGALENS_CODEX_PLUGIN=1` saves an explicit preview opt-in inside user-owned `~/.codex/plugins/megalens/`, so `$megalens-review` works immediately after restarting **Codex CLI** or the **Codex desktop app** without exporting any shell variable. Set `MEGALENS_CODEX_PLUGIN=0` at any time to disable it again. Once `CODEX_PLUGIN_ENABLED` is flipped to `true` on release, line 1 drops the `MEGALENS_CODEX_PLUGIN=1` prefix.
 
 What those two lines do:
-1. **`npx megalens-mcp setup`** opens browser sign-in (no token copy) and writes `[mcp_servers.megalens]` into `~/.codex/config.toml` — shared automatically by **Codex CLI**, the **Codex desktop app**, and the Codex IDE extension. *(Note: in published `megalens-mcp@0.3.12`, the generic `setup` subcommand uses browser device sign-in; `setup codex` still prompts for a manual token until updated upstream in `github.com/megalens/mcp`.)*
-2. **`megalens-codex-install`** (`install-codex.mjs`) copies the self-contained MegaLens plugin and runtime into `~/.codex/plugins/megalens/` (so it never depends on your checkout or a temporary `npx` cache and never resolves scripts from the repository under review) and installs:
+1. **`megalens-codex-install --with-oauth-mcp`** (`install-codex.mjs`) copies the self-contained MegaLens plugin and runtime into user-owned `~/.codex/plugins/megalens/` (never inside any repository under review, and never dependent on a temporary `npx` cache), writes `[mcp_servers.megalens]` (`https://megalens.ai/api/mcp?ide=codex`) into `~/.codex/config.toml` / `$CODEX_HOME/config.toml` using TOML-aware merge (handling inline tables, quoted keys, and existing entries without aborting), and installs:
    - **Codex Skills** (`~/.agents/skills/megalens-{review,status,result}/`, explicit-invocation only via `agents/openai.yaml`) — works in Codex CLI (`$megalens-review`) and Codex desktop app (Skills / `@`).
    - **Codex CLI Custom Prompts** (`~/.codex/prompts/megalens-{review,status,result}.md`) — slash commands `/prompts:megalens-review`, `/prompts:megalens-status`, `/prompts:megalens-result`.
    - **Local Codex Plugin + Marketplace entry** (`~/.codex/plugins/megalens/` + `~/.agents/plugins/marketplace.json`) — discoverable in `codex /plugins` and the Codex desktop app **Plugins** tab.
+2. **`codex mcp login megalens`** opens native browser OAuth sign-in against `https://megalens.ai` (zero token copy, no manual token paste, works on fresh profiles even when other editors are already installed). Codex CLI and the Codex desktop app share `$CODEX_HOME/config.toml` and the OAuth login automatically. *(Note: external package `megalens-mcp@0.3.12` is not required here; its `setup codex` still prompts for a manual token and its generic `setup` skips Codex when `~/.codex/config.toml` does not exist yet and another editor is detected — tracked in `PLUGIN-NEEDS.md` #14.)*
 
 Restart Codex (CLI or desktop app) after installing.
 
 ## GitHub repository prerequisites (while `APP_PATH_ENABLED = false`)
 
-`npx megalens-mcp setup` signs in your Codex editor MCP config (`~/.codex/config.toml`) only. Because the MegaLens GitHub App runner is disabled behind `APP_PATH_ENABLED = false` until the on-demand server endpoints are live, running `$megalens-review` on a GitHub repository currently uses your repository's **GitHub Actions workflow** and requires:
+`codex mcp login megalens` signs in your Codex editor MCP config (`~/.codex/config.toml`) only. Because the MegaLens GitHub App runner is disabled behind `APP_PATH_ENABLED = false` until the on-demand server endpoints are live, running `$megalens-review` on a GitHub repository currently uses your repository's **GitHub Actions workflow** and requires:
 
 1. **GitHub CLI authenticated:** `gh auth login`
 2. **Dispatch workflow on the repository's default branch:** `.github/workflows/megalens-dispatch.yml` (run `$megalens-review --runner github` to print the workflow template).
@@ -60,16 +60,15 @@ If you stop waiting or reach the 20-minute cap, MegaLens prints `Still running. 
 
 ## Codex Desktop App MCP configuration
 
-Codex CLI and the Codex desktop app share `~/.codex/config.toml` (`$CODEX_HOME/config.toml`). Running `npx megalens-mcp setup` configures it via browser sign-in automatically.
-
-For OAuth-based MCP setup instead of browser device token setup, see [`config.desktop.example.toml`](config.desktop.example.toml), or pass `--with-oauth-mcp` to `install-codex.mjs` (TOML-aware lookup; never overwrites an existing `mcp_servers.megalens` entry in any TOML form, including inline tables or quoted keys), then run `codex mcp login megalens`.
+Codex CLI and the Codex desktop app share `~/.codex/config.toml` (`$CODEX_HOME/config.toml`). Passing `--with-oauth-mcp` to `megalens-codex-install` merges `[mcp_servers.megalens]` cleanly into `config.toml` (TOML-aware lookup and inline-table insertion; never overwrites an existing `mcp_servers.megalens` entry in any TOML form, including inline tables or quoted keys), and `codex mcp login megalens` completes native browser OAuth with zero token copy. See [`config.desktop.example.toml`](config.desktop.example.toml) for the exact TOML block.
 
 ## Advanced
 
-- **Project-scoped install (repo skills + repo marketplace):**
+- **Project-scoped install (repo skills only; runtime stays in user storage and `.git/info/exclude` keeps the worktree clean):**
   ```sh
   MEGALENS_CODEX_PLUGIN=1 node codex/scripts/install-codex.mjs --project --dir /path/to/repo
   ```
+  Project installs never place executable scripts, opt-in markers, or marketplace packages inside the repository under review — the self-contained runtime always lives under `$CODEX_HOME/plugins/megalens/`, and installed skill paths are added to local `.git/info/exclude` so default `$megalens-review` does not reject them as uncommitted changes.
 - **Native Codex CLI marketplace install (gated OFF while `CODEX_PLUGIN_ENABLED = false`):**
   The repository marketplace (`codex/.agents/plugins/marketplace.json`) ships with `"installation": "NOT_AVAILABLE"` until release, so `codex plugin add megalens@megalens` refuses to activate while the feature flag is OFF. Once `CODEX_PLUGIN_ENABLED` is flipped to `true` and `"installation"` is set to `"AVAILABLE"`, native marketplace install exposes the plugin MCP server (`megalens`) and plugin-namespaced skills (`$megalens:megalens-review`, `$megalens:megalens-status`, `$megalens:megalens-result`):
   ```sh

@@ -5,6 +5,7 @@
 // work standalone from any unrelated repository without external relative imports.
 // Gated behind CODEX_PLUGIN_ENABLED (default false; enable with MEGALENS_CODEX_PLUGIN=1 or
 // explicit opt-in via install-codex.mjs).
+import { realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { main as engineMain } from '../runtime/scripts/engine.mjs';
@@ -21,7 +22,7 @@ export const CODEX_WORKFLOW_SETUP_NOTE =
   + 'To run GitHub reviews today, set up the GitHub Actions workflow on your repository:\n'
   + '1. Authenticate GitHub CLI: `gh auth login`\n'
   + '2. Add `.github/workflows/megalens-dispatch.yml` on your default branch (run `$megalens-review --runner github` to print the template).\n'
-  + '3. Set repository secret `MEGALENS_TOKEN` (`gh secret set MEGALENS_TOKEN`). `npx megalens-mcp setup` configures only Codex MCP, not GitHub Actions secrets; zero-copy GitHub setup is blocked until the GitHub App on-demand endpoints or a no-copy secret flow ship.';
+  + '3. Set repository secret `MEGALENS_TOKEN` (`gh secret set MEGALENS_TOKEN`). `codex mcp login megalens` configures only Codex MCP OAuth, not GitHub Actions secrets; zero-copy GitHub setup is blocked until the GitHub App on-demand endpoints or a no-copy secret flow ship.';
 
 /** Strict validation for an optional review id passed to status/result. */
 export function isValidCodexReviewId(id) {
@@ -56,11 +57,11 @@ export function adaptCodexOutput(text) {
     .replaceAll('started Claude Code from', 'started Codex from')
     .replaceAll(
       '/megalens:megalens-review (the bundle route) still works with a token.',
-      'Or run `npx megalens-mcp setup` to connect MegaLens MCP via browser sign-in.',
+      'Or run `codex mcp login megalens` to connect MegaLens MCP via browser OAuth.',
     )
     .replaceAll(
       'Without a repo or without the engine installed, /megalens:megalens-review still works with a token.',
-      'Or run `npx megalens-mcp setup` to connect MegaLens MCP via browser sign-in.',
+      'Or run `codex mcp login megalens` to connect MegaLens MCP via browser OAuth.',
     )
     .replaceAll('node scripts/engine.mjs install', `node "${SELF_PATH}" install`)
     .replaceAll('usage: engine.mjs ', 'usage: codex-review.mjs ');
@@ -69,6 +70,16 @@ export function adaptCodexOutput(text) {
     out = `${MSG.notSetup}\n${CODEX_WORKFLOW_SETUP_NOTE}\n`;
   }
   return out;
+}
+
+function isMainModule(metaUrl, argv1) {
+  if (!argv1) return false;
+  const self = fileURLToPath(metaUrl);
+  try {
+    return realpathSync(argv1) === realpathSync(self);
+  } catch {
+    return path.resolve(argv1) === self;
+  }
 }
 
 export async function main(argv, {
@@ -94,7 +105,7 @@ export async function main(argv, {
       + '       codex-review.mjs result [review-id]\n'
       + '       codex-review.mjs install | verify\n'
       + '\n'
-      + 'Sign in via browser (Codex CLI + Desktop App MCP): npx megalens-mcp setup\n'
+      + 'Sign in via browser OAuth (Codex CLI + Desktop App MCP): codex mcp login megalens\n'
       + `GitHub App path enabled: ${APP_PATH_ENABLED} (GitHub Actions workflow .github/workflows/megalens-dispatch.yml + gh auth login + MEGALENS_TOKEN secret required for GitHub runs)\n`,
     );
     return cmd ? 0 : 4;
@@ -128,7 +139,7 @@ export async function main(argv, {
   });
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+if (isMainModule(import.meta.url, process.argv[1])) {
   const ac = new AbortController();
   process.once('SIGINT', () => ac.abort());
   process.once('SIGTERM', () => ac.abort());

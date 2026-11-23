@@ -23,7 +23,7 @@ import {
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   CODEX_PLUGIN_ENABLED,
   CODEX_PLUGIN_OFF_MESSAGE,
@@ -42,7 +42,8 @@ import {
   installCodex,
   parseArgs as parseInstallArgs,
 } from '../codex/scripts/install-codex.mjs';
-import { hasTomlPath } from '../codex/scripts/toml-inspect.mjs';
+import { findTomlInlineTable, hasTomlPath, insertIntoTomlInlineTable } from '../codex/scripts/toml-inspect.mjs';
+import { realExec } from '../codex/runtime/scripts/lib/gh-runner.mjs';
 import { main as claudeMain } from '../scripts/engine.mjs';
 import { APP_PATH_ENABLED, CHECK_NAME } from '../scripts/lib/gh-runner.mjs';
 import { checkToml } from '../scripts/hosts/toml-check.mjs';
@@ -519,7 +520,7 @@ test('codex status/result: no history suggests $megalens-review; malformed IDs r
   assert.match(none.text, /Run \$megalens-review to start one\./);
 });
 
-test('FIX 2 + output adaptation: uses working `npx megalens-mcp setup` (not `setup codex`), preserves findings, scrubs secrets', async (t) => {
+test('FIX 2 + output adaptation: uses native `codex mcp login megalens` OAuth (not `setup codex`), preserves findings, scrubs secrets', async (t) => {
   const findingLine = '- **P1** `docs/help.md:4`: Example says `/megalens:review` instead of `$megalens-review`';
   assert.equal(adaptCodexOutput(findingLine), findingLine);
   assert.equal(
@@ -527,8 +528,34 @@ test('FIX 2 + output adaptation: uses working `npx megalens-mcp setup` (not `set
     'Still running. Run $megalens-result to see it.',
   );
   const adaptedAuth = adaptCodexOutput('Set MEGALENS_TOKEN and restart Claude Code. Without a repo or without the engine installed, /megalens:megalens-review still works with a token.');
-  assert.match(adaptedAuth, /restart Codex.*npx megalens-mcp setup`/);
+  assert.match(adaptedAuth, /restart Codex.*codex mcp login megalens`/);
   assert.equal(adaptedAuth.includes('setup codex'), false);
+
+  // Fresh Codex profile WITH another editor (~/.claude.json) already present and NO ~/.codex/config.toml:
+  // --with-oauth-mcp writes [mcp_servers.megalens] cleanly so `codex mcp login megalens` works with zero token paste.
+  const freshHome = mkdtempSync(path.join(tmpdir(), 'mlcodex-fresh-oauth-'));
+  t.after(() => rmSync(freshHome, { recursive: true, force: true }));
+  writeFileSync(path.join(freshHome, '.claude.json'), '{}\n');
+  const freshCodexHome = path.join(freshHome, '.codex');
+  const inst = installCodex(
+    { scope: 'global', home: freshHome, codexHome: freshCodexHome, withOauthMcp: true },
+    { env: { MEGALENS_CODEX_PLUGIN: '1', HOME: freshHome, CODEX_HOME: freshCodexHome } },
+  );
+  assert.equal(inst.code, 0, inst.report.join('\n'));
+  const freshCfg = readFileSync(path.join(freshCodexHome, 'config.toml'), 'utf8');
+  assert.ok(checkToml(freshCfg));
+  assert.match(freshCfg, /\[mcp_servers\.megalens\]/);
+  assert.match(freshCfg, /https:\/\/megalens\.ai\/api\/mcp\?ide=codex/);
+  assert.ok(!/ml_tok_|mlk_|sk-|Bearer /i.test(freshCfg), 'no bearer token written to disk');
+  if (hasCodexCli()) {
+    const mcpList = spawnSync('codex', ['mcp', 'list'], {
+      cwd: freshHome,
+      env: { PATH: process.env.PATH, HOME: freshHome, CODEX_HOME: freshCodexHome },
+      encoding: 'utf8',
+    });
+    assert.equal(mcpList.status, 0, mcpList.stderr);
+    assert.match(mcpList.stdout, /megalens\s+https:\/\/megalens\.ai\/api\/mcp\?ide=codex\b/);
+  }
 
   const stateDir = mkdtempSync(path.join(tmpdir(), 'mlcodex-scrub-'));
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));
@@ -555,7 +582,7 @@ test('FIX 2 + output adaptation: uses working `npx megalens-mcp setup` (not `set
   assert.match(r.text, /\[redacted\]/);
 });
 
-test('codex CLI subprocess: default OFF exits 4; MEGALENS_CODEX_PLUGIN=1 --help exits 0 with `npx megalens-mcp setup`', () => {
+test('codex CLI subprocess: default OFF exits 4; MEGALENS_CODEX_PLUGIN=1 --help exits 0 (including via symlink)', (t) => {
   const script = path.join(CODEX_DIR, 'scripts', 'codex-review.mjs');
   let offCode = 0;
   let offOut = '';
@@ -575,9 +602,21 @@ test('codex CLI subprocess: default OFF exits 4; MEGALENS_CODEX_PLUGIN=1 --help 
     env: { PATH: process.env.PATH, HOME: tmpdir(), MEGALENS_CODEX_PLUGIN: '1' },
     encoding: 'utf8',
   });
-  assert.match(helpOut, /npx megalens-mcp setup\b/);
+  assert.match(helpOut, /codex mcp login megalens\b/);
   assert.equal(helpOut.includes('setup codex'), false);
   assert.match(helpOut, /GitHub App path enabled: false/);
+
+  // Invoking codex-review.mjs through a symlink must still execute the CLI entrypoint
+  const symTmp = mkdtempSync(path.join(tmpdir(), 'mlcodex-symcli-'));
+  t.after(() => rmSync(symTmp, { recursive: true, force: true }));
+  const binLink = path.join(symTmp, 'megalens-codex-review');
+  symlinkSync(script, binLink);
+  const symHelp = spawnSync(process.execPath, [binLink, '--help'], {
+    env: { PATH: process.env.PATH, HOME: symTmp, MEGALENS_CODEX_PLUGIN: '1' },
+    encoding: 'utf8',
+  });
+  assert.equal(symHelp.status, 0, symHelp.stderr);
+  assert.match(symHelp.stdout, /Usage: codex-review\.mjs/);
 });
 
 // ---- 3. FIX 1: Bundled runtime isolation, parity, decoy attack defense, and real codex-cli plugin/read ----
@@ -649,7 +688,7 @@ test('FIX 1: isolated cached plugin runs from unrelated repo containing a decoy 
     encoding: 'utf8',
   });
   assert.equal(onRun.status, 0, onRun.stderr);
-  assert.match(onRun.stdout, /npx megalens-mcp setup\b/);
+  assert.match(onRun.stdout, /codex mcp login megalens\b/);
   assert.equal(existsSync(pwnedFile), false, 'customer repo decoy script must never execute');
 
   // If codex CLI is available, verify real native marketplace preview (with AVAILABLE flipped in temp copy ONLY)
@@ -744,7 +783,7 @@ test('FIX 3: install-codex copies self-contained runtime and persists preview op
     encoding: 'utf8',
   });
   assert.equal(freshRun.status, 0, `installed runner must stay enabled after restart: ${freshRun.stdout} ${freshRun.stderr}`);
-  assert.match(freshRun.stdout, /npx megalens-mcp setup\b/);
+  assert.match(freshRun.stdout, /codex mcp login megalens\b/);
 
   // Explicit MEGALENS_CODEX_PLUGIN=0 still disables it immediately even with opt-in marker present
   const disabledRun = spawnSync(process.execPath, [installedRunner, '--help'], {
@@ -777,7 +816,89 @@ test('FIX 3: install-codex copies self-contained runtime and persists preview op
   assert.equal(hasPersistedPreviewOptIn(link), false, 'symlink opt-in marker must be ignored');
 });
 
-test('FIX 7: --with-oauth-mcp uses TOML-aware lookup to skip inline and quoted existing mcp_servers.megalens definitions', (t) => {
+test('FIX 3 (round 2): symlinked npm bin (`npx --package ... megalens-codex-install`) actually runs and persists opt-in', (t) => {
+  const tmp = mkdtempSync(path.join(tmpdir(), 'mlcodex-npxbin-'));
+  const home = path.join(tmp, 'home');
+  const codexHome = path.join(home, '.codex');
+  const customerRepo = path.join(tmp, 'customer');
+  const fakeBinDir = path.join(tmp, 'node_modules', '.bin');
+  mkdirSync(home, { recursive: true });
+  mkdirSync(customerRepo, { recursive: true });
+  mkdirSync(fakeBinDir, { recursive: true });
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  // 1. Direct npm-style symlink invocation from an unrelated working directory
+  const binSymlink = path.join(fakeBinDir, 'megalens-codex-install');
+  symlinkSync(path.join(CODEX_DIR, 'scripts', 'install-codex.mjs'), binSymlink);
+  const symRun = spawnSync(process.execPath, [binSymlink, '--with-oauth-mcp'], {
+    cwd: customerRepo,
+    env: { PATH: process.env.PATH, HOME: home, CODEX_HOME: codexHome, MEGALENS_CODEX_PLUGIN: '1' },
+    encoding: 'utf8',
+  });
+  assert.equal(symRun.status, 0, symRun.stderr);
+  assert.match(symRun.stdout, /created\s+.*\.codex-plugin-preview-enabled/);
+  const optInFile = path.join(home, '.codex', 'plugins', 'megalens', PREVIEW_OPT_IN_FILENAME);
+  assert.ok(existsSync(optInFile), 'opt-in marker must be created when invoked via npm bin symlink');
+  assert.ok(existsSync(path.join(home, '.agents', 'skills', 'megalens-review', 'SKILL.md')));
+  assert.ok(existsSync(path.join(codexHome, 'config.toml')));
+
+  // Fresh process without MEGALENS_CODEX_PLUGIN runs enabled from unrelated repo
+  const installedRunner = path.join(home, '.codex', 'plugins', 'megalens', 'scripts', 'codex-review.mjs');
+  const afterRestart = spawnSync(process.execPath, [installedRunner, '--help'], {
+    cwd: customerRepo,
+    env: { PATH: process.env.PATH, HOME: home, CODEX_HOME: codexHome },
+    encoding: 'utf8',
+  });
+  assert.equal(afterRestart.status, 0, `${afterRestart.stdout}\n${afterRestart.stderr}`);
+
+  // 2. Real `npm pack` + `npx --yes --package <tgz> megalens-codex-install --with-oauth-mcp` end-to-end
+  const packDir = path.join(tmp, 'pack');
+  const npxHome = path.join(tmp, 'npx-home');
+  const npxCodexHome = path.join(npxHome, '.codex');
+  const npmCache = path.join(tmp, 'npm-cache');
+  mkdirSync(packDir, { recursive: true });
+  mkdirSync(npxHome, { recursive: true });
+  const packRes = spawnSync('npm', ['pack', '--ignore-scripts', '--silent', '--pack-destination', packDir], {
+    cwd: ROOT,
+    env: { PATH: process.env.PATH, HOME: npxHome, npm_config_cache: npmCache },
+    encoding: 'utf8',
+  });
+  assert.equal(packRes.status, 0, packRes.stderr);
+  const tgzName = packRes.stdout.trim().split('\n').pop();
+  const tgzPath = path.join(packDir, tgzName);
+  const npxRes = spawnSync(
+    'npx',
+    ['--yes', '--package', tgzPath, 'megalens-codex-install', '--with-oauth-mcp'],
+    {
+      cwd: customerRepo,
+      env: {
+        PATH: process.env.PATH,
+        HOME: npxHome,
+        CODEX_HOME: npxCodexHome,
+        npm_config_cache: npmCache,
+        MEGALENS_CODEX_PLUGIN: '1',
+      },
+      encoding: 'utf8',
+    },
+  );
+  assert.equal(npxRes.status, 0, `${npxRes.stdout}\n${npxRes.stderr}`);
+  const npxMarker = path.join(npxHome, '.codex', 'plugins', 'megalens', PREVIEW_OPT_IN_FILENAME);
+  assert.ok(existsSync(npxMarker), 'opt-in marker must exist after real `npx --package <tgz> megalens-codex-install`');
+  assert.ok(existsSync(path.join(npxCodexHome, 'config.toml')));
+
+  // Delete tarball and npm cache completely; installed runner still works in a fresh session without MEGALENS_CODEX_PLUGIN
+  rmSync(packDir, { recursive: true, force: true });
+  rmSync(npmCache, { recursive: true, force: true });
+  const npxRunner = path.join(npxHome, '.codex', 'plugins', 'megalens', 'scripts', 'codex-review.mjs');
+  const postNpx = spawnSync(process.execPath, [npxRunner, '--help'], {
+    cwd: customerRepo,
+    env: { PATH: process.env.PATH, HOME: npxHome, CODEX_HOME: npxCodexHome },
+    encoding: 'utf8',
+  });
+  assert.equal(postNpx.status, 0, `${postNpx.stdout}\n${postNpx.stderr}`);
+});
+
+test('FIX 7: --with-oauth-mcp handles inline-table mcp_servers and skips existing inline/quoted megalens definitions', (t) => {
   // Unit checks for TOML-aware lookup
   const existingCases = [
     '[mcp_servers.megalens]\nurl = "https://megalens.ai/api/mcp?ide=codex"\n',
@@ -800,10 +921,65 @@ test('FIX 7: --with-oauth-mcp uses TOML-aware lookup to skip inline and quoted e
     '# [mcp_servers.megalens]\nmodel = "gpt-6.2-sol"\n',
     'note = "[mcp_servers.megalens]"\n[mcp_servers.other]\ncommand = "other"\n',
     '[mcp_servers]\nother = { url = "https://example.com" }\n',
+    'mcp_servers = { other = { command = "true" } }\n',
   ];
   for (const cfg of nonExistingCases) {
     assert.equal(hasExistingMegalensMcp(cfg), false, `false positive on:\n${cfg}`);
   }
+
+  // Inline-table merge cases (e.g. `mcp_servers = { other = { command = "true" } }` — valid in Codex CLI)
+  const inlineMergeCases = [
+    'mcp_servers = { other = { command = "true" } }\n',
+    'mcp_servers = {}\n',
+    '"mcp_servers" = { other = { command = "true" } }\n',
+    'model = "gpt-6.2-sol"\nmcp_servers = { other = { command = "true" } } # user comment\n',
+    'mcp_servers.other = { command = "true" }\n',
+  ];
+  for (const cfg of inlineMergeCases) {
+    const home = mkdtempSync(path.join(tmpdir(), 'mlcodex-toml-inline-'));
+    t.after(() => rmSync(home, { recursive: true, force: true }));
+    const codexHome = path.join(home, '.codex');
+    mkdirSync(codexHome, { recursive: true });
+    const cfgPath = path.join(codexHome, 'config.toml');
+    writeFileSync(cfgPath, cfg, { mode: 0o600 });
+
+    const r = installCodex({ scope: 'global', home, codexHome, withOauthMcp: true }, { flags: { codexPlugin: true } });
+    assert.equal(r.code, 0, `installer must not abort on valid config:\n${cfg}`);
+    const merged = readFileSync(cfgPath, 'utf8');
+    assert.ok(checkToml(merged), `merged TOML must be valid:\n${merged}`);
+    assert.equal(hasTomlPath(merged, ['mcp_servers', 'megalens']), true, `megalens must be added:\n${merged}`);
+    if (cfg.includes('other')) {
+      assert.equal(hasTomlPath(merged, ['mcp_servers', 'other']), true, `other server must be preserved:\n${merged}`);
+    }
+    assert.ok(existsSync(path.join(home, '.agents', 'skills', 'megalens-review', 'SKILL.md')));
+
+    // Idempotent second run keeps merged config untouched (skipped for inline-table merge, unchanged for managed block)
+    const r2 = installCodex({ scope: 'global', home, codexHome, withOauthMcp: true }, { flags: { codexPlugin: true } });
+    assert.equal(r2.code, 0);
+    assert.equal(readFileSync(cfgPath, 'utf8'), merged);
+    assert.ok(
+      r2.report.some((l) => /(?:skipped.*already defines mcp_servers\.megalens|unchanged\s+.*config\.toml)/.test(l)),
+      r2.report.join('\n'),
+    );
+
+    // Verify real `codex mcp list` accepts the merged config and lists megalens (and other when present)
+    if (hasCodexCli()) {
+      const mcpList = spawnSync('codex', ['mcp', 'list'], {
+        cwd: home,
+        env: { PATH: process.env.PATH, HOME: home, CODEX_HOME: codexHome },
+        encoding: 'utf8',
+      });
+      assert.equal(mcpList.status, 0, `codex mcp list rejected merged TOML:\n${merged}\n${mcpList.stderr}`);
+      assert.match(mcpList.stdout, /\bmegalens\b/);
+      if (cfg.includes('other')) assert.match(mcpList.stdout, /\bother\b/);
+    }
+  }
+
+  // Unit check for findTomlInlineTable + insertIntoTomlInlineTable
+  const span = findTomlInlineTable('mcp_servers = { a = { command = "true" } }\n', ['mcp_servers']);
+  assert.ok(span);
+  assert.equal(span.hasEntries, true);
+  assert.ok(checkToml(insertIntoTomlInlineTable('mcp_servers = { a = { command = "true" } }\n', span, 'b', '{ url = "https://example.com" }')));
 
   // End-to-end installer tests for quoted table + inline entry under [mcp_servers] + top-level inline table
   for (const cfg of existingCases) {
@@ -843,38 +1019,136 @@ test('FIX 7: --with-oauth-mcp uses TOML-aware lookup to skip inline and quoted e
   assert.equal(readFileSync(baks[0], 'utf8'), orig);
 });
 
-test('install-codex: merges marketplace without clobbering other plugins; project scope isolates repo; dry-run & symlinks safe', (t) => {
-  const home = mkdtempSync(path.join(tmpdir(), 'mlcodex-proj-home-'));
-  const repo = mkdtempSync(path.join(tmpdir(), 'mlcodex-proj-repo-'));
+test('FIX 1 + NEW HIGH: project-scoped install keeps runtime/opt-in out of repo, excludes skills in .git/info/exclude, and does not block default GitHub review', async (t) => {
+  const tmp = mkdtempSync(path.join(tmpdir(), 'mlcodex-proj-flow-'));
+  const home = path.join(tmp, 'home');
+  const codexHome = path.join(home, '.codex');
+  const customer = path.join(tmp, 'customer');
+  mkdirSync(home, { recursive: true });
+  mkdirSync(customer, { recursive: true });
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+
+  // Clean git checkout with a feature commit ahead of main
+  assert.equal(spawnSync('git', ['-C', customer, 'init', '-qb', 'main']).status, 0);
+  assert.equal(spawnSync('git', ['-C', customer, '-c', 'user.name=Review', '-c', 'user.email=review@example.invalid', 'commit', '-qm', 'base', '--allow-empty']).status, 0);
+  assert.equal(spawnSync('git', ['-C', customer, 'checkout', '-qb', 'feature']).status, 0);
+  assert.equal(spawnSync('git', ['-C', customer, '-c', 'user.name=Review', '-c', 'user.email=review@example.invalid', 'commit', '-qm', 'feature', '--allow-empty']).status, 0);
+
+  // Dry-run touches neither repo nor .git/info/exclude nor user codexHome
+  const dry = installCodex({ scope: 'project', dir: customer, home, codexHome, dryRun: true }, { env: { MEGALENS_CODEX_PLUGIN: '1', HOME: home, CODEX_HOME: codexHome } });
+  assert.equal(dry.code, 0);
+  assert.equal(existsSync(path.join(customer, '.agents')), false);
+  assert.equal(existsSync(path.join(codexHome, 'plugins', 'megalens')), false);
+
+  // Real project install
+  const inst = installCodex({ scope: 'project', dir: customer, home, codexHome }, { env: { MEGALENS_CODEX_PLUGIN: '1', HOME: home, CODEX_HOME: codexHome } });
+  assert.equal(inst.code, 0, inst.report.join('\n'));
+
+  // 1. Runtime & preview opt-in marker live STRICTLY in user storage ($CODEX_HOME), NEVER inside the reviewed repo
+  const userRunner = path.join(codexHome, 'plugins', 'megalens', 'scripts', 'codex-review.mjs');
+  assert.ok(existsSync(userRunner));
+  assert.ok(existsSync(path.join(codexHome, 'plugins', 'megalens', PREVIEW_OPT_IN_FILENAME)));
+  assert.equal(existsSync(path.join(customer, '.codex')), false, 'must never write .codex/ runtime inside customer repo');
+  assert.equal(existsSync(path.join(customer, '.agents', 'plugins')), false, 'must never write repo-local marketplace pointing into customer repo');
+  for (const s of ['megalens-review', 'megalens-status', 'megalens-result']) {
+    const md = readFileSync(path.join(customer, '.agents', 'skills', s, 'SKILL.md'), 'utf8');
+    assert.ok(md.includes(userRunner), `project skill ${s} must point to user-owned runner outside repo`);
+    assert.equal(md.includes(customer), false, `project skill ${s} must never execute code inside the reviewed repo`);
+  }
+
+  // 2. git status is completely clean because .git/info/exclude ignores only our installed skill dirs
+  const gitStatus = spawnSync('git', ['-C', customer, 'status', '--porcelain', '--untracked-files=normal'], { encoding: 'utf8' });
+  assert.equal(gitStatus.status, 0);
+  assert.equal(gitStatus.stdout.trim(), '', `project install must not dirty repo: ${gitStatus.stdout}`);
+
+  // 3. Running installed $megalens-review with simulated GitHub prerequisites does NOT reject its own files as uncommitted changes
+  const headSha = spawnSync('git', ['-C', customer, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+  const baseSha = spawnSync('git', ['-C', customer, 'rev-parse', 'main'], { encoding: 'utf8' }).stdout.trim();
+  const { main: installedMain } = await import(pathToFileURL(userRunner));
+  const ok = (stdout = '') => ({ code: 0, stdout, stderr: '' });
+  let dispatched = false;
+  let output = '';
+  const code = await installedMain(['review', '--no-wait'], {
+    cwd: customer,
+    env: { PATH: process.env.PATH, HOME: home, CODEX_HOME: codexHome, MEGALENS_STATE_DIR: path.join(tmp, 'state') },
+    out: (line) => { output += line; },
+    exec: async (cmd, args, opts) => {
+      if (cmd === 'git') return realExec(cmd, args, opts);
+      assert.equal(cmd, 'gh');
+      if (args[0] === '--version' || args[0] === 'auth') return ok();
+      if (args[0] === 'repo') return ok(JSON.stringify({ nameWithOwner: 'example/repo', defaultBranchRef: { name: 'main' } }));
+      if (args[0] === 'api' && args.some((a) => a.includes('/contents/'))) return ok('file');
+      if (args[0] === 'api' && args.some((a) => a.includes(`/commits/${headSha}`))) return ok(`${headSha}\n`);
+      if (args[0] === 'secret') return ok(JSON.stringify([{ name: 'MEGALENS_TOKEN' }]));
+      if (args[0] === 'run' && args[1] === 'list') {
+        if (!dispatched) return ok('[]');
+        return ok(JSON.stringify([{
+          databaseId: 9123,
+          displayTitle: `MegaLens standard ${baseSha}..${headSha}`,
+          createdAt: new Date().toISOString(),
+          url: 'https://github.com/example/repo/actions/runs/9123',
+        }]));
+      }
+      if (args[0] === 'workflow' && args[1] === 'run') {
+        dispatched = true;
+        return ok();
+      }
+      assert.fail(`Unexpected gh call: ${args.join(' ')}`);
+    },
+  });
+  assert.equal(code, 0, `project-installed review should dispatch cleanly, got: ${output}`);
+  assert.equal(dispatched, true, 'must dispatch GitHub workflow instead of failing on own install files');
+  assert.doesNotMatch(output, /You have uncommitted changes/);
+
+  // 4. Real uncommitted user file STILL triggers the dirty-worktree guard
+  writeFileSync(path.join(customer, 'dirty.txt'), 'uncommitted change\n');
+  let dirtyOut = '';
+  const dirtyCode = await installedMain(['review', '--no-wait'], {
+    cwd: customer,
+    env: { PATH: process.env.PATH, HOME: home, CODEX_HOME: codexHome, MEGALENS_STATE_DIR: path.join(tmp, 'state') },
+    out: (line) => { dirtyOut += line; },
+    exec: async (cmd, args, opts) => {
+      if (cmd === 'git') return realExec(cmd, args, opts);
+      if (args[0] === '--version' || args[0] === 'auth') return ok();
+      if (args[0] === 'repo') return ok(JSON.stringify({ nameWithOwner: 'example/repo', defaultBranchRef: { name: 'main' } }));
+      if (args[0] === 'api' && args.some((a) => a.includes('/contents/'))) return ok('file');
+      if (args[0] === 'secret') return ok(JSON.stringify([{ name: 'MEGALENS_TOKEN' }]));
+      assert.fail(`Unexpected gh call on dirty worktree: ${args.join(' ')}`);
+    },
+  });
+  assert.equal(dirtyCode, 4);
+  assert.match(dirtyOut, /You have uncommitted changes/);
+});
+
+test('install-codex: merges global marketplace without clobbering other plugins; dry-run & symlinks safe', (t) => {
+  const home = mkdtempSync(path.join(tmpdir(), 'mlcodex-mp-home-'));
+  const codexHome = path.join(home, '.codex');
   t.after(() => {
     rmSync(home, { recursive: true, force: true });
-    rmSync(repo, { recursive: true, force: true });
   });
 
-  // Existing marketplace with another plugin
-  mkdirSync(path.join(repo, '.agents', 'plugins'), { recursive: true });
+  // Existing global marketplace with another plugin
+  mkdirSync(path.join(home, '.agents', 'plugins'), { recursive: true });
   const origMp = JSON.stringify({
     name: 'team-tools',
     interface: { displayName: 'Team Tools' },
     plugins: [{ name: 'other-plugin', source: { source: 'local', path: './plugins/other' }, policy: { installation: 'AVAILABLE', authentication: 'ON_USE' }, category: 'Productivity' }],
   }, null, 2);
-  writeFileSync(path.join(repo, '.agents', 'plugins', 'marketplace.json'), origMp);
+  writeFileSync(path.join(home, '.agents', 'plugins', 'marketplace.json'), origMp);
 
   // Dry-run touches nothing
-  const dry = installCodex({ scope: 'project', dir: repo, home, dryRun: true }, { flags: { codexPlugin: true } });
+  const dry = installCodex({ scope: 'global', home, codexHome, dryRun: true }, { flags: { codexPlugin: true } });
   assert.equal(dry.code, 0);
-  assert.equal(readFileSync(path.join(repo, '.agents', 'plugins', 'marketplace.json'), 'utf8'), origMp);
-  assert.equal(existsSync(path.join(repo, '.agents', 'skills')), false);
+  assert.equal(readFileSync(path.join(home, '.agents', 'plugins', 'marketplace.json'), 'utf8'), origMp);
+  assert.equal(existsSync(path.join(home, '.agents', 'skills')), false);
 
-  // Real project install keeps other-plugin and stores backup outside repo (in home)
-  const r = installCodex({ scope: 'project', dir: repo, home }, { flags: { codexPlugin: true } });
+  // Real global install keeps other-plugin and stores backup outside repo (in home/.megalens/backups)
+  const r = installCodex({ scope: 'global', home, codexHome }, { flags: { codexPlugin: true } });
   assert.equal(r.code, 0);
-  const mp = JSON.parse(readFileSync(path.join(repo, '.agents', 'plugins', 'marketplace.json'), 'utf8'));
+  const mp = JSON.parse(readFileSync(path.join(home, '.agents', 'plugins', 'marketplace.json'), 'utf8'));
   assert.equal(mp.name, 'team-tools');
   assert.deepEqual(mp.plugins.map((p) => p.name), ['other-plugin', 'megalens']);
-  assert.equal(existsSync(path.join(home, '.codex', 'prompts')), false, 'project install never writes global prompts');
   assert.equal(walk(path.join(home, '.megalens', 'backups')).length, 1);
-  assert.ok(walk(repo).every((f) => !f.includes('backups')));
 
   // Symlink refusal: nothing written
   const symHome = mkdtempSync(path.join(tmpdir(), 'mlcodex-sym-'));
@@ -925,7 +1199,7 @@ test('codex/ manifests, config example, skills, prompts, README and package.json
   const exampleToml = readFileSync(path.join(CODEX_DIR, 'config.desktop.example.toml'), 'utf8');
   assert.ok(checkToml(exampleToml));
   assert.match(exampleToml, /\[mcp_servers\.megalens\]/);
-  assert.match(exampleToml, /npx megalens-mcp setup\b/);
+  assert.match(exampleToml, /codex mcp login megalens\b/);
   assert.equal(exampleToml.includes('setup codex'), false);
   assert.ok(!/ml_tok_|mlk_|sk-/.test(exampleToml));
 
@@ -950,8 +1224,8 @@ test('codex/ manifests, config example, skills, prompts, README and package.json
   assert.equal(reviewPrompt.includes('setup codex'), false);
 
   const readme = readFileSync(path.join(CODEX_DIR, 'README.md'), 'utf8');
-  assert.match(readme, /npx megalens-mcp setup\b/);
-  assert.match(readme, /megalens-codex-install/);
+  assert.match(readme, /codex mcp login megalens\b/);
+  assert.match(readme, /megalens-codex-install --with-oauth-mcp/);
   assert.match(readme, /APP_PATH_ENABLED = false/);
   assert.match(readme, /CODEX_PLUGIN_ENABLED = false/);
   assert.match(readme, /NOT_AVAILABLE/);

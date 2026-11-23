@@ -1,14 +1,13 @@
 # MegaLens MCP configuration for Codex CLI and the Codex desktop app.
 # Both surfaces share ~/.codex/config.toml (or $CODEX_HOME/config.toml).
 #
-# Recommended (zero token copy — browser sign-in; select Codex CLI):
-#   npx megalens-mcp setup
-#
-# Alternative 1 — OAuth (no local token file; authenticate in the desktop app or via `codex mcp login megalens`):
+# Recommended (zero token copy — native browser OAuth via Codex CLI + Desktop App):
+#   1. Add this block (or pass `--with-oauth-mcp` to `megalens-codex-install`)
+#   2. Run: codex mcp login megalens
 [mcp_servers.megalens]
 url = "https://megalens.ai/api/mcp?ide=codex"
 startup_timeout_sec = 20
 tool_timeout_sec = 1800  # reviews can take several minutes; default is 60 s
 
-# Alternative 2 — Environment variable bearer token (uncomment the line below and export MEGALENS_TOKEN):
+# Alternative — Environment variable bearer token (uncomment the line below and export MEGALENS_TOKEN):
 # bearer_token_env_var = "MEGALENS_TOKEN"
