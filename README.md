@@ -4,25 +4,31 @@ Independent code review for your changes inside Claude Code. One command starts 
 
 ## Quick start (2 steps)
 
-Needs Node 18+, `git`, and the GitHub CLI (`gh auth login`). If MegaLens is not installed on your repository yet, install the MegaLens GitHub App once at https://megalens.ai/app/start (no workflow file or token needed).
+You need Node 18+, `git`, and the GitHub CLI (`gh auth login`). Set up the MegaLens GitHub Actions workflow on your repository's default branch. The App runner is disabled in this plugin until the server can verify installations and start reviews on request. [Workflow setup](#running-on-your-own-github-actions-runner)
 
-1. **Install the plugin:**
+1. **Install the plugin.**
 
    ```sh
    claude --plugin-dir /path/to/megalens-claude-plugin
    ```
 
-2. **Run a review:**
+2. **Run a review.**
 
    ```text
    /megalens:review
    ```
 
-That's it. MegaLens picks the runner automatically (our review machine via the GitHub App when installed for your repository, otherwise your own GitHub Actions runner if its workflow is present), starts the review, prints short progress lines (`Review started`, `Running on GitHub...`, `About 2 minutes so far`), and prints the findings inline when it finishes.
+MegaLens starts the review on your GitHub Actions runner, prints progress while it runs, and shows the findings when it finishes. If the workflow is missing, the command prints one line.
 
-- **Deeper pass:** run `/megalens:review deep` (Standard is the default).
-- **Stopped early or hit the 20-minute wait limit?** MegaLens prints `Still running. Run /megalens:result to see it.` Run `/megalens:result` later to see the latest review for this repository, or `/megalens:status` to check progress.
-- **Safety:** MegaLens never pushes your commits without asking, never calls a partial or failed review clean, and never prints tokens.
+```text
+Install the MegaLens GitHub App or add the workflow: https://megalens.ai/app/start
+```
+
+Standard is the default tier. For a deeper pass, run `/megalens:review deep`.
+
+If you stop waiting or reach the 20 minute limit, MegaLens prints `Still running. Run /megalens:result to see it.` You can also run `/megalens:status` to check progress.
+
+MegaLens asks before pushing commits, reports partial or failed reviews as incomplete, and keeps tokens out of the output.
 
 ## `.megalens/rules`
 
@@ -48,35 +54,31 @@ Read https://megalens.ai/privacy before reviewing code you do not own or that is
 npm test
 ```
 
-The tests cover runner auto-pick, the wait loop (with a fake clock), no-id status/result, the 20-minute wait cap, the installer, the collector, the local MCP server, the engine front end and the GitHub runner. They use temporary repositories and fakes, so they make no network or model calls.
+The tests cover runner selection, status and result without an ID, the 20 minute wait limit, the installer, the collector, the local MCP server, the engine front end and the GitHub runner. They use temporary repositories and simulated responses, with no network or model calls.
 
 ---
 
 ## Advanced
 
-Nothing below is required for the main `/megalens:review` path above.
-
 ### Flags and explicit review ids
 
-- `/megalens:review --runner app|github|local` forces a specific runner instead of auto-picking.
-- `/megalens:review --base REF --head REF` reviews an explicit commit range.
-- `/megalens:review --quiet` enables the engine's optional filter (off by default).
-- `/megalens:review --no-wait` starts the review without waiting in the same command.
-- `/megalens:status <id>` and `/megalens:result <id>` look up a specific review (`app:<check-id>`, `gh:<run-id>`, or `rv_<id>`) instead of the latest review for this repository.
+* `/megalens:review --runner github|local` selects the GitHub Actions runner or the local engine.
+* `/megalens:review --base REF --head REF` reviews an explicit commit range.
+* `/megalens:review --quiet` enables the engine's optional filter (off by default).
+* `/megalens:review --no-wait` starts the review without waiting in the same command.
+* `/megalens:status <id>` and `/megalens:result <id>` accept workflow IDs (`gh:<run-id>`) and local review IDs (`rv_<id>`).
 
 ### Running on your own GitHub Actions runner
 
-If you prefer reviews to run inside your own GitHub Actions runner instead of the MegaLens GitHub App:
-
 1. Copy `templates/megalens-dispatch.yml` to `.github/workflows/megalens-dispatch.yml` on your repository's **default branch** and push it.
-2. Store your MegaLens token as a repository secret: `gh secret set MEGALENS_TOKEN` (the plugin never reads or prints the value).
-3. Run `/megalens:review` (or `/megalens:review deep`). When the GitHub App is not installed on the repo, MegaLens picks this workflow automatically.
+2. Run `gh secret set MEGALENS_TOKEN` to store your MegaLens token as a repository secret. The plugin never reads or prints the value.
+3. Run `/megalens:review` or `/megalens:review deep`.
 
 `templates/megalens-dispatch.yml` pins `megalens/review-action@950eb5f1eeff21008fcf585587b88fc83546cdcf` (tag `v1.2.0`, engine `megalens-review` `0.1.3`) in all three jobs (`create`, `review`, `publish`). Only commits on GitHub are reviewed; uncommitted changes are never silently skipped.
 
 ### Local engine on Linux
 
-On Linux with bubblewrap, if `megalens-review` (`npm install -g megalens-review@0.1.3`) is on `PATH` (or `MEGALENS_REVIEW_BIN`) and `MEGALENS_TOKEN` is set in your shell, `/megalens:review` can run locally over uncommitted changes as well. Run `node scripts/engine.mjs install` once to install and hash-verify the pinned Codex CLI (`node scripts/engine.mjs verify` re-checks it). The engine refuses to run as root, and BYO OpenAI key / login modes are switched off in this build. See `PLUGIN-NEEDS.md`.
+On Linux with bubblewrap, use `/megalens:review --runner local` to review uncommitted changes. Install `megalens-review` with `npm install -g megalens-review@0.1.3`, make it available on `PATH` or through `MEGALENS_REVIEW_BIN`, and set `MEGALENS_TOKEN` in your shell. Run `node scripts/engine.mjs install` once to install the pinned Codex CLI and verify its hash. To check it again, run `node scripts/engine.mjs verify`. The engine refuses to run as root. OpenAI key and login modes are disabled in this build. [Engine requirements](PLUGIN-NEEDS.md)
 
 **Later:** a Double tier (Claude reviews first, then the engine uses that review as context) is built behind a constant and not available at launch; `/megalens:review double` answers "The Double tier is not available yet; use standard or deep." Its steps are kept in `docs/double-tier-later.md`.
 

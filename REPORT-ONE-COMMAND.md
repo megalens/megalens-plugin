@@ -208,3 +208,17 @@ The plugin detects zero-check installations when the available credentials estab
 ### Verification
 
 The new regressions failed on the original code and passed after the changes. The full `npm test` suite passed **202 tests with 0 failures**. GitHub calls in the tests used fixtures. `git diff --check` passed.
+
+## Fix round (App path off)
+
+The plugin keeps `APP_PATH_ENABLED = false` pending the App review start and installation status endpoints from `SOL.md` #1 and #2. With no flags, `/megalens:review` dispatches the user's GitHub Actions workflow when `.github/workflows/megalens-dispatch.yml` exists on the default branch. If the workflow cannot be found, the command exits with code 4 and prints one line.
+
+```text
+Install the MegaLens GitHub App or add the workflow: https://megalens.ai/app/start
+```
+
+Check runs and suites no longer select a runner. Automatic status and result lookups compare workflow runs with eligible saved reviews, skipping saved App entries. Explicit App requests report that the path is disabled. Local reviews require `--runner local`. Use `--runner github` for detailed workflow setup errors. [Runner selection](scripts/lib/gh-runner.mjs) · [CLI routing](scripts/engine.mjs) · [Workflow setup](README.md#running-on-your-own-github-actions-runner)
+
+Regression tests cover absent workflows, existing and active App checks, a configured local engine, and saved App entries. GitHub calls use fixtures. Local shutdown and resume fixtures now wait for readiness or hold the worker open until the check has run. [Routing regressions](tests/one-command.test.mjs)
+
+`npm test` passed all 175 tests. `git diff --check` passed.

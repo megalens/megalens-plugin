@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Front end for MegaLens reviews, used by /megalens:review, /megalens:status, /megalens:result.
 //   engine.mjs review [deep] (standard default; double exists but is off: DOUBLE_TIER_ENABLED)
-//              [--quiet] [--first-review FILE] [--base REF --head REF] [--runner app|github|local] [--wait|--no-wait]
+//              [--quiet] [--first-review FILE] [--base REF --head REF] [--runner github|local] [--wait|--no-wait]
 //   engine.mjs status [review-id]      engine.mjs result [review-id]
 //   engine.mjs first-review-write      (reads the host's review JSON on stdin, writes a clean 0600 file in a private folder, prints its path)
 // Prints text for the user. Never prints credentials.
@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  scrubExact, chooseRoute, shouldFallBack, isSandboxPrecheckDoc, isRunnerId, isAppId,
+  scrubExact, shouldFallBack, isSandboxPrecheckDoc, isRunnerId, isAppId, APP_PATH_ENABLED,
   detectRemoteRunner, appReview, appStatus, appResult,
   runnerReview, runnerStatus, runnerResult, findLatestRemoteReview, realExec, MSG,
 } from './lib/gh-runner.mjs';
@@ -218,10 +218,7 @@ export async function main(argv, {
   stdin = () => readStdin(),
   flags = {},
   exec = realExec,
-  platform = process.platform,
-  probe = null,
   signal = null,
-  reviewStartedAt = null,
 } = {}) {
   const [cmd, ...rest0] = argv;
   let rest = rest0; let runnerFlag = null;
@@ -229,7 +226,11 @@ export async function main(argv, {
     const i = rest0.indexOf('--runner');
     if (i !== -1) {
       runnerFlag = rest0[i + 1];
-      if (runnerFlag !== 'app' && runnerFlag !== 'github' && runnerFlag !== 'local') { out('--runner needs app, github or local.\n'); return 4; }
+      if (runnerFlag === 'app' && !APP_PATH_ENABLED) { out(`${MSG.appDisabled}\n`); return 4; }
+      if (runnerFlag !== 'app' && runnerFlag !== 'github' && runnerFlag !== 'local') {
+        out(`--runner needs ${APP_PATH_ENABLED ? 'app, github or local' : 'github or local'}.\n`);
+        return 4;
+      }
       rest = [...rest0.slice(0, i), ...rest0.slice(i + 2)];
     }
   }
@@ -272,7 +273,8 @@ export async function main(argv, {
       let targetId = rest[0];
       if (!explicitId) {
         const repoKey = await repoKeyPromise(false);
-        const saved = loadLatestReview({ env, repoKey }) || loadLatestReview({ env, repoKey: await repoKeyPromise(true) });
+        let saved = loadLatestReview({ env, repoKey }) || loadLatestReview({ env, repoKey: await repoKeyPromise(true) });
+        if (!APP_PATH_ENABLED && isAppId(saved?.id)) saved = null;
         const remote = await raceWithDeadline(
           (callSignal) => findLatestRemoteReview({ exec, cwd, env, signal: callSignal }),
           { signal, remainingMs: timing.latestLookupMs ?? LATEST_LOOKUP_MS },
@@ -291,6 +293,7 @@ export async function main(argv, {
       }
       if (/^app:/.test(targetId)) {
         if (!isAppId(targetId)) throw new UsageError('that is not a MegaLens App review id (they look like app:123456789)');
+        if (!APP_PATH_ENABLED) { sayExact(`${MSG.appDisabled}\n`); return 4; }
         const r = await (cmd === 'status' ? appStatus : appResult)({ exec, cwd, env, signal }, targetId, { showId: explicitId });
         sayExact(r.text); return r.code;
       }
@@ -322,14 +325,13 @@ export async function main(argv, {
       if (auth.error) { say(`MegaLens engine not started: ${auth.error}\n`); return 4; }
       const bin = env.MEGALENS_REVIEW_BIN || 'megalens-review';
       const base = { env: childEnv(env, auth.mode), cwd, signal };
-      if (cmd === 'status') return await localStatus(bin, id, base, say, probe, { showId: explicitId });
-      return await fetchAndRender(bin, ['result', id], base, say, env, probe, { showId: explicitId });
+      if (cmd === 'status') return await localStatus(bin, id, base, say, { showId: explicitId });
+      return await fetchAndRender(bin, ['result', id], base, say, env, null, { showId: explicitId });
     }
 
     // ---- review ----
     const o = parseReviewArgs(rest, flags);
-    const route = chooseRoute({ platform, runner: runnerFlag });
-    const t0 = reviewStartedAt ?? nowFn();
+    const t0 = nowFn();
     const waitMs = timing.waitMs ?? DEFAULT_WAIT_MS;
     const capMs = o.wait ? waitMs : Infinity;
     const remaining = () => Math.max(0, capMs - Math.max(0, nowFn() - t0));
@@ -342,84 +344,47 @@ export async function main(argv, {
       return r.value;
     };
 
-    const runViaApp = async (preRepo = null, { allowNoCheckFallback = false, unverifiedApp = false } = {}) => {
+    const runViaApp = async (preRepo = null) => {
       const repoKey = await prepare((callSignal) => repoKeyPromise(true, callSignal));
       let streamed = false;
       const r = await appReview({
         exec, cwd, env, tier: o.tier, base: o.base, head: o.head, wait: o.wait,
-        ...timing, t0, signal, preRepo, allowNoCheckFallback, unverifiedApp,
+        ...timing, t0, signal, preRepo,
         onLine: (s) => { streamed = true; sayExact(s); },
         saveLatest: (rec) => saveLatestReview({ env, repoKey, ...rec, now: nowFn }),
       });
-      if (r.safeToFallback && allowNoCheckFallback) return { code: r.code, safeToFallback: true };
       if (!streamed) sayExact(r.text);
-      return { code: r.code, safeToFallback: false };
+      return r.code;
     };
 
-    const runViaGithub = async (note = '') => {
+    const runViaGithub = async (preRepo = null) => {
       const repoKey = await prepare((callSignal) => repoKeyPromise(true, callSignal));
       let streamed = false;
       const r = await runnerReview({
         exec, cwd, env, tier: o.tier, base: o.base, head: o.head, wait: o.wait,
-        ...timing, t0, signal,
-        onLine: (s) => {
-          if (!streamed && note) sayExact(note);
-          streamed = true;
-          sayExact(s);
-        },
+        ...timing, t0, signal, preRepo,
+        onLine: (s) => { streamed = true; sayExact(s); },
         saveLatest: (rec) => saveLatestReview({ env, repoKey, ...rec, now: nowFn }),
       });
-      if (!streamed) sayExact(note + r.text);
+      if (!streamed) sayExact(r.text);
       return r.code;
     };
 
-    const runAutoRemote = async ({ allowLocalFallback = false } = {}) => {
-      const detected = await prepare((callSignal) => detectRemoteRunner({ exec, cwd, env, now: nowFn, signal: callSignal }));
-      if (detected.runner === 'app' || (detected.guardApp && o.tier === 'standard' && o.base === null)) {
-        const hasWf = detected.hasWorkflow;
-        if (o.tier === 'deep') {
-          if (hasWf) return await runViaGithub();
-          sayExact(`${MSG.appDeepUnsupported}\n`);
-          return 4;
-        }
-        if (o.base !== null) {
-          if (hasWf) return await runViaGithub();
-          sayExact(`${MSG.appRangeUnsupported}\n`);
-          return 4;
-        }
-        const appRes = await runViaApp({ nwo: detected.nwo, defaultBranch: detected.defaultBranch }, {
-          allowNoCheckFallback: hasWf,
-          unverifiedApp: detected.guardApp,
-        });
-        if (appRes.safeToFallback && hasWf) return await runViaGithub();
-        return appRes.code;
+    if (runnerFlag === 'app') return await runViaApp();
+    if (runnerFlag === 'github') return await runViaGithub();
+    if (runnerFlag === null) {
+      const detected = await prepare((callSignal) => detectRemoteRunner({ exec, cwd, env, signal: callSignal }));
+      if (detected.runner === 'none') {
+        sayExact(`${detected.message}\n`);
+        return 4;
       }
-      if (detected.runner === 'github') {
-        return await runViaGithub();
+      if (detected.runner === 'app' && (!detected.hasWorkflow || (o.tier === 'standard' && o.base === null))) {
+        return await runViaApp(detected);
       }
-      // Neither GitHub App nor dispatch workflow is configured.
-      // On Linux only, if local credentials are configured, fall back to the local engine.
-      const hasLocalCreds = Boolean(env.MEGALENS_TOKEN || String(env.MEGALENS_BYO ?? '').trim());
-      if (allowLocalFallback && hasLocalCreds) {
-        let buf = ''; const sig = { setup: false };
-        const code = await main(['review', ...rest, '--runner', 'local'], { env, cwd, out: (t) => { buf += t; }, err, stdin, flags, exec, platform, probe: sig, signal, reviewStartedAt: t0 });
-        if (sig.setup && detected.reason === 'not_setup') {
-          sayExact(`${detected.message}\n`);
-          return 4;
-        }
-        out(buf);
-        return code;
-      }
-      // Print ONLY the one setup line (never append a local-engine explanation when no local credentials are set).
-      sayExact(`${detected.message}\n`);
-      return 4;
-    };
+      return await runViaGithub(detected);
+    }
 
-    if (route.route === 'app') return (await runViaApp()).code;
-    if (route.route === 'github') return await runViaGithub();
-    if (route.route === 'auto') return await runAutoRemote({ allowLocalFallback: route.fallbackAllowed });
-
-    // ---- local engine route (explicit --runner local, or Linux fallback when no remote runner is configured) ----
+    // ---- local engine route (explicit --runner local) ----
     const auth = chooseAuth(env, flags);
     if (auth.error) { say(`MegaLens engine not started: ${auth.error}\n`); return 4; }
     const bin = env.MEGALENS_REVIEW_BIN || 'megalens-review';
@@ -471,7 +436,6 @@ export async function main(argv, {
           say('The local Standard review stopped without a saved result. Check the engine before retrying.\n');
           return 4;
         }
-        if (outcome.setup && probe) probe.setup = true;
         if (!outcome.setup) recordLatest({ id, runner: 'local', startedAt }, repoKey);
         say(outcome.text);
         return outcome.code;
@@ -522,7 +486,7 @@ export async function main(argv, {
           if (startTimer !== null) clearTimeout(startTimer);
           if (signal) signal.removeEventListener('abort', onStartAbort);
         }
-        if (r.code === 127) { if (probe) probe.setup = true; say(missingBin()); return 4; }
+        if (r.code === 127) { say(missingBin()); return 4; }
         let j; try { j = JSON.parse(r.stdout); } catch { j = null; }
         if (j && REVIEW_ID(j.review_id)) {
           recordLatest({ id: j.review_id, runner: 'local', tier: 'deep' }, repoKey);
@@ -535,7 +499,7 @@ export async function main(argv, {
           say(`## MegaLens deep review: ${startInterrupted === 'timeout' ? 'NOT COMPLETED' : 'CANCELLED'}\n\n${startInterrupted === 'timeout' ? 'Timed out' : 'Interrupted'} while starting the local deep review. This is not a clean review.\n`);
           return 4;
         }
-        if (r.code !== 0 || !j || !REVIEW_ID(j.review_id)) return await finishNoDoc(r, say, env, probe);
+        if (r.code !== 0 || !j || !REVIEW_ID(j.review_id)) return finishNoDoc(r, say, env);
         if (!o.wait) {
           say(`Review started\n${STILL_RUNNING_LINE}\n`);
           return 0;
@@ -564,7 +528,7 @@ export async function main(argv, {
         if (w.finished) {
           const remainingMs = Math.max(0, waitMs - Math.max(0, nowFn() - t0));
           const fetched = await raceWithDeadline(
-            (callSignal) => fetchAndRender(bin, ['result', j.review_id], { ...base, signal: callSignal }, say, env, probe, { showId: false }),
+            (callSignal) => fetchAndRender(bin, ['result', j.review_id], { ...base, signal: callSignal }, say, env, null, { showId: false }),
             { signal, remainingMs, now: nowFn, t0, waitMs },
           );
           if (fetched.interrupted) {
@@ -623,7 +587,7 @@ export async function main(argv, {
           { ...base, signal: callAc.signal, graceMs: cancelGraceMs, waitForExitOnAbort: true },
           say,
           env,
-          probe,
+          null,
           { showId: false, meta, shouldSuppress: isOvertime },
         );
         if (!interruptKind && isOvertime()) interruptKind = 'timeout';
@@ -658,9 +622,9 @@ export async function main(argv, {
   }
 }
 
-async function localStatus(bin, id, base, say, probe, { showId = true } = {}) {
+async function localStatus(bin, id, base, say, { showId = true } = {}) {
   const r = await runBin(bin, ['status', id], base);
-  if (r.code === 127) { if (probe) probe.setup = true; say(missingBin()); return 4; }
+  if (r.code === 127) { say(missingBin()); return 4; }
   let j; try { j = JSON.parse(r.stdout); } catch { j = null; }
   if (r.code !== 0 || !j || typeof j.state !== 'string' || !STATES.includes(j.state)) {
     say(`Could not read the status of ${id}: ${firstLine(r.stderr) || 'no usable answer from the engine'}. This is not a finished review.\n`);
@@ -686,9 +650,8 @@ const REVIEW_ID = (s) => typeof s === 'string' && /^rv_[A-Za-z0-9_-]{6,64}$/.tes
 const firstLine = (s) => String(s ?? '').split('\n').map((x) => x.trim()).filter(Boolean).slice(-1)[0]?.slice(0, 300) ?? '';
 const missingBin = () => 'The engine is not installed: `megalens-review` was not found on PATH (set MEGALENS_REVIEW_BIN to its path). Once it is, run `node scripts/engine.mjs install` once (it downloads the pinned Codex CLI and checks its hashes). No review ran. /megalens:megalens-review (the bundle route) still works with a token.\n';
 
-async function finishNoDoc(r, say, env, probe = null) {
-  if (r.code === 127) { if (probe) probe.setup = true; say(missingBin()); return 4; }
-  if (probe && shouldFallBack({ code: r.code, stderr: r.stderr })) probe.setup = true;
+function finishNoDoc(r, say, env) {
+  if (r.code === 127) { say(missingBin()); return 4; }
   say(renderResult(null, { exit: r.code, stderrText: scrub(firstLine(r.stderr), env) })); return r.code === 0 ? 4 : r.code;
 }
 
