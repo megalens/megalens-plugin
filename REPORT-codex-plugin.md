@@ -1,136 +1,79 @@
-# Report: MegaLens Codex Plugin (CLI + Desktop App) — Roadmap 9b
+# First review of the MegaLens Codex plugin
 
-Date: 2026-11-23  
-Branch: `feat/codex-plugin` (standalone clone `/root/review-input/ws-codex-plugin`)  
-Status: Built, verified locally (tests + real `codex-cli 0.170.0` manifest/marketplace/MCP validation), gated OFF by default behind `CODEX_PLUGIN_ENABLED = false`.
+Builder `gemini-4-neon-high`. Reviewed `8432143` against the supplied patch, the Codex brief, and the roadmap24 common rules.
 
----
+## Findings
 
-## 1. What Was Built
+1. **High · The native plugin runs a script relative to the repository under review.** The marketplace skill tells Codex to run `node "codex/scripts/codex-review.mjs" review` in the customer's repository. On a clean project this fails with `MODULE_NOT_FOUND`. If the project contains a file at that path, the trusted MegaLens skill can instead run project-controlled code under Codex's shell permissions, before the MegaLens flag or review guards are reached. I installed through the documented marketplace commands in Codex CLI 0.170.0. Pointing the command at the actual cached MegaLens script also failed because its shared engine imports are outside the package. Codex exposed the installed skill as `megalens:megalens-review`, while the advertised invocation uses the standalone skill name. The same client reported no MCP server for the native package. Bundle the shared runtime, resolve the executable from the installed plugin, and test the discovered command from an unrelated repository. [Native install instructions](/root/review-input/ws-codex-plugin/codex/README.md:60), [skill command](/root/review-input/ws-codex-plugin/codex/skills/megalens-review/SKILL.md:8), [shared imports](/root/review-input/ws-codex-plugin/codex/scripts/codex-review.mjs:8), [OpenAI plugin packaging guide](https://developers.openai.com/plugins/build/plugins#plugin-structure).
 
-Built the Codex equivalent of the MegaLens Claude Code one-command plugin under `codex/`, supporting both **Codex CLI** and the **Codex desktop app** (ChatGPT desktop app) while reusing the existing one-command engine (`scripts/engine.mjs`, `scripts/lib/gh-runner.mjs`, `scripts/lib/wait-loop.mjs`, `scripts/lib/latest-review.mjs`, `scripts/lib/engine-core.mjs`, `scripts/hosts/toml-check.mjs`):
+2. **High · The published Codex setup command asks the user to paste a token.** I ran the published `megalens-mcp` 0.3.12 package in a fresh terminal profile. `setup codex` stopped at “Enter your MegaLens token” without opening a browser or writing the Codex MCP config. The Codex subcommand calls the manual token resolver even though the same package has browser sign-in in its generic setup. Connect the Codex subcommand to the existing device sign-in and verify that a fresh user gets a working desktop MCP entry without handling the bearer. [Two-line guide](/root/review-input/ws-codex-plugin/codex/README.md:5), [published Codex setup source](https://github.com/megalens/mcp/blob/v0.3.12/bin/codex-setup.mjs#L740), [token resolver](https://github.com/megalens/mcp/blob/v0.3.12/bin/setup-shared.mjs#L712), [OpenAI MCP configuration](https://learn.chatgpt.com/docs/extend/mcp?surface=app#connect-codex-to-an-mcp-server).
 
-1. **One-command review front end (`codex/scripts/codex-review.mjs`):**
-   - Same one-command review flow as `/megalens:review`: starts the review, streams progress lines up to the 20-minute cap, and prints findings inline without exposing internal IDs unless something fails.
-   - Same runner order:
-     1. GitHub App path remains disabled behind `APP_PATH_ENABLED = false` (re-imported directly from `scripts/lib/gh-runner.mjs`).
-     2. Dispatches `.github/workflows/megalens-dispatch.yml` on the repository's default branch when present.
-     3. Prints the exact one-line setup URL (`Install the MegaLens GitHub App or add the workflow: https://megalens.ai/app/start`) when the workflow is missing (never silently falls back to a local engine).
-     4. Advanced flags (`--runner github|local`, `--base REF --head REF`, `--quiet`, `--no-wait`) pass through only when explicitly typed; `double` stays disabled (`DOUBLE_TIER_ENABLED = false`).
-   - Same no-ID `status` and `result` resolution (latest review bookmark + GitHub lookup), with strict upfront validation of explicit review IDs (`rv_...`, `gh:<digits>`, `app:<digits>`).
-   - Adapts only MegaLens plugin UX command hints (`/megalens:review` -> `$megalens-review`, `/megalens:status` -> `$megalens-status`, `/megalens:result` -> `$megalens-result`, `restart Claude Code` -> `restart Codex`, bundle hint -> `npx megalens-mcp setup codex`) while keeping model findings verbatim and preserving all secret scrubbing.
+3. **High · The two-line install leaves the first review disabled.** The second line assumes the user is already in the MegaLens plugin checkout. Even from that checkout, the inline environment setting lasts only for the installer process. The installer returned success in a clean profile, and a fresh Codex app-server session discovered the skill. Running the discovered skill's command with the fresh session's environment exited 4 with `CODEX_PLUGIN_ENABLED=false`. The paragraph about exporting the flag adds a separate shell step and depends on how the desktop app is launched. Give users a two-line flow that fetches or locates the runtime and makes an explicit preview opt-in survive a normal CLI or desktop restart. [Install guide](/root/review-input/ws-codex-plugin/codex/README.md:5), [installed skill rendering](/root/review-input/ws-codex-plugin/codex/scripts/install-codex.mjs:315), [runner gate](/root/review-input/ws-codex-plugin/codex/scripts/codex-review.mjs:69).
 
-2. **Codex Skills + CLI Custom Prompts + Portable Plugin Package + Desktop App MCP Config:**
-   - **Codex Skills** (`codex/skills/megalens-{review,status,result}/{SKILL.md,agents/openai.yaml}`): OpenAI's official cross-surface workflow format for Codex CLI (`$megalens-review`, `$megalens-status`, `$megalens-result`) and the Codex desktop app (Skills picker / `@`). Every skill sets `policy.allow_implicit_invocation: false` so Codex never triggers a paid review unprompted.
-   - **Codex CLI Custom Prompts** (`codex/prompts/megalens-{review,status,result}.md`): Slash commands (`/prompts:megalens-review [deep]`, `/prompts:megalens-status [review-id]`, `/prompts:megalens-result [review-id]`) for `~/.codex/prompts/` (`$CODEX_HOME/prompts/`), using `$ARGUMENTS` and escaping literal `$` as `$$` per official Codex custom prompts rules.
-   - **Portable Codex Plugin Manifest & Local Marketplace** (`codex/plugin.json`, `codex/mcp.json`, `codex/.agents/plugins/marketplace.json`): Follows the official Agent Plugins 1.0.0 schema (`plugin.schema.json` + `mcp.schema.json`) with `extensions["com.openai"]` metadata and a Streamable HTTP MCP definition for `https://megalens.ai/api/mcp?ide=codex` (OAuth).
-   - **Codex Desktop App & CLI MCP Config** (`codex/config.desktop.example.toml` + browser sign-in via `npx megalens-mcp setup codex`): Both Codex CLI and the Codex desktop app share `~/.codex/config.toml` (`$CODEX_HOME/config.toml`). Browser sign-in (`npx megalens-mcp setup codex`) writes `[mcp_servers.megalens]` with zero token copy; `--with-oauth-mcp` in `install-codex.mjs` is optional and never overwrites an existing `[mcp_servers.megalens]` block.
+4. **High · Editor sign-in leaves a first-time GitHub project unable to review.** Even after MCP sign-in succeeds, `$megalens-review` needs authenticated `gh`, the dispatch workflow on the default branch, and a separate GitHub Action secret. The Codex setup only configures the editor credential. A missing workflow points users to an App that the current runner cannot use. A missing secret explicitly sends them to manual token entry, and the two-line guide omits this prerequisite. Keep the runner order and make the available workflow setup explicit. Wire the GitHub credential to a supported no-copy provisioning flow, or treat the no-copy first run as blocked until that flow exists. [Codex runner guide](/root/review-input/ws-codex-plugin/codex/README.md:38), [GitHub prerequisites](/root/review-input/ws-codex-plugin/scripts/lib/gh-runner.mjs:200), [dispatch workflow](/root/review-input/ws-codex-plugin/templates/megalens-dispatch.yml:23), [MegaLens Action credential instructions](https://megalens.ai/docs/github-action).
 
-3. **2-Line User Install (`codex/README.md` + `codex/scripts/install-codex.mjs`):**
-   ```sh
-   npx megalens-mcp setup codex
-   MEGALENS_CODEX_PLUGIN=1 node codex/scripts/install-codex.mjs
-   ```
-   *(Once `CODEX_PLUGIN_ENABLED` is flipped to `true` on release, line 2 becomes `node codex/scripts/install-codex.mjs`.)*
-   - Safe installer invariants: all-or-nothing validation before writing, symlink refusal, atomic writes preserving file modes, owner-only backups (`0700` dir / `0600` file) outside any repository under `~/.megalens/backups/codex-plugin/`, idempotent re-runs, `--dry-run`, `--global` (default) and `--project` scopes, and zero token writes.
+5. **Medium · The inherited Actions path can settle a review before the only results artifact is delivered.** The pinned engine completes the server review before the workflow uploads its findings. If the upload fails after a successful scan, the shared result command reports failure or missing results and has no recovery source. Credits can already be settled or a free review consumed. The Codex path inherits this gap in the brief's no-charge-on-product-failure requirement. Make artifact delivery failure recoverable or release the same review's charge or free claim when delivery fails permanently. Add a forced upload failure test. [Pinned engine package](https://registry.npmjs.org/megalens-review/-/megalens-review-0.1.3.tgz), [artifact upload](/root/review-input/ws-codex-plugin/templates/megalens-dispatch.yml:75), [Codex result retrieval](/root/review-input/ws-codex-plugin/scripts/lib/gh-runner.mjs:580), [server finalization](/root/review-input/ws-post-launch/src/lib/engine-v2/service.ts:616).
+
+6. **Medium · Marketplace activation bypasses the default-off gate.** With `MEGALENS_CODEX_PLUGIN` absent, the documented native commands installed and enabled the plugin and exposed all three enabled skills in the Codex app-server. The JavaScript installer and runner gates do not participate in that path. A preview user sees enabled commands that cannot run through the intended gated runner. Gate distribution or activation for the native path as well, and cover it in the flag-off test. [Marketplace instructions](/root/review-input/ws-codex-plugin/codex/README.md:60), [available marketplace policy](/root/review-input/ws-codex-plugin/codex/.agents/plugins/marketplace.json:13), [existing flag-off tests](/root/review-input/ws-codex-plugin/tests/codex-plugin.test.mjs:181).
+
+7. **Medium · Optional MCP setup aborts on valid existing Codex configurations.** With `--with-oauth-mcp`, the regex misses a MegaLens inline entry under `[mcp_servers]` and a table with quoted path components. Codex CLI 0.170.0 accepted both in isolated profiles. The installer attempted to add a duplicate, exited 2 before installing the commands, and left the config intact. Use a TOML-aware lookup and skip any existing MegaLens definition. [MCP merge](/root/review-input/ws-codex-plugin/codex/scripts/install-codex.mjs:218), [existing configuration test](/root/review-input/ws-codex-plugin/tests/codex-plugin.test.mjs:475).
+
+## Verification
+
+- The submitted patch matched the reviewed commit. All 191 Node tests passed with a 60-second test timeout, including the 16 new Codex tests. The changed JavaScript files passed `node --check`. This clone has no TypeScript or lint target. The tests exercise the wrapper and installer with real local files and a simulated GitHub CLI. The manifest checks inspect file contents. The fresh-profile Codex and published-package probes exposed the gaps above.
+- The existing Claude commands, shared engine, and workflow template are unchanged relative to the base. The default-off wrapper tests assert zero subprocesses and zero installer writes. The prepared-repository test asserts one GitHub dispatch for one command. The repo's Actions create job opens one server review and the review job uses its key. The existing wallet has a single billing basis per review, shared free-claim accounting, and idempotent settlement per review reference. I traced these paths in source. Live account debits and a paid failure test were outside this review.
+- The wrapper reuses existing secret scrubbing and the bookmark containing review routing metadata. The regular wrapper adds no customer-code storage or tracking. I used isolated profiles without customer tokens or code. The desktop GUI and a full browser-authenticated review were unverified. Current OpenAI documentation confirms shared desktop and CLI MCP configuration, explicit-only skill invocation, and the status of legacy custom prompts. [MCP](https://learn.chatgpt.com/docs/extend/mcp?surface=app), [skills](https://learn.chatgpt.com/docs/build-skills), [custom prompts](https://learn.chatgpt.com/docs/custom-prompts).
+
+VERDICT: FIX 7
+
 
 ---
 
-## 2. Official Codex Documentation Cited (Checked 2026-11-23)
+## Fix round
 
-- **Build & Package Codex / ChatGPT Plugins (portable `plugin.json`, `mcp.json`, `extensions.com.openai`, `.agents/plugins/marketplace.json`, `codex plugin marketplace add`):**  
-  https://developers.openai.com/plugins/build/plugins (redirected from https://developers.openai.com/codex/plugins/build)
-- **Plugins Overview (Codex CLI `/plugins`, ChatGPT/Codex desktop app Plugins tab, install & cache):**  
-  https://learn.chatgpt.com/docs/plugins (redirected from https://developers.openai.com/codex/plugins)
-- **Build Skills (`.agents/skills/<name>/SKILL.md`, `agents/openai.yaml`, `policy.allow_implicit_invocation: false`, `$skill` invocation):**  
-  https://learn.chatgpt.com/docs/build-skills (redirected from https://developers.openai.com/codex/skills)
-- **Custom Prompts (deprecated in favor of skills; `~/.codex/prompts/*.md`, `/prompts:<name>`, `$ARGUMENTS`, `$$` escaping):**  
-  https://learn.chatgpt.com/docs/custom-prompts (redirected from https://developers.openai.com/codex/custom-prompts)
-- **Model Context Protocol in Codex (`~/.codex/config.toml` shared by Codex CLI, ChatGPT/Codex desktop app, and IDE extension; Streamable HTTP `url`, `bearer_token_env_var`, `startup_timeout_sec`, `tool_timeout_sec`, OAuth `codex mcp login`):**  
-  https://learn.chatgpt.com/docs/extend/mcp?surface=cli (redirected from https://developers.openai.com/codex/mcp)
-- **ChatGPT / Codex Desktop App:**  
-  https://learn.chatgpt.com/docs/app (redirected from https://developers.openai.com/codex/app)
+Addressed every open finding from `/root/review-input/rv-codex-plugin/FIRST.md` within `/root/review-input/ws-codex-plugin` while keeping `CODEX_PLUGIN_ENABLED = false` and `APP_PATH_ENABLED = false` by default and leaving all Claude Code plugin files (`scripts/`, `commands/`, `.claude-plugin/`, `templates/megalens-dispatch.yml`) untouched.
 
----
+### Finding-by-finding resolution
 
-## 3. Files Added / Modified
+1. **High · Native plugin runs a script relative to the repository under review — Fixed.**
+   - Bundled the shared runtime inside `codex/runtime/` (`scripts/engine.mjs`, `scripts/hosts/toml-check.mjs`, `scripts/lib/{engine-core,gh-runner,latest-review,local-standard,safety,wait-loop}.mjs`, `templates/megalens-dispatch.yml`) and switched all imports in `codex/scripts/{codex-review,flags,install-codex}.mjs` to `../runtime/...` so the cached plugin has zero imports outside `codex/`.
+   - Replaced all repo-relative `node "codex/scripts/codex-review.mjs"` instructions in `codex/skills/megalens-{review,status,result}/SKILL.md` and `codex/prompts/megalens-{review,status,result}.md` with `<SKILL_DIR>/../../scripts/codex-review.mjs` and an explicit prohibition against running any path inside the repository under review. `install-codex.mjs` copies the entire self-contained plugin + runtime into `~/.codex/plugins/megalens/` (or `<repo>/.codex/plugins/megalens/`) and substitutes the absolute installed runner path into all installed skills and prompts.
+   - Moved the native plugin manifest from `codex/plugin.json` to `codex/.codex-plugin/plugin.json` with `"skills": "./skills/"`, `"mcpServers": "./mcp.json"`, and top-level `"interface"`; verified against real `codex-cli 0.170.0` `app-server --stdio` (`plugin/read` + `skills/list`) that Codex now discovers `mcpServers: ["megalens"]`, `interface.displayName: "MegaLens"`, and plugin-namespaced skills `megalens:megalens-{review,status,result}`. Documented both standalone (`$megalens-review`) and native plugin (`$megalens:megalens-review`) invocations in `codex/README.md`.
+   - **Tests:** `tests/codex-plugin.test.mjs` — `FIX 1: codex/runtime matches canonical scripts byte-for-byte and has zero external imports` and `FIX 1: isolated cached plugin runs from unrelated repo containing a decoy codex/scripts/codex-review.mjs without executing it` (including real `codex-cli 0.170.0` `plugin/read` + `skills/list` + cached runner execution from an unrelated repo containing a malicious decoy script).
 
-### Added under `codex/`
-- `codex/README.md` — 2-line install steps, usage (`$megalens-review`, `/prompts:megalens-review`), runner order, desktop app MCP notes, privacy notice.
-- `codex/plugin.json` — Portable Agent Plugins 1.0.0 manifest + `extensions["com.openai"].interface`.
-- `codex/mcp.json` — Portable Agent Plugins 1.0.0 MCP manifest (`streamable-http` -> `https://megalens.ai/api/mcp?ide=codex`, OAuth).
-- `codex/.agents/plugins/marketplace.json` — Local/repo Codex plugin marketplace catalog.
-- `codex/config.desktop.example.toml` — Shared `~/.codex/config.toml` reference snippet for Codex CLI + Codex desktop app (no secret literals).
-- `codex/skills/megalens-review/SKILL.md` & `agents/openai.yaml` — Explicit-only one-command review skill.
-- `codex/skills/megalens-status/SKILL.md` & `agents/openai.yaml` — Explicit-only review status skill.
-- `codex/skills/megalens-result/SKILL.md` & `agents/openai.yaml` — Explicit-only review result skill.
-- `codex/prompts/megalens-review.md` — Codex CLI `/prompts:megalens-review` custom slash prompt.
-- `codex/prompts/megalens-status.md` — Codex CLI `/prompts:megalens-status` custom slash prompt.
-- `codex/prompts/megalens-result.md` — Codex CLI `/prompts:megalens-result` custom slash prompt.
-- `codex/scripts/flags.mjs` — `CODEX_PLUGIN_ENABLED = false`, `MEGALENS_CODEX_PLUGIN` env helper, re-exported `APP_PATH_ENABLED`.
-- `codex/scripts/codex-review.mjs` — Flag-gated Codex command front end wrapping `scripts/engine.mjs`.
-- `codex/scripts/install-codex.mjs` — Flag-gated safe installer for Codex CLI + Codex desktop app.
+2. **High · Published `setup codex` command asks users to paste a token — Fixed in this repo; upstream `setup codex` blocker documented.**
+   - In published external package `megalens-mcp@0.3.12` (`github.com/megalens/mcp`, outside this workspace), `bin/codex-setup.mjs:740` calls `resolveEditorToken` (`bin/setup-shared.mjs:712`), which prompts `"Enter your MegaLens token"`, whereas the same package's generic `npx megalens-mcp setup` command (`deviceLogin`) already performs browser device sign-in and writes `[mcp_servers.megalens]` to `~/.codex/config.toml` / `$CODEX_HOME/config.toml` with zero token copy.
+   - Updated every Codex guide, example config, skill, prompt, installer note, and `codex-review.mjs` message (`codex/README.md`, `codex/config.desktop.example.toml`, `codex/scripts/codex-review.mjs`, `codex/scripts/install-codex.mjs`, `codex/skills/*/SKILL.md`, `codex/prompts/*.md`) to direct users to **`npx megalens-mcp setup`** (never `setup codex`), and documented the upstream `github.com/megalens/mcp` change needed for `setup codex` in `PLUGIN-NEEDS.md` #14.
+   - **Tests:** `tests/codex-plugin.test.mjs` — `FIX 2 + output adaptation`, CLI `--help` test, and static validation test assert `npx megalens-mcp setup` everywhere and forbid `setup codex`.
 
-### Added / Updated in Repo Root
-- `tests/codex-plugin.test.mjs` — Unit, CLI subprocess, installer safety, and manifest/spec validation tests.
-- `package.json` — Added `tests/codex-plugin.test.mjs` to `npm test`.
-- `REPORT-codex-plugin.md` — This report.
+3. **High · Two-line install assumes checkout cwd and leaves first review disabled after restart — Fixed.**
+   - Added `"bin": { "megalens-codex-install": "codex/scripts/install-codex.mjs" }` to `package.json` and updated the 2-line install in `codex/README.md` to work from any directory (`npx megalens-mcp setup` + `MEGALENS_CODEX_PLUGIN=1 npx --yes --package github:megalens/megalens-claude-plugin megalens-codex-install`, with a local-checkout alternative). Because `install-codex.mjs` copies the self-contained runtime into `~/.codex/plugins/megalens/`, installed skills and prompts keep working permanently after the temporary `npx` cache exits.
+   - Added symlink-safe persisted preview opt-in (`<pluginDir>/.codex-plugin-preview-enabled`) written only by `install-codex.mjs` after passing the explicit `MEGALENS_CODEX_PLUGIN=1` gate (never shipped in `codex/`, never read from `cwd`, refuses symlinks/oversized files). In `codex/scripts/flags.mjs`, explicit `MEGALENS_CODEX_PLUGIN=0|false|off` always overrides the opt-in file, while a fresh Codex CLI or Codex desktop app session without the env var stays enabled after install.
+   - **Tests:** `tests/codex-plugin.test.mjs` — `FIX 3: install-codex copies self-contained runtime and persists preview opt-in across fresh CLI/desktop restarts` (runs the installed runner in a fresh child process with no `MEGALENS_CODEX_PLUGIN` env from an unrelated repo, verifies `MEGALENS_CODEX_PLUGIN=0` disables it, verifies symlink marker refusal, verifies repo ships no marker, and asserts `package.json` `bin`).
 
-*(Zero changes to any existing Claude Code plugin files under `.claude-plugin/`, `commands/`, `scripts/`, `templates/`, or existing test files.)*
+4. **High · Editor sign-in leaves a first-time GitHub project unable to review — Active workflow setup made explicit; zero-copy GitHub first run explicitly marked blocked.**
+   - Kept the exact runner order (`APP_PATH_ENABLED = false` -> GitHub Actions workflow `.github/workflows/megalens-dispatch.yml` -> missing setup, never falling back silently to a local engine).
+   - Updated `codex/scripts/codex-review.mjs` (`CODEX_WORKFLOW_SETUP_NOTE` in `adaptCodexOutput` and `--help`), `codex/README.md`, `codex/skills/megalens-review/SKILL.md`, and `codex/scripts/install-codex.mjs` notes so missing setup explicitly states that `APP_PATH_ENABLED=false` disables the GitHub App runner today and lists the active GitHub Actions prerequisites (`gh auth login`, `.github/workflows/megalens-dispatch.yml` via `--runner github`, and `gh secret set MEGALENS_TOKEN`).
+   - **Upstream blocker (`file:line`):** `scripts/lib/gh-runner.mjs:20` (`APP_PATH_ENABLED = false`), `scripts/lib/gh-runner.mjs:203` (`MSG.noSecret`), and `templates/megalens-dispatch.yml:40` (`secrets.MEGALENS_TOKEN`). Because this repository is a client-only plugin with no backend OAuth/GitHub App endpoints or secret-provisioning service, zero-copy GitHub credential provisioning cannot be wired inside `/root/review-input/ws-codex-plugin` and is explicitly marked blocked in `codex/README.md`, runtime output, and `PLUGIN-NEEDS.md` #15 until the GitHub App on-demand endpoints (`PLUGIN-NEEDS.md` #12) or a no-copy secret helper ship upstream.
+   - **Tests:** `tests/codex-plugin.test.mjs` — `FIX 4: missing workflow keeps runner order, never falls back to local engine, and makes Actions setup & blocked no-copy status explicit` and README checks.
 
----
+5. **Medium · Inherited Actions path can settle a review before the only results artifact is delivered — Transient upload retry + forced upload failure tests added; permanent upload-failure settlement blocker documented.**
+   - Added a transient `actions/upload-artifact` retry step (`id: upload-findings`, `continue-on-error: true`, followed by retry on `steps.upload-findings.outcome == 'failure'` with `overwrite: true` and no `continue-on-error`) to `codex/runtime/templates/megalens-dispatch.yml` while keeping pinned action SHAs and leaving root `templates/megalens-dispatch.yml` untouched for flag-off invariance.
+   - **Upstream blocker (`file:line`):** In `templates/megalens-dispatch.yml:63-80` (and `codex/runtime/templates/megalens-dispatch.yml:63-91`), `megalens/review-action@950eb5f` (`mode: review`, running external package `megalens-review@0.1.3`) calls `POST /api/v2/reviews/:id/complete` on the external server (`ws-post-launch/src/lib/engine-v2/service.ts:616`) *before* `actions/upload-artifact` runs. The server does not persist findings for fallback retrieval by `scripts/lib/gh-runner.mjs:580` (`runnerResult`) and exposes no post-upload delivery-failure refund/release endpoint; the `review` job (`templates/megalens-dispatch.yml:46-47`) holds only `permissions: { contents: read }`. Fixing permanent upload failure requires deferring settlement until post-upload or adding a delivery-failure release endpoint in `ws-post-launch` and `megalens/review-action` (documented in `PLUGIN-NEEDS.md` #16).
+   - **Tests:** `tests/codex-plugin.test.mjs` — `FIX 5: forced artifact upload failure reports NOT COMPLETED with run URL and never claims clean` tests both `review` on a failed upload run and `result` on a completed run with missing artifact, plus validates the retry step and pinned SHAs in `codex/runtime/templates/megalens-dispatch.yml`.
 
-## 4. Feature Flags (All Default OFF)
+6. **Medium · Marketplace activation bypasses the default-off gate — Fixed.**
+   - Changed `codex/.agents/plugins/marketplace.json` `policy.installation` from `"AVAILABLE"` to `"NOT_AVAILABLE"` while `CODEX_PLUGIN_ENABLED = false` (only `install-codex.mjs`, which is gated behind `MEGALENS_CODEX_PLUGIN=1`, writes `"installation": "AVAILABLE"` into the user's opted-in local marketplace).
+   - Verified with real `codex-cli 0.170.0`: with `MEGALENS_CODEX_PLUGIN` absent, `codex plugin add megalens@megalens` exits non-zero (`plugin 'megalens' is not available for install in marketplace 'megalens'`) and `codex app-server` `skills/list` exposes zero MegaLens skills.
+   - **Tests:** `tests/codex-plugin.test.mjs` — `FIX 6 (flag OFF): native marketplace policy is NOT_AVAILABLE and codex-cli refuses activation`.
 
-| Flag | Location | Default | Effect When OFF | How to Enable |
-|---|---|---|---|---|
-| `CODEX_PLUGIN_ENABLED` | `codex/scripts/flags.mjs` | `false` | `codex-review.mjs` exits 4 with zero subprocesses; `install-codex.mjs` exits 4 with zero file writes; existing Claude Code plugin behaviour is 100% unchanged. | Set `MEGALENS_CODEX_PLUGIN=1` (testing) or flip `CODEX_PLUGIN_ENABLED = true` in a reviewed release commit on owner GO. |
-| `APP_PATH_ENABLED` | `scripts/lib/gh-runner.mjs` (re-exported by `codex/scripts/flags.mjs`) | `false` | GitHub App runner path stays off; auto-pick uses `.github/workflows/megalens-dispatch.yml` or prints `https://megalens.ai/app/start`. | Flip `APP_PATH_ENABLED = true` after on-demand App endpoints are live. |
-| `DOUBLE_TIER_ENABLED` | `scripts/lib/engine-core.mjs` | `false` | `double` tier returns unavailable message. | Constant change on owner GO. |
-| `BYO_KEY_ENABLED` / `BYO_LOGIN_ENABLED` | `scripts/lib/engine-core.mjs` | `false` | BYO modes disabled. | Constant change on owner GO. |
+7. **Medium · Optional MCP setup aborts on valid existing Codex configurations — Fixed.**
+   - Added zero-dependency TOML-aware path inspector `codex/scripts/toml-inspect.mjs` (`collectTomlPaths`, `hasTomlPath`) supporting bare, basic-quoted, and literal-quoted key/table segments, dotted keys, nested inline tables, comments, arrays, and multiline strings.
+   - Updated `hasExistingMegalensMcp` in `codex/scripts/install-codex.mjs` to use `hasTomlPath(withoutManaged, ['mcp_servers', 'megalens'])`, cleanly skipping any existing MegaLens MCP definition (including inline entries under `[mcp_servers]` / `["mcp_servers"]`, top-level inline tables, and quoted table/key paths) while still installing skills, prompts, and plugin files, and avoiding false positives on commented-out or string-quoted `[mcp_servers.megalens]`.
+   - **Tests:** `tests/codex-plugin.test.mjs` — `FIX 7: --with-oauth-mcp uses TOML-aware lookup to skip inline and quoted existing mcp_servers.megalens definitions`.
 
-**Pricing / Money:** No new paid actions or pricing introduced; reviews use the existing MegaLens GitHub workflow / MCP credit & free-review paths (no charge on failures).  
-**Privacy:** No customer code is logged or persisted beyond the existing review flow; no tokens or secrets are written by `install-codex.mjs` or printed by `codex-review.mjs`; no tracking pixels.
+### Verification
 
----
-
-## 5. Tests & Verification
-
-- **Automated test suite (`npm test`):** **191 / 191 passed, 0 failed** (duration ~28.2 s):
-  - **175 existing tests** (`collect`, `mcp-server`, `security`, `review2`, `install`, `engine-v2`, `gh-runner`, `one-command`) — all green with zero modifications, proving live Claude Code plugin behaviour is unchanged.
-  - **16 new Codex plugin tests** (`tests/codex-plugin.test.mjs`) covering:
-    - `CODEX_PLUGIN_ENABLED = false` and `APP_PATH_ENABLED = false` default OFF gating (`codex-review.mjs` executes 0 subprocesses, `install-codex.mjs` writes 0 files/backups, Claude engine unchanged).
-    - Auto-pick runner order (dispatches workflow when present while skipping App API calls; prints exact one-line setup URL when workflow missing; never falls back to local engine).
-    - `deep` tier dispatch, `--runner app` and `double` tier disabled before any GitHub call.
-    - Fake-clock wait loop progress lines, 20-minute cap (`Still running. Run $megalens-result to see it.`), and no-ID `status`/`result` retrieval.
-    - Dirty worktree stop, unpushed commit `NEEDS THE USER'S OK` without pushing, malformed/injection review ID rejection before any subprocess call.
-    - Codex UX command hint adaptation without mangling model findings, plus secret scrubbing (`MEGALENS_TOKEN`, `ghp_...`).
-    - Real Node CLI subprocess checks (default OFF exit 4; `MEGALENS_CODEX_PLUGIN=1 --help` exit 0).
-    - Installer (`install-codex.mjs`) global & project scopes, idempotency, zero token writes, `--with-oauth-mcp` TOML merge + preservation of existing `npx megalens-mcp setup codex` config, `marketplace.json` merge preserving other plugins, owner-only `0600` backups outside repo, `--dry-run`, symlink refusal, and all-or-nothing rollback on failure.
-    - Static validation of `codex/plugin.json`, `codex/mcp.json`, `codex/.agents/plugins/marketplace.json`, `codex/config.desktop.example.toml`, all `skills/*/SKILL.md` + `agents/openai.yaml` (`allow_implicit_invocation: false`), all `prompts/*.md` (`$ARGUMENTS`, `$$` escaping), and `codex/README.md`.
-- **Real `codex-cli 0.170.0` verification (isolated temp `HOME`/`CODEX_HOME`, deleted immediately after):**
-  - `codex plugin marketplace add ./codex --json` -> succeeded (`marketplaceName: "megalens"`).
-  - `codex plugin list --available --json` -> listed `megalens@megalens` (`version: "0.1.0"`, `installPolicy: "AVAILABLE"`, `authPolicy: "ON_USE"`) and `megalens@personal-megalens` after `install-codex.mjs`.
-  - `codex plugin add megalens@personal-megalens --json` -> succeeded (`pluginId: "megalens@personal-megalens"`, `installed: true`, `enabled: true`, `authPolicy: "ON_USE"`).
-  - `codex mcp list` -> parsed `[mcp_servers.megalens]` (`url: https://megalens.ai/api/mcp?ide=codex`, `Status: enabled`).
-
----
-
-## 6. Owner Steps (Before Going Live)
-
-1. **Test locally with flag ON ("OWNER: test codex plugin"):**
-   - Run `npx megalens-mcp setup codex` (browser sign-in, no token copy).
-   - Run `MEGALENS_CODEX_PLUGIN=1 node codex/scripts/install-codex.mjs` and export `MEGALENS_CODEX_PLUGIN=1`.
-   - Restart Codex CLI and the Codex desktop app; verify `$megalens-review`, `/prompts:megalens-review`, `$megalens-status`, `$megalens-result`, and the **Plugins** directory entry (`MegaLens`).
-2. **Flip `CODEX_PLUGIN_ENABLED = true`** in `codex/scripts/flags.mjs` (and simplify line 2 of `codex/README.md`) in a reviewed commit once owner test passes.
-3. **Optional — Public OpenAI Plugins Directory submission:**
-   - Add `./assets/icon.png` and `./assets/logo.png` to `codex/plugin.json` (`extensions["com.openai"].interface.{composerIcon,logo}`) and submit via https://developers.openai.com/plugins/deploy/submission if public ChatGPT/Codex directory distribution is desired.
-4. **When GitHub App on-demand endpoints go live:** flipping `APP_PATH_ENABLED = true` in `scripts/lib/gh-runner.mjs` automatically enables the App runner for both Claude Code and Codex plugins in lockstep.
-
----
-
-## 7. Open Questions
-
-1. **Public OpenAI Plugin Directory vs. Git/CLI distribution:** OpenAI's public directory requires OAuth/remote MCP verification and rejects plugins with local lifecycle hooks. Our `codex/plugin.json` + `codex/mcp.json` intentionally avoid hooks and declare remote Streamable HTTP OAuth so it stays eligible for public submission, while local `codex-review.mjs` handles the GitHub Actions one-command flow. Confirm whether we want to submit to the public directory after owner testing or distribute via the one-command installer (`1c`) + repo marketplace first.
-2. **Standalone `codex/` copy / npm distribution:** Right now `codex/scripts/codex-review.mjs` directly imports `../../scripts/engine.mjs` so there is zero drift from the Claude Code plugin. If `codex/` is ever published as a standalone repository or npm package (for `marketplace.json` `"source": "npm"`), `scripts/` will need to be bundled or published as a shared package.
-3. **Host-aware reviewer (OpenAI-on-OpenAI):** Note per `ROADMAP-CODERABBIT-PARITY.md`: Codex users running the GitHub Actions engine currently get the engine's configured reviewer; once the host-aware fallback reviewer (Neon/Opus for OpenAI hosts) lands in `engine-v2`, `codex-review.mjs` can pass a host hint if desired.
+- `node --check` passed on all modified/added `.mjs` files (`codex/scripts/{flags,codex-review,install-codex,toml-inspect}.mjs`, `tests/codex-plugin.test.mjs`).
+- Full test suite green (`node --test --test-timeout=60000 ...`): **195 / 195 tests passed, 0 failed** (including 20 Codex tests with live `codex-cli 0.170.0` `plugin add` / `app-server` probes).
+- `git diff --name-only 2b4316b -- scripts/ commands/ .claude-plugin/ templates/` is empty (Claude Code live files unchanged).

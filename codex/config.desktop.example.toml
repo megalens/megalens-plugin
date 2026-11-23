@@ -1,8 +1,8 @@
 # MegaLens MCP configuration for Codex CLI and the Codex desktop app.
 # Both surfaces share ~/.codex/config.toml (or $CODEX_HOME/config.toml).
 #
-# Recommended (zero token copy — browser sign-in):
-#   npx megalens-mcp setup codex
+# Recommended (zero token copy — browser sign-in; select Codex CLI):
+#   npx megalens-mcp setup
 #
 # Alternative 1 — OAuth (no local token file; authenticate in the desktop app or via `codex mcp login megalens`):
 [mcp_servers.megalens]

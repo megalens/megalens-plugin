@@ -11,7 +11,7 @@
         "path": "./"
       },
       "policy": {
-        "installation": "AVAILABLE",
+        "installation": "NOT_AVAILABLE",
         "authentication": "ON_USE"
       },
       "category": "Developer Tools"
