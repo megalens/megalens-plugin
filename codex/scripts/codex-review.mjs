@@ -67,7 +67,7 @@ export function adaptCodexOutput(text) {
     .replaceAll('usage: engine.mjs ', 'usage: codex-review.mjs ');
 
   if (!APP_PATH_ENABLED && out === `${MSG.notSetup}\n`) {
-    out = `${MSG.notSetup}\n${CODEX_WORKFLOW_SETUP_NOTE}\n`;
+    out = `GitHub Actions workflow setup required (${MSG.notSetup.match(/https:\/\/\S+/)?.[0] ?? 'https://megalens.ai/app/start'}).\n${CODEX_WORKFLOW_SETUP_NOTE}\n`;
   }
   return out;
 }

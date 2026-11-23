@@ -1,41 +1,91 @@
-// Minimal zero-dependency TOML-aware path inspector & inline-table helper for Codex config.toml.
-// Collects defined table headers, dotted keys, and inline-table key paths while
-// skipping comments, basic/literal/multiline strings, and arrays.
+// Zero-dependency TOML 1.0 / 1.1 validator, path inspector, and inline-table editor for Codex config.toml.
+// Supports arbitrary-length bare keys/values (no substring cap), quoted/dotted keys,
+// single-line and multiline inline tables (with optional trailing commas and comments),
+// basic/literal/multiline strings (including TOML 1.1 \e and \xHH escapes), and arrays.
+
+const BARE_KEY_RE = /[A-Za-z0-9_-]+/y;
+const BARE_VAL_RE = /[^\s,\]}#]+/y;
+const TIME_PART_RE = /[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})?/y;
+const SCALAR_VAL_RE = /^(?:true|false|[+-]?(?:inf|nan)|[+-]?(?:0|[1-9](?:_?[0-9])*)(?:\.[0-9](?:_?[0-9])*)?(?:[eE][+-]?[0-9](?:_?[0-9])*)?|0x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*|0o[0-7](?:_?[0-7])*|0b[01](?:_?[01])*|[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[Tt ][0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?(?:[Zz]|[+-][0-9]{2}:[0-9]{2})?)?|[0-9]{2}:[0-9]{2}(?::[0-9]{2}(?:\.[0-9]+)?)?)$/;
 
 function inspectToml(src) {
   if (typeof src !== 'string') return { paths: [], inlineTables: [] };
   const hasBom = src.charCodeAt(0) === 0xfeff;
   let i = hasBom ? 1 : 0;
+  let line = 1;
+  const fail = (m) => { throw new Error(`line ${line}: ${m}`); };
   const eof = () => i >= src.length;
   const ws = () => { while (src[i] === ' ' || src[i] === '\t') i++; };
   const skipComment = () => { if (src[i] === '#') while (!eof() && src[i] !== '\n') i++; };
   const nl = () => {
     if (src[i] === '\r' && src[i + 1] === '\n') i++;
-    if (src[i] === '\n') { i++; return true; }
+    if (src[i] === '\n') { i++; line++; return true; }
     return false;
   };
   const wsNl = () => { for (;;) { ws(); skipComment(); if (!nl()) break; } };
 
+  function hexDigits(len) {
+    const h = src.slice(i, i + len);
+    if (h.length !== len || !/^[0-9A-Fa-f]+$/.test(h)) fail('invalid hex escape');
+    i += len;
+    return parseInt(h, 16);
+  }
+
+  function decodeEscape() {
+    const n = src[i];
+    if (n === undefined) fail('unterminated escape');
+    i++;
+    if (n === 'b') return '\b';
+    if (n === 't') return '\t';
+    if (n === 'n') return '\n';
+    if (n === 'f') return '\f';
+    if (n === 'r') return '\r';
+    if (n === 'e') return '\x1b';
+    if (n === '"') return '"';
+    if (n === '\\') return '\\';
+    if (n === 'x') return String.fromCharCode(hexDigits(2));
+    if (n === 'u') return String.fromCharCode(hexDigits(4));
+    if (n === 'U') {
+      const cp = hexDigits(8);
+      if (cp > 0x10ffff) fail('invalid unicode code point');
+      return String.fromCodePoint(cp);
+    }
+    fail(`invalid escape \\${n}`);
+  }
+
   function basicString() {
     if (src.startsWith('"""', i)) {
       i += 3;
+      if (src[i] === '\r' && src[i + 1] === '\n') { i += 2; line++; }
+      else if (src[i] === '\n') { i++; line++; }
       let s = '';
       for (;;) {
-        if (eof()) throw new Error('unterminated multi-line basic string');
+        if (eof()) fail('unterminated multi-line basic string');
         if (src[i] === '\\') {
-          if (src[i + 1] === '\n' || (src[i + 1] === '\r' && src[i + 2] === '\n')) {
-            i += src[i + 1] === '\r' ? 3 : 2;
-            while (src[i] === ' ' || src[i] === '\t' || src[i] === '\r' || src[i] === '\n') i++;
+          let j = i + 1;
+          while (src[j] === ' ' || src[j] === '\t') j++;
+          if (src[j] === '\n' || (src[j] === '\r' && src[j + 1] === '\n')) {
+            i = j + (src[j] === '\r' ? 2 : 1);
+            line++;
+            while (src[i] === ' ' || src[i] === '\t' || src[i] === '\r' || src[i] === '\n') {
+              if (src[i] === '\n') line++;
+              i++;
+            }
             continue;
           }
-          i += 2;
+          i++;
+          s += decodeEscape();
           continue;
         }
         if (src.startsWith('"""', i)) {
-          i += 3;
-          while (src[i] === '"') i++;
+          let q = 0;
+          while (src[i + q] === '"') q++;
+          if (q > 5) fail('too many quotes in multi-line basic string');
+          s += '"'.repeat(q - 3);
+          i += q;
           return s;
         }
+        if (src[i] === '\n') line++;
         s += src[i++];
       }
     }
@@ -43,14 +93,10 @@ function inspectToml(src) {
     let s = '';
     for (;;) {
       const c = src[i];
-      if (c === undefined || c === '\n') throw new Error('unterminated basic string');
+      if (c === undefined || c === '\n' || c === '\r') fail('unterminated basic string');
       if (c === '\\') {
-        const n = src[i + 1];
-        if (n === 'u') { s += String.fromCharCode(parseInt(src.slice(i + 2, i + 6), 16) || 0); i += 6; continue; }
-        if (n === 'U') { s += String.fromCodePoint(parseInt(src.slice(i + 2, i + 10), 16) || 0); i += 10; continue; }
-        const map = { b: '\b', t: '\t', n: '\n', f: '\f', r: '\r', '"': '"', '\\': '\\' };
-        s += map[n] ?? n ?? '';
-        i += 2;
+        i++;
+        s += decodeEscape();
         continue;
       }
       if (c === '"') { i++; return s; }
@@ -62,14 +108,20 @@ function inspectToml(src) {
   function literalString() {
     if (src.startsWith("'''", i)) {
       i += 3;
+      if (src[i] === '\r' && src[i + 1] === '\n') { i += 2; line++; }
+      else if (src[i] === '\n') { i++; line++; }
       let s = '';
       for (;;) {
-        if (eof()) throw new Error('unterminated multi-line literal string');
+        if (eof()) fail('unterminated multi-line literal string');
         if (src.startsWith("'''", i)) {
-          i += 3;
-          while (src[i] === "'") i++;
+          let q = 0;
+          while (src[i + q] === "'") q++;
+          if (q > 5) fail('too many quotes in multi-line literal string');
+          s += "'".repeat(q - 3);
+          i += q;
           return s;
         }
+        if (src[i] === '\n') line++;
         s += src[i++];
       }
     }
@@ -77,7 +129,7 @@ function inspectToml(src) {
     let s = '';
     for (;;) {
       const c = src[i];
-      if (c === undefined || c === '\n') throw new Error('unterminated literal string');
+      if (c === undefined || c === '\n' || c === '\r') fail('unterminated literal string');
       if (c === "'") { i++; return s; }
       s += c;
       i++;
@@ -87,11 +139,18 @@ function inspectToml(src) {
   function keyPart() {
     ws();
     const c = src[i];
-    if (c === '"') return basicString();
-    if (c === "'") return literalString();
-    const m = /^[A-Za-z0-9_-]+/.exec(src.slice(i, i + 256));
-    if (!m) throw new Error('invalid key');
-    i += m[0].length;
+    if (c === '"') {
+      if (src.startsWith('"""', i)) fail('multi-line string not allowed as key');
+      return basicString();
+    }
+    if (c === "'") {
+      if (src.startsWith("'''", i)) fail('multi-line string not allowed as key');
+      return literalString();
+    }
+    BARE_KEY_RE.lastIndex = i;
+    const m = BARE_KEY_RE.exec(src);
+    if (!m) fail('invalid key');
+    i = BARE_KEY_RE.lastIndex;
     return m[0];
   }
 
@@ -106,6 +165,7 @@ function inspectToml(src) {
 
   const paths = [];
   const inlineTables = [];
+  const enc = (p) => JSON.stringify(p);
 
   function parseValue(prefix) {
     ws();
@@ -121,7 +181,7 @@ function inspectToml(src) {
         wsNl();
         if (src[i] === ',') { i++; continue; }
         if (src[i] === ']') { i++; return; }
-        throw new Error('invalid array');
+        fail('invalid array');
       }
     }
     if (c === '{') {
@@ -136,6 +196,8 @@ function inspectToml(src) {
         }
         return;
       }
+      const seenKeys = new Set();
+      const seenDotted = new Set();
       let hasEntries = false;
       let lastEntryEnd = openIdx + 1;
       let trailingCommaIdx = -1;
@@ -151,8 +213,17 @@ function inspectToml(src) {
         }
         const k = dottedKey();
         ws();
-        if (src[i] !== '=') throw new Error('expected = in inline table');
+        if (src[i] !== '=') fail('expected = in inline table');
         i++;
+        for (let n = 1; n < k.length; n++) {
+          const pre = enc(k.slice(0, n));
+          if (seenKeys.has(pre)) fail(`cannot extend key "${k.slice(0, n).join('.')}" in inline table`);
+          seenDotted.add(pre);
+        }
+        const id = enc(k);
+        if (seenKeys.has(id) || seenDotted.has(id)) fail('duplicate key in inline table');
+        seenKeys.add(id);
+
         const nextPrefix = prefix ? [...prefix, ...k] : null;
         if (nextPrefix) paths.push(nextPrefix);
         parseValue(nextPrefix);
@@ -169,21 +240,43 @@ function inspectToml(src) {
           }
           return;
         }
-        throw new Error('invalid inline table');
+        fail('invalid inline table');
       }
     }
-    const m = /^[^\s,\]}#]+/.exec(src.slice(i, i + 256));
-    if (!m) throw new Error('missing value');
-    i += m[0].length;
-    // Allow space-separated RFC 3339 date-time (e.g. 2026-11-23 12:00:00Z)
-    if (/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(m[0]) && src[i] === ' ' && /[0-9]{2}:/.test(src.slice(i + 1, i + 4))) {
-      i++;
-      const t = /^[0-9:.]+([Zz]|[+-][0-9:]+)?/.exec(src.slice(i));
-      if (t) i += t[0].length;
+    BARE_VAL_RE.lastIndex = i;
+    const m = BARE_VAL_RE.exec(src);
+    if (!m) fail('missing value');
+    let rawVal = m[0];
+    i = BARE_VAL_RE.lastIndex;
+    // Allow space-separated RFC 3339 date-time (e.g. 2026-11-23 12:00:00Z or 2026-11-23 12:00)
+    if (/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(rawVal) && src[i] === ' ') {
+      TIME_PART_RE.lastIndex = i + 1;
+      const tm = TIME_PART_RE.exec(src);
+      if (tm) {
+        rawVal += ` ${tm[0]}`;
+        i = TIME_PART_RE.lastIndex;
+      }
     }
+    if (!SCALAR_VAL_RE.test(rawVal)) fail(`invalid value "${rawVal.slice(0, 20)}"`);
   }
 
+  const headers = new Set();
+  const keys = new Set();
+  const dotted = new Set();
+  const arrays = new Set();
+  const cnt = new Map();
+  const scopeOf = (p) => {
+    const out = [];
+    for (let n = 0; n < p.length; n++) {
+      out.push(p[n]);
+      const pre = enc(p.slice(0, n + 1));
+      if (arrays.has(pre) && n < p.length - 1) out.push(`#${cnt.get(pre)}`);
+    }
+    return out;
+  };
+
   let table = [];
+  let scope = [];
   while (!eof()) {
     wsNl();
     if (eof()) break;
@@ -193,28 +286,71 @@ function inspectToml(src) {
       const p = dottedKey();
       ws();
       if (isArr) {
-        if (src[i] !== ']' || src[i + 1] !== ']') throw new Error('bad array-table header');
+        if (src[i] !== ']' || src[i + 1] !== ']') fail('bad array-table header');
         i += 2;
       } else {
-        if (src[i] !== ']') throw new Error('bad table header');
+        if (src[i] !== ']') fail('bad table header');
         i++;
+      }
+      for (let n = 1; n < p.length; n++) {
+        const pre = scopeOf(p.slice(0, n));
+        if (keys.has(enc(pre))) {
+          fail(`[${p.join('.')}] extends "${p.slice(0, n).join('.')}", which is already a value or inline table`);
+        }
+      }
+      const upto = isArr ? p.length - 1 : p.length;
+      const base = [];
+      for (let n = 0; n < upto; n++) {
+        base.push(p[n]);
+        const pre = enc(p.slice(0, n + 1));
+        if (arrays.has(pre)) base.push(`#${cnt.get(pre)}`);
+      }
+      if (isArr) {
+        const k = enc([...base, p[p.length - 1]]);
+        if (headers.has(k) || keys.has(k) || dotted.has(k)) fail(`[[${p.join('.')}]] redefines a table or key`);
+        arrays.add(enc(p));
+        cnt.set(enc(p), (cnt.get(enc(p)) || 0) + 1);
+        scope = [...base, p[p.length - 1], `#${cnt.get(enc(p))}`];
+      } else {
+        const k = enc(base);
+        if (headers.has(k)) fail(`duplicate table [${p.join('.')}]`);
+        if (keys.has(k)) fail(`[${p.join('.')}] redefines a key`);
+        if (dotted.has(k)) fail(`[${p.join('.')}] was already defined by dotted keys`);
+        headers.add(k);
+        scope = base;
       }
       table = p;
       paths.push(p);
     } else {
       const p = dottedKey();
       ws();
-      if (src[i] !== '=') throw new Error('expected =');
+      if (src[i] !== '=') fail('expected =');
       i++;
+      for (let n = 1; n < p.length; n++) {
+        const pre = enc([...scope, ...p.slice(0, n)]);
+        if (keys.has(pre)) fail(`cannot extend key "${p.slice(0, n).join('.')}"`);
+        dotted.add(pre);
+      }
+      const scopedKey = enc([...scope, ...p]);
+      if (keys.has(scopedKey) || headers.has(scopedKey) || dotted.has(scopedKey)) {
+        fail(`duplicate key ${p.join('.')}`);
+      }
+      keys.add(scopedKey);
       const full = [...table, ...p];
       paths.push(full);
       parseValue(full);
     }
     ws();
     skipComment();
-    if (!eof() && !nl()) throw new Error('unexpected trailing text');
+    if (!eof() && !nl()) fail('unexpected trailing text');
   }
   return { paths, inlineTables };
+}
+
+/** Validate TOML 1.0 / 1.1 syntax and key/table uniqueness. Returns true or throws Error('line N: ...'). */
+export function validateToml(src) {
+  inspectToml(src);
+  return true;
 }
 
 export function collectTomlPaths(src) {
@@ -254,10 +390,15 @@ export function findTomlInlineTable(src, targetPath) {
 
 /**
  * Insert `key = value` into an inline table span returned by `findTomlInlineTable`.
- * Preserves existing entries, formatting, and surrounding lines.
+ * Preserves existing entries, formatting, comments, and surrounding lines.
  */
 export function insertIntoTomlInlineTable(src, span, key, valueExpr) {
   if (!span.hasEntries) {
+    const inner = src.slice(span.openIdx + 1, span.closeIdx);
+    if (inner.includes('\n')) {
+      const eol = inner.includes('\r\n') ? '\r\n' : '\n';
+      return `${src.slice(0, span.closeIdx)}  ${key} = ${valueExpr}${eol}${src.slice(span.closeIdx)}`;
+    }
     return `${src.slice(0, span.openIdx)}{ ${key} = ${valueExpr} }${src.slice(span.closeIdx + 1)}`;
   }
   if (span.trailingCommaIdx >= 0) {

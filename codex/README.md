@@ -55,7 +55,7 @@ If you stop waiting or reach the 20-minute cap, MegaLens prints `Still running. 
 
 1. **MegaLens GitHub App** — disabled behind `APP_PATH_ENABLED = false` until the on-demand server endpoints are live.
 2. **GitHub Actions workflow** (`.github/workflows/megalens-dispatch.yml` on the repository's default branch) — dispatches the run, streams progress up to 20 minutes, and prints findings inline.
-3. **Missing setup** — prints the setup URL (`Install the MegaLens GitHub App or add the workflow: https://megalens.ai/app/start`) plus explicit GitHub Actions workflow instructions while `APP_PATH_ENABLED = false`.
+3. **Missing setup** — prints explicit GitHub Actions workflow setup instructions (with `https://megalens.ai/app/start`) while `APP_PATH_ENABLED = false`, never directing users to install a disabled App.
    Never falls back silently to a local engine, never pushes commits without your OK, and never prints tokens.
 
 ## Codex Desktop App MCP configuration

@@ -128,3 +128,57 @@ Addressed every open finding and the new High finding from `/root/review-input/r
 - `node --check` passed on `codex/scripts/{flags,codex-review,install-codex,toml-inspect}.mjs` and `tests/codex-plugin.test.mjs`.
 - Full test suite green (`node --test --test-timeout=60000 tests/*.test.mjs`): **197 / 197 passed, 0 failed** (including 22 Codex tests with live `codex-cli 0.170.0` `plugin add` / `app-server` / `mcp list` and real `npm pack` + `npx --package` bin-symlink execution).
 - `git diff --name-only 2b4316b -- scripts/ commands/ .claude-plugin/ templates/` is empty (Claude Code live files unchanged).
+
+
+---
+
+## Fix round (round 3 — `/root/review-input/rv-codex-plugin/LOOP-CONFIRM2.md`)
+
+Addressed every open finding from `/root/review-input/rv-codex-plugin/LOOP-CONFIRM2.md` strictly inside `/root/review-input/ws-codex-plugin` without undoing any earlier fix, keeping `CODEX_PLUGIN_ENABLED = false`, `APP_PATH_ENABLED = false`, `codex/.agents/plugins/marketplace.json` `installation: "NOT_AVAILABLE"`, and Claude Code live files (`scripts/`, `commands/`, `.claude-plugin/`, `templates/`) untouched.
+
+### Finding-by-finding resolution
+
+1. **Earlier #1 (High) · Native plugin resolves its runner from the repository under review — Fixed.**
+   - **Root cause in round 2:** Upgrading a repository that had previously run round 1 (`fa49769`) `--project` left stale `<repo>/.codex/plugins/megalens/` (containing `SKILL.md` pointing into `<repo>/.codex/plugins/megalens/scripts/codex-review.mjs`) and `<repo>/.agents/plugins/marketplace.json` (`local-repo` pointing to `./.codex/plugins/megalens`) behind in the checkout, so `codex plugin marketplace add . && codex plugin add megalens@local-repo` still installed the repo-local plugin. In addition, passing `--codex-home` pointing inside the reviewed repo could place `pluginDir` inside `<project>`.
+   - **Fix:**
+     - Added `cleanupLegacyProjectPlugin(plan, project)` (`codex/scripts/install-codex.mjs:391-428,582-584`) backed by symlink-refusing, dry-run-aware `Plan.removeFile` / `Plan.removeDirTree` (`codex/scripts/install-codex.mjs:165-272`): on `--project` installs/upgrades, removes any stale repo-local `<project>/.codex/plugins/megalens/` directory and strips the repo-local `megalens` (`./.codex/plugins/megalens`) entry from `<project>/.agents/plugins/marketplace.json` (deleting `marketplace.json` with an owner-only backup and pruning empty directories if it was our `local-repo` file with no remaining plugins, while preserving any other plugins).
+     - Added `isSubpath(project, pluginDir)` guard (`codex/scripts/install-codex.mjs:96-99,565-567`) so `pluginDir` falls back to `~/.codex/plugins/megalens` even if `--codex-home` points inside the reviewed repo.
+   - **Tests:** `tests/codex-plugin.test.mjs` — `FIX 1 + NEW HIGH (round 3): --project --with-oauth-mcp stays clean on reinstall, cleans up legacy repo-local plugin on upgrade, and refuses codexHome inside repo` (including dry-run, live `codex plugin marketplace add` refusal on upgraded repo, mixed-plugin `marketplace.json` preservation, and `--codex-home` inside repo) + live verification upgrading directly from `git archive fa49769`.
+
+2. **LOOP-CONFIRM1 NEW High · Project-scoped installation blocks the default GitHub review — Fixed.**
+   - **Root cause in round 2:**
+     1. Reinstalling `--project --with-oauth-mcp` saw `.codex/config.toml` already on disk (`projectCreatedConfig = false`), so `mergeGitExclude` overwrote the managed block in `.git/info/exclude` without `/.codex/config.toml`, making `.codex/config.toml` untracked (`?? .codex/`) and blocking default `$megalens-review`.
+     2. Upgrading from round 1 (`fa49769`) left `.codex/plugins/megalens/`, `.agents/plugins/marketplace.json`, and managed-only `.codex/config.toml` untracked (`?? .agents/` and `?? .codex/`).
+   - **Fix:**
+     - `cleanupLegacyProjectPlugin` removes stale repo-local plugin & marketplace files on upgrade (`codex/scripts/install-codex.mjs:391-428,582-584`).
+     - Project `.git/info/exclude` management (`codex/scripts/install-codex.mjs:656-688`) now preserves `/${prefix}.codex/config.toml` whenever (a) `.codex/config.toml` is newly created, (b) it is already listed in our managed `.git/info/exclude` block (across both `--with-oauth-mcp` and plain `--project` reinstalls), or (c) `.codex/config.toml` contains only our managed block (round-1 upgrades).
+   - **Tests:** `tests/codex-plugin.test.mjs` — `FIX 1 + NEW HIGH (round 3)` verifies empty `git status --porcelain --untracked-files=all`, `git check-ignore .codex/config.toml`, idempotent second run, and clean `$megalens-review` dispatch on fresh install, reinstall (with and without `--with-oauth-mcp`), and upgrade from round-1 layout.
+
+3. **Earlier #7 (Medium) · Optional MCP setup aborts on valid existing Codex configurations — Fixed.**
+   - **Root cause in round 2:** Both `codex/scripts/toml-inspect.mjs` (previously 256-char slice) and `codex/runtime/scripts/hosts/toml-check.mjs:26,37` (200-char slice) truncated bare keys and bare values at 200/256 characters. Valid Codex configs containing a bare key longer than 200/256 characters (e.g. a 274-char env variable name inside `mcp_servers = { other = { command = "true", env = { MEGALENS_TEST_AAAA... = "sample" } } }`, accepted by `codex mcp list`) failed validation with `line 1: expected =` and aborted install before writing skills.
+   - **Fix:**
+     - Upgraded `codex/scripts/toml-inspect.mjs:6-353` to use sticky regexes (`BARE_KEY_RE = /[A-Za-z0-9_-]+/y`, `BARE_VAL_RE = /[^\s,\]}#]+/y`) with zero length cap, full TOML 1.0/1.1 string/escape/inline-table handling (`\e`, `\xHH`, multiline basic/literal strings, multiline inline tables with comments/trailing commas), and full structural/duplicate-key validation exported as `validateToml(src)` (`codex/scripts/toml-inspect.mjs:351-354`).
+     - Updated `mergeOauthMcpToml` (`codex/scripts/install-codex.mjs:351-383`) to validate merged TOML with `validateToml(text)` + `hasTomlPath(text, ['mcp_servers', 'megalens'])` instead of failing on `toml-check.mjs`'s 200-char slice (keeping `codex/runtime/scripts/hosts/toml-check.mjs` byte-for-byte identical to canonical `scripts/hosts/toml-check.mjs`).
+   - **Tests:** `tests/codex-plugin.test.mjs` — `FIX 7` tests 274-char bare keys (inside inline `mcp_servers` and under tables), TOML 1.1 multiline inline tables with trailing commas/comments, existing `megalens` alongside >256-char keys, corrupt-TOML all-or-nothing rejection, and live `codex mcp list` verification.
+
+4. **Earlier #4 (High) · Editor sign-in leaves a first-time GitHub project unable to review — Misleading disabled-App lead line removed; no-copy GitHub credential provisioning remains blocked upstream (`file:line` evidence).**
+   - **Fix in this repo:** Updated `adaptCodexOutput` (`codex/scripts/codex-review.mjs:69-71`) and `codex/README.md:58` so missing workflow setup while `APP_PATH_ENABLED = false` leads with `GitHub Actions workflow setup required (https://megalens.ai/app/start).` + `CODEX_WORKFLOW_SETUP_NOTE` and never tells the user `"Install the MegaLens GitHub App"` while the App path is disabled.
+   - **Unreachable upstream blocker (`file:line`):**
+     - `scripts/lib/gh-runner.mjs:20` and `codex/runtime/scripts/lib/gh-runner.mjs:20`: `export const APP_PATH_ENABLED = false;` (kept off by stopping rule in base commit `2b4316b` until server endpoints exist).
+     - `scripts/lib/gh-runner.mjs:203,361-375` and `codex/runtime/scripts/lib/gh-runner.mjs:203,361-375`: Actions dispatch requires repository/org secret `MEGALENS_TOKEN` (`gh secret set MEGALENS_TOKEN`).
+     - `templates/megalens-dispatch.yml:40` and `codex/runtime/templates/megalens-dispatch.yml:40`: `megalens-token: ${{ secrets.MEGALENS_TOKEN }}`.
+     - `PLUGIN-NEEDS.md:15,18` (#12 and #15): this repository is a client-only plugin with no backend GitHub App on-demand review endpoints or no-copy secret provisioning service. Per `FIRST.md` #4 (*"or treat the no-copy first run as blocked until that flow exists"*), zero-copy GitHub first run is explicitly documented as blocked in `codex/README.md:33`, `codex/scripts/codex-review.mjs:25`, and `PLUGIN-NEEDS.md:18`.
+   - **Tests:** `tests/codex-plugin.test.mjs` — `FIX 4` asserts `APP_PATH_ENABLED=false`, absence of `"Install the MegaLens GitHub App"`, explicit GitHub Actions setup prerequisites, and explicit blocked no-copy status.
+
+5. **Earlier #5 (Medium) · Actions path can settle a review before findings are delivered — Transient retry & forced-failure tests in place; permanent upload-failure settlement release remains blocked upstream (`file:line` evidence).**
+   - **Already in place in this repo:** `codex/runtime/templates/megalens-dispatch.yml:75-91` retries transient `actions/upload-artifact` failures (pinned SHA `ea165f8d65b6e75b540449e92b4886f43607fa02`, `overwrite: true`), and `codex/runtime/scripts/lib/gh-runner.mjs:580-615` (`runnerResult`) reports `NOT COMPLETED` with run URL and exit 4 on missing artifacts without ever claiming clean (`tests/codex-plugin.test.mjs:370-407`).
+   - **Unreachable upstream blocker (`file:line`):**
+     - `codex/runtime/templates/megalens-dispatch.yml:63-74` (and `templates/megalens-dispatch.yml:63-74`) invokes external `megalens/review-action@950eb5f1eeff21008fcf585587b88fc83546cdcf` (`mode: review`, wrapping external `megalens-review@0.1.3`), which calls `POST /api/v2/reviews/:id/complete` on the external server (`ws-post-launch/src/lib/engine-v2/service.ts:616`) *before* `actions/upload-artifact` executes at `codex/runtime/templates/megalens-dispatch.yml:75-91`.
+     - Neither the external server (which does not persist `findings.json` for fallback retrieval and exposes no post-upload delivery-failure refund/free-claim release endpoint) nor `megalens/review-action` / `megalens-review` reside in `/root/review-input/ws-codex-plugin`; the `review` job (`codex/runtime/templates/megalens-dispatch.yml:46-47`) holds only `permissions: { contents: read }` and has no account token once the review key is closed. Tracked in `PLUGIN-NEEDS.md:19` (#16).
+
+### Verification
+
+- `node --check` passed on `codex/scripts/{flags,codex-review,install-codex,toml-inspect}.mjs` and `tests/codex-plugin.test.mjs`.
+- Full test suite green (`node --test --test-timeout=60000 tests/*.test.mjs`): **198 / 198 passed, 0 failed, 0 skipped** (including 23 Codex tests with live `codex-cli 0.170.0` `plugin add`, `app-server`, `mcp list`, and `npm pack` + `npx --package` execution).
+- Live probes reproducing `codex-loop2.log` (`--project --with-oauth-mcp` reinstall, upgrade from `git archive fa49769`, and 274-char bare key inside inline `mcp_servers` verified with `codex mcp list`) all passed.
+- `git diff --name-only 2b4316b -- scripts/ commands/ .claude-plugin/ templates/` is empty (Claude Code live files unchanged).

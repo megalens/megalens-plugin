@@ -21,9 +21,11 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   unlinkSync,
   writeSync,
 } from 'node:fs';
@@ -31,9 +33,8 @@ import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { checkToml } from '../runtime/scripts/hosts/toml-check.mjs';
 import { CODEX_PLUGIN_OFF_MESSAGE, PREVIEW_OPT_IN_FILENAME, isCodexPluginEnabled } from './flags.mjs';
-import { collectTomlPaths, findTomlInlineTable, hasTomlPath, insertIntoTomlInlineTable } from './toml-inspect.mjs';
+import { findTomlInlineTable, hasTomlPath, insertIntoTomlInlineTable, validateToml } from './toml-inspect.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CODEX_DIR = path.resolve(HERE, '..');
@@ -92,6 +93,11 @@ export function resolveCodexHome(env = process.env, home = homedir(), explicit =
   return custom ? path.resolve(custom) : path.join(path.resolve(home), '.codex');
 }
 
+function isSubpath(parent, child) {
+  const rel = path.relative(path.resolve(parent), path.resolve(child));
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
 function assertSafeScriptPath(p) {
   const abs = path.resolve(p);
   if (/[\r\n\0'"]/.test(abs)) {
@@ -126,9 +132,9 @@ class Plan {
     throw new Error(`${file} is outside allowed roots; nothing was changed.`);
   }
 
-  check(file) {
-    const root = this.rootFor(file);
-    const rel = path.relative(root, file);
+  checkPathNoSymlinks(target) {
+    const root = this.rootFor(target);
+    const rel = path.relative(root, target);
     let cur = root;
     let st = null;
     for (const part of rel.split(path.sep)) {
@@ -145,6 +151,11 @@ class Plan {
         throw new Error(`${cur} is a symbolic link; refusing to read or write through it. Nothing was changed.`);
       }
     }
+    return st;
+  }
+
+  check(file) {
+    const st = this.checkPathNoSymlinks(file);
     if (st && !st.isFile()) throw new Error(`${file} is not a regular file; nothing was changed.`);
     return st;
   }
@@ -156,7 +167,43 @@ class Plan {
       this.report.push(`unchanged  ${file}`);
       return;
     }
-    this.ops.push({ file, content, st, old, defaultMode });
+    this.ops.push({ kind: 'write', file, content, st, old, defaultMode });
+  }
+
+  removeFile(file, { backup = true, pruneTo = null } = {}) {
+    const st = this.check(file);
+    if (!st) return;
+    const old = backup ? readFileSync(file, 'utf8') : null;
+    this.ops.push({ kind: 'removeFile', file, st, old, backup, pruneTo });
+  }
+
+  removeDirTree(dir, { stopPruneAt = null } = {}) {
+    const absDir = path.resolve(dir);
+    const st = this.checkPathNoSymlinks(absDir);
+    if (!st) return;
+    if (!st.isDirectory()) throw new Error(`${absDir} is not a directory; nothing was changed.`);
+    const files = [];
+    const dirs = [];
+    const visit = (d) => {
+      for (const entry of readdirSync(d)) {
+        const p = path.join(d, entry);
+        const est = lstatSync(p);
+        if (est.isSymbolicLink()) {
+          throw new Error(`${p} is a symbolic link; refusing to remove through it. Nothing was changed.`);
+        }
+        if (est.isDirectory()) {
+          visit(p);
+          dirs.push(p);
+        } else if (est.isFile()) {
+          files.push(p);
+        } else {
+          throw new Error(`${p} is not a regular file or directory; nothing was changed.`);
+        }
+      }
+    };
+    visit(absDir);
+    dirs.push(absDir);
+    this.ops.push({ kind: 'removeDirTree', dir: absDir, files, dirs, stopPruneAt });
   }
 
   skip(file, why) {
@@ -171,29 +218,72 @@ class Plan {
     const stamp = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomBytes(3).toString('hex')}`;
     const dir = path.join(this.backupRoot, stamp);
     let used = false;
-    for (const { file, content, st, old, defaultMode } of this.ops) {
-      const oldMode = st ? st.mode & 0o777 : null;
-      const mode = oldMode === null ? defaultMode : oldMode;
-      let backup = '';
-      if (st) {
-        backup = path.join(dir, file.split(path.sep).filter(Boolean).join('__'));
-        if (!this.dryRun) {
-          mkdirSync(dir, { recursive: true, mode: 0o700 });
-          if (!used) {
-            for (let d = dir; ; d = path.dirname(d)) {
-              chmodSync(d, 0o700);
-              if (d === this.backupRoot) break;
-            }
-            used = true;
-          }
-          const fd = openSync(backup, 'wx', 0o600);
-          try {
-            writeSync(fd, old);
-          } finally {
-            closeSync(fd);
-          }
+    const ensureBackupDir = () => {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      if (!used) {
+        for (let d = dir; ; d = path.dirname(d)) {
+          chmodSync(d, 0o700);
+          if (d === this.backupRoot) break;
+        }
+        used = true;
+      }
+    };
+    const writeBackup = (file, old) => {
+      const backup = path.join(dir, file.split(path.sep).filter(Boolean).join('__'));
+      if (!this.dryRun) {
+        ensureBackupDir();
+        const fd = openSync(backup, 'wx', 0o600);
+        try {
+          writeSync(fd, old);
+        } finally {
+          closeSync(fd);
         }
       }
+      return backup;
+    };
+    const pruneEmptyDirs = (startDir, stopAt) => {
+      if (!stopAt || this.dryRun) return;
+      const stopAbs = path.resolve(stopAt);
+      let cur = path.resolve(startDir);
+      while (cur !== stopAbs && isSubpath(stopAbs, cur)) {
+        let st;
+        try { st = lstatSync(cur); } catch { break; }
+        if (st.isSymbolicLink() || !st.isDirectory()) break;
+        if (readdirSync(cur).length > 0) break;
+        rmdirSync(cur);
+        cur = path.dirname(cur);
+      }
+    };
+
+    for (const op of this.ops) {
+      if (op.kind === 'removeFile') {
+        const { file, old, backup: doBackup, pruneTo } = op;
+        const backup = doBackup && old !== null ? writeBackup(file, old) : '';
+        if (!this.dryRun) {
+          unlinkSync(file);
+          if (pruneTo) pruneEmptyDirs(path.dirname(file), pruneTo);
+        }
+        this.report.push(
+          `${this.dryRun ? 'would ' : ''}removed    ${file}`
+          + (backup ? `\n           backup (outside the repo, owner-only): ${backup}` : ''),
+        );
+        continue;
+      }
+      if (op.kind === 'removeDirTree') {
+        const { dir: targetDir, files, dirs, stopPruneAt } = op;
+        if (!this.dryRun) {
+          for (const f of files) unlinkSync(f);
+          for (const d of dirs) rmdirSync(d);
+          if (stopPruneAt) pruneEmptyDirs(path.dirname(targetDir), stopPruneAt);
+        }
+        this.report.push(`${this.dryRun ? 'would ' : ''}removed    ${targetDir}`);
+        continue;
+      }
+
+      const { file, content, st, old, defaultMode } = op;
+      const oldMode = st ? st.mode & 0o777 : null;
+      const mode = oldMode === null ? defaultMode : oldMode;
+      const backup = st ? writeBackup(file, old) : '';
       if (!this.dryRun) {
         mkdirSync(path.dirname(file), { recursive: true });
         const tmp = path.join(
@@ -237,12 +327,22 @@ function spliceBlock(old, begin, end, bodyLines) {
   return { text: (trimmed ? trimmed + eol + eol : '') + block, had: false };
 }
 
-/** True if config.toml already defines mcp_servers.megalens outside our managed block (TOML-aware). */
-export function hasExistingMegalensMcp(raw) {
-  const withoutManaged = String(raw ?? '').replace(
-    new RegExp(`${escRe(BEGIN)}[\\s\\S]*?${escRe(END)}(\\r?\\n)?`, 'g'),
+function stripManagedBlock(raw, begin, end) {
+  return String(raw ?? '').replace(
+    new RegExp(`${escRe(begin)}[\\s\\S]*?${escRe(end)}(\\r?\\n)?`, 'g'),
     '',
   );
+}
+
+function readManagedBlockLines(raw, begin, end) {
+  const m = new RegExp(`${escRe(begin)}\\r?\\n([\\s\\S]*?)${escRe(end)}`).exec(String(raw ?? ''));
+  if (!m) return [];
+  return m[1].split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+}
+
+/** True if config.toml already defines mcp_servers.megalens outside our managed block (TOML-aware). */
+export function hasExistingMegalensMcp(raw) {
+  const withoutManaged = stripManagedBlock(raw, BEGIN, END);
   return hasTomlPath(withoutManaged, ['mcp_servers', 'megalens']);
 }
 
@@ -256,10 +356,7 @@ function mergeOauthMcpToml(plan, file) {
 
   // If the user defines `mcp_servers = { ... }` as an inline table, TOML 1.0 forbids
   // extending it with a `[mcp_servers.megalens]` table header; splice directly into the inline table.
-  const withoutManaged = String(old).replace(
-    new RegExp(`${escRe(BEGIN)}[\\s\\S]*?${escRe(END)}(\\r?\\n)?`, 'g'),
-    '',
-  );
+  const withoutManaged = stripManagedBlock(old, BEGIN, END);
   const inlineSpan = findTomlInlineTable(withoutManaged, ['mcp_servers']);
   let text;
   if (inlineSpan) {
@@ -276,22 +373,63 @@ function mergeOauthMcpToml(plan, file) {
   }
 
   try {
-    checkToml(text);
+    validateToml(text);
+    if (!hasTomlPath(text, ['mcp_servers', 'megalens'])) {
+      throw new Error('merged config is missing mcp_servers.megalens');
+    }
   } catch (e) {
-    // Allow pre-existing valid TOML 1.1 constructs (e.g. multiline inline tables) when both
-    // the original and updated configs parse cleanly with collectTomlPaths and contain our entry.
-    let ok11 = false;
-    try {
-      collectTomlPaths(old);
-      ok11 = hasTomlPath(text, ['mcp_servers', 'megalens']);
-    } catch {
-      ok11 = false;
-    }
-    if (!ok11) {
-      throw new Error(`${file} cannot take the MegaLens MCP block: ${e.message}. Nothing was changed.`);
-    }
+    throw new Error(`${file} cannot take the MegaLens MCP block: ${e.message}. Nothing was changed.`);
   }
   plan.write(file, text);
+}
+
+/**
+ * Clean up legacy repo-local MegaLens plugin artifacts written inside `<project>` by earlier
+ * `--project` installs (`.codex/plugins/megalens/` and the repo-local `megalens` entry in
+ * `.agents/plugins/marketplace.json`), without touching unrelated user files or other plugins.
+ */
+function cleanupLegacyProjectPlugin(plan, project) {
+  const legacyPluginDir = path.join(project, '.codex', 'plugins', 'megalens');
+  const pluginSt = plan.checkPathNoSymlinks(legacyPluginDir);
+  if (pluginSt && pluginSt.isDirectory()) {
+    const isLegacyMegalens = [
+      path.join(legacyPluginDir, '.codex-plugin', 'plugin.json'),
+      path.join(legacyPluginDir, 'scripts', 'codex-review.mjs'),
+      path.join(legacyPluginDir, PREVIEW_OPT_IN_FILENAME),
+    ].some((p) => existsSync(p));
+    if (isLegacyMegalens) {
+      plan.removeDirTree(legacyPluginDir, { stopPruneAt: project });
+    }
+  }
+
+  const legacyMarketplace = path.join(project, '.agents', 'plugins', 'marketplace.json');
+  const mpSt = plan.checkPathNoSymlinks(legacyMarketplace);
+  if (mpSt && mpSt.isFile()) {
+    let doc;
+    try {
+      doc = JSON.parse(readFileSync(legacyMarketplace, 'utf8'));
+    } catch {
+      doc = null;
+    }
+    if (doc && typeof doc === 'object' && !Array.isArray(doc) && Array.isArray(doc.plugins)) {
+      const remaining = doc.plugins.filter(
+        (p) => !(
+          p
+          && typeof p === 'object'
+          && p.name === 'megalens'
+          && p.source?.source === 'local'
+          && p.source?.path === './.codex/plugins/megalens'
+        ),
+      );
+      if (remaining.length !== doc.plugins.length) {
+        if (remaining.length === 0 && doc.name === 'local-repo') {
+          plan.removeFile(legacyMarketplace, { backup: true, pruneTo: project });
+        } else {
+          plan.write(legacyMarketplace, JSON.stringify({ ...doc, plugins: remaining }, null, 2) + '\n');
+        }
+      }
+    }
+  }
 }
 
 /**
@@ -421,20 +559,29 @@ export function installCodex(opts = {}, { env = process.env, flags = {} } = {}) 
   const skillsRoot = o.scope === 'global' ? home : project;
   // ALWAYS install executable runtime + opt-in marker in user-owned storage, NEVER inside the reviewed repo.
   // In global mode, place under ~/.codex/plugins/megalens so ~/.agents/plugins/marketplace.json resolves `./.codex/plugins/megalens`.
-  const pluginDir = o.scope === 'global'
+  let pluginDir = o.scope === 'global'
     ? path.join(home, '.codex', 'plugins', 'megalens')
     : path.join(codexHome, 'plugins', 'megalens');
+  if (o.scope === 'project' && isSubpath(project, pluginDir)) {
+    pluginDir = path.join(home, '.codex', 'plugins', 'megalens');
+  }
   const installedRunner = path.join(pluginDir, 'scripts', 'codex-review.mjs');
   const scriptPath = assertSafeScriptPath(o.scriptPath || installedRunner);
   const gitExclude = o.scope === 'project' ? resolveGitInfoExclude(project) : null;
   const allowedRoots = o.scope === 'global'
     ? [home, codexHome]
-    : [project, codexHome, ...(gitExclude ? [gitExclude.excludeRoot] : [])];
+    : [project, codexHome, home, ...(gitExclude ? [gitExclude.excludeRoot] : [])];
   const plan = new Plan({
     dryRun: Boolean(o.dryRun),
     allowedRoots,
     backupRoot: path.join(home, '.megalens', 'backups', 'codex-plugin'),
   });
+
+  // 0. Project scope upgrade: remove any stale repo-local MegaLens plugin runtime or marketplace entry
+  //    left inside `<project>` by earlier installs so no executable or marketplace points into the repo.
+  if (o.scope === 'project') {
+    cleanupLegacyProjectPlugin(plan, project);
+  }
 
   // 1. Self-contained Codex plugin package + bundled runtime (ALWAYS user-owned, never inside reviewed repo).
   //    Works standalone even after a temporary npx cache or checkout is removed, and persists
@@ -501,21 +648,41 @@ export function installCodex(opts = {}, { env = process.env, flags = {} } = {}) 
   }
 
   // 4. Optional Streamable HTTP OAuth MCP config in config.toml (never clobbers existing config;
-  //    supports inline tables and quoted keys).
-  let projectCreatedConfig = false;
+  //    supports inline tables, long keys/values, and quoted keys).
+  const projectConfigPath = path.join(project, '.codex', 'config.toml');
+  let projectConfigSt = null;
+  let projectConfigIsManagedOnly = false;
+  if (o.scope === 'project') {
+    projectConfigSt = plan.checkPathNoSymlinks(projectConfigPath);
+    if (projectConfigSt && projectConfigSt.isFile()) {
+      const existingProjectCfg = readFileSync(projectConfigPath, 'utf8');
+      projectConfigIsManagedOnly = existingProjectCfg.includes(BEGIN)
+        && stripManagedBlock(existingProjectCfg, BEGIN, END).trim() === '';
+    }
+  }
+  const projectCreatedConfig = o.scope === 'project' && o.withOauthMcp && !projectConfigSt;
   if (o.withOauthMcp) {
     const configPath = o.scope === 'global'
       ? path.join(codexHome, 'config.toml')
-      : path.join(project, '.codex', 'config.toml');
-    projectCreatedConfig = o.scope === 'project' && !existsSync(configPath);
+      : projectConfigPath;
     mergeOauthMcpToml(plan, configPath);
   }
 
   // 5. Project scope: exclude only the installer's own untracked files in local `.git/info/exclude`
-  //    so default `$megalens-review` does not reject its own installation files as uncommitted changes.
+  //    so default `$megalens-review` does not reject its own installation files as uncommitted changes
+  //    (and preserve `/.codex/config.toml` exclusion across reinstalls and upgrades from earlier versions).
   if (o.scope === 'project' && gitExclude) {
+    const configExcludePattern = `/${gitExclude.prefix}.codex/config.toml`;
+    const existingExcludeSt = plan.check(gitExclude.excludeFile);
+    const prevExcludeLines = existingExcludeSt
+      ? readManagedBlockLines(readFileSync(gitExclude.excludeFile, 'utf8'), BEGIN, END)
+      : [];
+    const prevExcludedConfig = prevExcludeLines.includes(configExcludePattern);
+    const shouldExcludeConfig = projectCreatedConfig
+      || projectConfigIsManagedOnly
+      || (prevExcludedConfig && Boolean(projectConfigSt || o.withOauthMcp));
     const excludePatterns = SKILLS.map((s) => `/${gitExclude.prefix}.agents/skills/${s}/`);
-    if (projectCreatedConfig) excludePatterns.push(`/${gitExclude.prefix}.codex/config.toml`);
+    if (shouldExcludeConfig) excludePatterns.push(configExcludePattern);
     mergeGitExclude(plan, gitExclude.excludeFile, excludePatterns);
   }
 
