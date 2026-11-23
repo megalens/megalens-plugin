@@ -21,6 +21,7 @@ function fakeExec(over = {}, { runs = [], pre = [], document = null } = {}) {
     if (key.startsWith('gh --version')) return ok('gh version 2');
     if (key.startsWith('gh auth')) return ok('Logged in');
     if (key.startsWith('gh repo')) return ok(JSON.stringify({ nameWithOwner: 'acme/widget', defaultBranchRef: { name: 'main' }, url: 'https://github.com/acme/widget' }));
+    if (args.some((a) => /^orgs\/[^/]+\/installations$/.test(a))) return ok('[]');
     if (key.startsWith('gh api') && args.some((a) => a.includes('/check-suites'))) return ok('[]');
     if (key.startsWith('gh api') && args.some((a) => a.includes('/check-runs'))) return ok('[]');
     if (key.startsWith('gh api') && args.some((a) => a.includes('/contents/'))) return ok('file');
@@ -322,7 +323,7 @@ test('main: Linux prefers remote runner (workflow/App) over local even when MEGA
   // When neither App nor workflow is present AND local binary is missing, Linux shows the clean one-line repo setup message.
   const noRemoteMissing = fakeExec({ 'gh api': bad('HTTP 404') });
   const setup = await viaMain(['review', 'standard'], { exec: noRemoteMissing.exec, env: { MEGALENS_REVIEW_BIN: '/nonexistent/megalens-review' } });
-  assert.equal(setup.code, 4); assert.match(setup.text, /not set up for acme\/widget/); assert.equal(setup.text.trim().split('\n').length, 1);
+  assert.equal(setup.code, 4); assert.match(setup.text, /Could not verify whether MegaLens is installed for acme\/widget/); assert.equal(setup.text.trim().split('\n').length, 1);
 });
 
 // A fake engine that ran a review, found something and failed (exit 4 / document written). Its text may carry any marker string.
@@ -360,7 +361,7 @@ test('main: isSandboxPrecheckDoc only matches rv_none with empty findings and sa
   // On Linux with no remote runner, a sandbox pre-check doc falls cleanly to the repo setup line; a real review id shows the local FAILED result.
   const noRemote1 = fakeExec({ 'gh api': bad('HTTP 404') });
   const r = await viaMain(['review', 'standard'], { exec: noRemote1.exec, bin: fakeBinPrecheck() });
-  assert.equal(r.code, 4); assert.match(r.text, /not set up for acme\/widget/);
+  assert.equal(r.code, 4); assert.match(r.text, /Could not verify whether MegaLens is installed for acme\/widget/);
   const noRemote2 = fakeExec({ 'gh api': bad('HTTP 404') });
   const r2 = await viaMain(['review', 'standard'], { exec: noRemote2.exec, bin: fakeBinPrecheck('rv_abc12345') });
   assert.equal(r2.code, 4); assert.match(r2.text, /review: FAILED/);

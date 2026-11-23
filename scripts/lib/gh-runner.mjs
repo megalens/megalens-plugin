@@ -184,7 +184,7 @@ export function checkRunTimestamp(cr) {
 /** Parse either a single JSON array, a wrapper object (`{installations:[]}`/`{repositories:[]}`), or newline-delimited JSON arrays from `gh api --paginate`. */
 function parsePaginatedList(stdout, wrapperKey = null) {
   const raw = String(stdout ?? '').trim();
-  if (!raw) return [];
+  if (!raw) return null;
   const whole = jsonOf(raw);
   if (Array.isArray(whole)) return whole;
   if (wrapperKey && whole && Array.isArray(whole[wrapperKey])) return whole[wrapperKey];
@@ -215,6 +215,7 @@ export const MSG = {
   secretUnknown: `Could not check the repository secret ${SECRET_NAME} (no permission to list secrets). Going on; if it is missing the run fails at its first job and no review is charged.`,
   uncommitted: 'Note: uncommitted changes are not reviewable on GitHub. Only commits that are on GitHub are reviewed. Commit and push them first if you want them reviewed.',
   dirtyStop: 'You have uncommitted changes, and GitHub can only review commits that are on GitHub, so it would review a different change than the one you are editing. Nothing was started and no credit was used. Commit and push your changes, then run this again. (On Linux with the local engine, `--runner local` reviews uncommitted changes. To review only the commits already on GitHub, name the range: `--base <ref> --head HEAD`.)',
+  worktreeUnknown: 'Could not check for uncommitted changes. Nothing was started. Run `git status` in this repository and resolve any Git errors before retrying.',
   secretCheckFailed: (why) => `Could not check the repository secret ${SECRET_NAME}: ${why || 'gh gave no reason'}. Nothing was started. Check your network and \`gh auth status\`, then run this again.`,
   orgSecretUnknown: `${SECRET_NAME} is not a repository secret, and the organisation secrets could not be read. Going on; if it is missing the run fails at its first job and no review is charged.`,
   notFound: (url) => `The workflow was started, but its run could not be found, so there is no id to give you. A review may have been started and charged: do NOT start another one. Open ${url} to find the run, then use its number as gh:<number> with /megalens:status and /megalens:result. Nothing has been reviewed yet.`,
@@ -253,16 +254,6 @@ export async function hasDispatchWorkflow({ exec, cwd, env, nwo, defaultBranch, 
   return wf.code === 0 && wf.stdout.trim() === 'file';
 }
 
-function parseAppSlugs(stdout) {
-  const parsed = jsonOf(stdout);
-  if (Array.isArray(parsed)) {
-    return parsed.map((x) => (typeof x === 'string' ? x : x?.slug ?? x?.app?.slug ?? null)).filter(Boolean);
-  }
-  if (parsed && Array.isArray(parsed.check_suites)) return parsed.check_suites.map((s) => s?.app?.slug).filter(Boolean);
-  if (parsed && Array.isArray(parsed.check_runs)) return parsed.check_runs.map((c) => c?.app?.slug).filter(Boolean);
-  return String(stdout ?? '').split('\n').map((s) => s.trim()).filter(Boolean);
-}
-
 async function installationHasRepo({ run, instId, nwo }) {
   if (!Number.isInteger(instId) || instId <= 0) return null;
   const r = await run('gh', ['api', '-X', 'GET', `user/installations/${instId}/repositories`, '-f', 'per_page=100', '--paginate', '--jq', '[.repositories[]?.full_name]']);
@@ -273,20 +264,10 @@ async function installationHasRepo({ run, instId, nwo }) {
   return list.some((x) => (typeof x === 'string' ? x : x?.full_name ?? '').toLowerCase() === target);
 }
 
-/**
- * Determine whether the MegaLens GitHub App is currently installed and active on `nwo`.
- * Queries live installation endpoints first (`orgs/{owner}/installations` and `user/installations`) so:
- *   - newly installed Apps with 0 prior checks are detected;
- *   - removed or suspended Apps with historical checks are definitively rejected.
- * Only when GitHub denies both installation endpoints (e.g. personal repo or non-admin org member with a
- * standard OAuth token) does it fall back to check suites/runs — checking `headSha` first, and consulting
- * `defaultBranch` check history only when `allowHistoryFallback` is true (so stale history never suppresses
- * an existing dispatch workflow).
- */
-export async function checkAppInstallation({ exec, cwd, env, nwo, defaultBranch, headSha = null, allowHistoryFallback = true, signal = null }) {
+/** Return installed: null when the available credentials cannot establish installation state. */
+export async function checkAppInstallation({ exec, cwd, env, nwo, signal = null }) {
   const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
   const owner = String(nwo).split('/')[0];
-  let orgSelectedActive = false;
 
   // 1. Live organization installations API (authoritative when the user is an org admin).
   if (owner) {
@@ -309,7 +290,6 @@ export async function checkAppInstallation({ exec, cwd, env, nwo, defaultBranch,
           if (has === null) repoCheckConclusive = false;
         }
         if (repoCheckConclusive) return { installed: false, source: 'org-api' };
-        orgSelectedActive = true;
       }
     }
   }
@@ -324,63 +304,32 @@ export async function checkAppInstallation({ exec, cwd, env, nwo, defaultBranch,
     const installs = parsePaginatedList(userRes.stdout, 'installations');
     if (Array.isArray(installs)) {
       const ownerLower = owner.toLowerCase();
-      const active = installs.filter((i) => {
-        if (!i || !isMegaLensAppSlug(i.app_slug, env) || i.suspended_at) return false;
+      const matches = installs.filter((i) => {
+        if (!i || !isMegaLensAppSlug(i.app_slug, env)) return false;
         const login = typeof i.account_login === 'string' ? i.account_login : i.account?.login;
         return !login || login.toLowerCase() === ownerLower;
       });
-      if (active.length === 0) return { installed: false, source: 'user-api' };
-      if (active.some((i) => i.repository_selection === 'all')) return { installed: true, source: 'user-api' };
+      // An App user token lists installations for the App that issued it. An empty list alone is inconclusive.
+      const active = matches.filter((i) => !i.suspended_at);
+      if (active.some((i) => i.repository_selection === 'all' && (i.account_login || i.account?.login))) {
+        return { installed: true, source: 'user-api' };
+      }
       let repoCheckConclusive = true;
       for (const inst of active) {
         const has = await installationHasRepo({ run, instId: inst.id, nwo });
         if (has === true) return { installed: true, source: 'user-api' };
         if (has === null) repoCheckConclusive = false;
       }
-      if (repoCheckConclusive) return { installed: false, source: 'user-api' };
+      if (matches.length && repoCheckConclusive) return { installed: false, source: 'user-api' };
     }
   }
 
-  // 3. Check suites / check runs fallback when live installation endpoints are inaccessible to the token.
-  //    When `allowHistoryFallback` is false (a dispatch workflow is present), NEVER let historical completed
-  //    checks or check suites (on HEAD or defaultBranch) suppress the workflow fallback — only a currently
-  //    live (queued / in_progress) MegaLens check run on HEAD selects the App to attach instead of double-billing.
-  const hasActiveMegaLensOnRef = async (ref) => {
-    const cr = await run('gh', ['api', '-X', 'GET', `repos/${nwo}/commits/${ref}/check-runs`]);
-    if (cr.code !== 0) return false;
-    return parseCheckRuns(cr.stdout).some((c) => {
-      if (!c || c.name !== CHECK_NAME || !isMegaLensAppSlug(c.app?.slug, env)) return false;
-      const st = mapCheckState(c);
-      return st === 'queued' || st === 'running';
-    });
-  };
-  const hasMegaLensOnRef = async (ref) => {
-    const cs = await run('gh', ['api', '-X', 'GET', `repos/${nwo}/commits/${ref}/check-suites`, '--jq', '[.check_suites[]?.app?.slug]']);
-    if (cs.code === 0 && parseAppSlugs(cs.stdout).some((s) => isMegaLensAppSlug(s, env))) return true;
-    const cr = await run('gh', ['api', '-X', 'GET', `repos/${nwo}/commits/${ref}/check-runs`, '--jq', '[.check_runs[]? | {name: .name, slug: .app.slug}]']);
-    if (cr.code === 0 && parseAppSlugs(cr.stdout).some((s) => isMegaLensAppSlug(s, env))) return true;
-    return false;
-  };
-
-  if (!allowHistoryFallback) {
-    if (headSha && SHA_RE.test(headSha) && await hasActiveMegaLensOnRef(headSha)) {
-      return { installed: true, source: orgSelectedActive ? 'org-api' : 'head-active-check' };
-    }
-    return { installed: false, source: 'none' };
-  }
-
-  if (headSha && SHA_RE.test(headSha)) {
-    if (await hasMegaLensOnRef(headSha)) return { installed: true, source: orgSelectedActive ? 'org-api' : 'head-check' };
-  }
-  if (defaultBranch && defaultBranch !== headSha) {
-    if (await hasMegaLensOnRef(defaultBranch)) return { installed: true, source: orgSelectedActive ? 'org-api' : 'history-check' };
-  }
-  return { installed: false, source: 'none' };
+  return { installed: null, source: 'unknown' };
 }
 
 /** True when the MegaLens GitHub App is detected on `nwo`. */
 export async function isAppInstalled(opts) {
-  return (await checkAppInstallation(opts)).installed;
+  return (await checkAppInstallation(opts)).installed === true;
 }
 
 /**
@@ -403,15 +352,25 @@ export async function detectRemoteRunner({ exec, cwd, env, headSha = null, signa
     if (hs.code === 0 && SHA_RE.test(hs.stdout.trim())) sha = hs.stdout.trim();
   }
   const hasWorkflow = await hasDispatchWorkflow({ exec, cwd, env, nwo, defaultBranch, signal });
-  const app = await checkAppInstallation({
-    exec, cwd, env, nwo, defaultBranch, headSha: sha,
-    // Never let historical check suites on defaultBranch suppress a present dispatch workflow.
-    allowHistoryFallback: !hasWorkflow,
-    signal,
-  });
+  const app = await checkAppInstallation({ exec, cwd, env, nwo, signal });
   if (app.installed) return { runner: 'app', nwo, defaultBranch, hasWorkflow, appSource: app.source };
-  if (hasWorkflow) return { runner: 'github', nwo, defaultBranch, hasWorkflow: true };
-  return { runner: 'none', nwo, defaultBranch, hasWorkflow: false, message: MSG.notSetup(nwo), reason: 'not_setup' };
+  const unknown = app.installed === null;
+  const check = unknown && sha ? await findAppCheckRun({ exec, cwd, env, nwo, headSha: sha, signal }) : null;
+  const active = check && ['queued', 'running'].includes(mapCheckState(check));
+  if (check && (active || !hasWorkflow)) {
+    return { runner: 'app', nwo, defaultBranch, hasWorkflow, appSource: active ? 'head-active-check' : 'head-check' };
+  }
+  if (hasWorkflow) return { runner: 'github', nwo, defaultBranch, hasWorkflow: true, guardApp: unknown && !check };
+  const message = unknown
+    ? `Could not verify whether MegaLens is installed for ${nwo}. If you already installed the GitHub App at ${APP_INSTALL_URL}, run /megalens:review --runner app. You can also add ${WORKFLOW_PATH} to use your own GitHub runner.`
+    : MSG.notSetup(nwo);
+  return { runner: 'none', nwo, defaultBranch, hasWorkflow: false, message, reason: 'not_setup' };
+}
+
+async function worktreeDirty(run) {
+  const status = await run('git', ['status', '--porcelain', '--untracked-files=normal']);
+  if (status.code !== 0) throw new SetupError(MSG.worktreeUnknown);
+  return Boolean(status.stdout.trim());
 }
 
 /** Everything the GitHub Actions runner needs before it starts. Throws SetupError with a message naming the exact fix. */
@@ -453,8 +412,7 @@ export async function preflight({ exec, cwd, env, base = null, head = null, sign
   if (!baseSha) throw new SetupError(`Could not find where this work branches off ${defaultBranch}. Run \`git fetch origin ${defaultBranch}\` and try again.`);
   if (baseSha === headSha) throw new SetupError(`Nothing to review: ${short(headSha)} is the same commit as the default branch (${defaultBranch}), so there is no change between them. Commit your work on a branch first.`);
 
-  const dirty = await run('git', ['status', '--porcelain']);
-  if (dirty.code === 0 && dirty.stdout.trim()) {
+  if (await worktreeDirty(run)) {
     if (base === null && head === null) throw new SetupError(MSG.dirtyStop);
     note += `${MSG.uncommitted}\n`;
   }
@@ -513,30 +471,26 @@ export async function startRun({
   const workflowUrl = `https://github.com/${pre.nwo}/actions/workflows/${WORKFLOW_FILE}`;
 
   const reconcileOnce = async () => {
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), reconcileTimeoutMs);
-    timer.unref?.();
-    try {
-      const freshRun = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal: ac.signal });
-      const rows = await listRuns(freshRun, pre.nwo);
-      if (!rows) return { status: 'error' };
-      const hits = rows.filter((x) => !seen.has(x.databaseId) && x.displayTitle === title);
-      if (hits.length === 1) {
-        const hit = hits[0];
-        return {
-          status: 'found',
-          run: {
-            id: `gh:${hit.databaseId}`,
-            url: typeof hit.url === 'string' ? hit.url : `https://github.com/${pre.nwo}/actions/runs/${hit.databaseId}`,
-            createdAt: typeof hit.createdAt === 'string' ? hit.createdAt : null,
-          },
-        };
-      }
-      if (hits.length > 1) return { status: 'ambiguous' };
-      return { status: 'none' };
-    } finally {
-      clearTimeout(timer);
+    const lookup = await raceWithDeadline(
+      (callSignal) => listRuns((cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal: callSignal }), pre.nwo),
+      { remainingMs: Math.min(reconcileTimeoutMs, remaining()) },
+    );
+    const rows = lookup.value;
+    if (!rows) return { status: 'error' };
+    const hits = rows.filter((x) => !seen.has(x.databaseId) && x.displayTitle === title);
+    if (hits.length === 1) {
+      const hit = hits[0];
+      return {
+        status: 'found',
+        run: {
+          id: `gh:${hit.databaseId}`,
+          url: typeof hit.url === 'string' ? hit.url : `https://github.com/${pre.nwo}/actions/runs/${hit.databaseId}`,
+          createdAt: typeof hit.createdAt === 'string' ? hit.createdAt : null,
+        },
+      };
     }
+    if (hits.length > 1) return { status: 'ambiguous' };
+    return { status: 'none' };
   };
 
   const dispatchRes = await raceWithDeadline(
@@ -700,6 +654,7 @@ export async function runnerReview({
   pollMs = DEFAULT_POLL_MS,
   progressMs = DEFAULT_PROGRESS_MS,
   now = () => Date.now(),
+  t0 = now(),
   sleep = defaultSleep,
   sleepMs,
   tries,
@@ -709,7 +664,6 @@ export async function runnerReview({
   showIdOnNoWait = false,
 }) {
   if (tier !== 'standard' && tier !== 'deep') return { text: 'The GitHub runner path runs the standard or deep tier.\n', code: 4 };
-  const t0 = now();
   const capMs = wait ? waitMs : Infinity;
   const remaining = () => (Number.isFinite(capMs) ? Math.max(0, capMs - Math.max(0, now() - t0)) : Infinity);
   let pre;
@@ -803,21 +757,17 @@ export function mapCheckState(cr) {
   return 'failed';
 }
 
-function parseCheckRuns(stdout) {
-  const j = jsonOf(stdout);
-  if (Array.isArray(j)) return j;
-  if (j && Array.isArray(j.check_runs)) return j.check_runs;
-  return [];
-}
-
 /** Find the newest MegaLens App check run on `headSha`, distinguishing API failure (`ok: false`) from zero checks. */
 async function findAppCheckRunWithStatus({ exec, cwd, env, nwo, headSha, signal = null }) {
-  const r = await exec('gh', ['api', '-X', 'GET', `repos/${nwo}/commits/${headSha}/check-runs`], { cwd, env: ghEnv(env), signal });
+  const r = await exec('gh', [
+    'api', '-X', 'GET', `repos/${nwo}/commits/${headSha}/check-runs`,
+    '-f', 'per_page=100', '-f', 'filter=all', '-f', `check_name=${CHECK_NAME}`, '--paginate', '--jq', '.check_runs',
+  ], { cwd, env: ghEnv(env), signal });
   if (r.aborted || signal?.aborted) return { ok: false, cr: null, aborted: true };
   if (r.code !== 0) return { ok: false, cr: null, aborted: false };
-  const parsed = jsonOf(r.stdout);
-  if (!Array.isArray(parsed) && !(parsed && Array.isArray(parsed.check_runs))) return { ok: false, cr: null, aborted: false };
-  const runs = (Array.isArray(parsed) ? parsed : parsed.check_runs)
+  const parsed = parsePaginatedList(r.stdout, 'check_runs');
+  if (!parsed) return { ok: false, cr: null, aborted: false };
+  const runs = parsed
     .filter((c) => c && Number.isInteger(c.id) && c.name === CHECK_NAME && isMegaLensAppSlug(c.app?.slug, env))
     .sort((a, b) => (checkRunTimestamp(b) - checkRunTimestamp(a)) || (b.id - a.id));
   return { ok: true, cr: runs[0] ?? null, aborted: false };
@@ -927,8 +877,7 @@ export async function appPreflight({ exec, cwd, env, nwo = null, defaultBranch =
   const headSha = hs.stdout.trim();
   if (hs.code !== 0 || !SHA_RE.test(headSha)) throw new SetupError('Could not read the commit to review (is this a git repository with a commit?).');
   let note = '';
-  const dirty = await run('git', ['status', '--porcelain']);
-  if (dirty.code === 0 && dirty.stdout.trim()) {
+  if (await worktreeDirty(run)) {
     if (base === null && head === null) throw new SetupError(MSG.dirtyStop);
     note += `${MSG.uncommitted}\n`;
   }
@@ -958,6 +907,7 @@ export async function appReview({
   pollMs = DEFAULT_POLL_MS,
   progressMs = DEFAULT_PROGRESS_MS,
   now = () => Date.now(),
+  t0 = now(),
   sleep = defaultSleep,
   sleepMs = 2000,
   appearWaitMs = 60_000,
@@ -969,7 +919,6 @@ export async function appReview({
 }) {
   if (tier !== 'standard') return { text: `${MSG.appDeepUnsupported}\n`, code: 4 };
   if (base !== null) return { text: `${MSG.appRangeUnsupported}\n`, code: 4 };
-  const t0 = now();
   const capMs = wait ? waitMs : Infinity;
   const remaining = () => (Number.isFinite(capMs) ? Math.max(0, capMs - Math.max(0, now() - t0)) : Infinity);
   const bounded = (fn) => raceWithDeadline(fn, { signal, remainingMs: remaining(), now, t0, waitMs: capMs });
@@ -997,7 +946,7 @@ export async function appReview({
   let cr = initCheck.value.cr;
   const initialCheckOk = initCheck.value.ok;
   if (!cr) {
-    // Check if commit is on default branch or has an open PR (the App webhook may already have enqueued a review).
+    // A default-branch push or associated PR may already have queued an App review.
     const brRes = await bounded((callSignal) => exec('git', ['branch', '--show-current'], { cwd, env: ghEnv(env), signal: callSignal }));
     if (brRes.interrupted) return stopBeforeCheck(brRes.interrupted);
     const br = brRes.value;
@@ -1009,18 +958,28 @@ export async function appReview({
     const bwhList = bwh.code === 0 ? jsonOf(bwh.stdout) : null;
     const bwhCheckOk = bwh.code === 0 && Array.isArray(bwhList);
     const onRemoteDefault = bwhCheckOk && bwhList.some((name) => name === pre.defaultBranch);
-    const onDefault = onLocalDefault || onRemoteDefault;
+    // A later push can move the branch tip while the App is still publishing the earlier review.
+    let defaultMayContainHead = true;
+    if (bwhCheckOk && !onLocalDefault && !onRemoteDefault) {
+      const compared = await bounded((callSignal) => exec('gh', [
+        'api', '-X', 'GET', `repos/${pre.nwo}/compare/${pre.headSha}...${encodeURIComponent(pre.defaultBranch)}`,
+        '-f', 'per_page=1', '--jq', '.status',
+      ], { cwd, env: ghEnv(env), signal: callSignal }));
+      if (compared.interrupted) return stopBeforeCheck(compared.interrupted);
+      const { code, stdout } = compared.value;
+      defaultMayContainHead = code !== 0 || !['behind', 'diverged'].includes(stdout.trim());
+    }
 
-    const prWrapped = await bounded((callSignal) => exec('gh', ['api', '-X', 'GET', `repos/${pre.nwo}/commits/${pre.headSha}/pulls`, '--jq', '[.[] | select(.state == "open") | .number]'], { cwd, env: ghEnv(env), signal: callSignal }));
+    const prWrapped = await bounded((callSignal) => exec('gh', [
+      'api', '-X', 'GET', `repos/${pre.nwo}/commits/${pre.headSha}/pulls`, '-f', 'per_page=100', '--paginate', '--jq', '[.[]?.number]',
+    ], { cwd, env: ghEnv(env), signal: callSignal }));
     if (prWrapped.interrupted) return stopBeforeCheck(prWrapped.interrupted);
     const prRes = prWrapped.value;
-    const openPrs = prRes.code === 0 ? jsonOf(prRes.stdout) : null;
-    const prCheckOk = prRes.code === 0 && Array.isArray(openPrs);
-    const hasOpenPr = prCheckOk && openPrs.length > 0;
+    const associatedPrs = prRes.code === 0 ? parsePaginatedList(prRes.stdout) : null;
     // Fail closed against double-billing: ONLY fall back to workflow_dispatch when we affirmatively confirmed
-    // zero MegaLens check runs on headSha, zero open PRs, AND the commit is not on the default branch
+    // zero MegaLens check runs on headSha, zero associated PRs, AND the commit is not on the default branch
     // (so the App webhook cannot fire for this commit).
-    const mayBeTriggeredByApp = onDefault || !bwhCheckOk || hasOpenPr || !prCheckOk || !initialCheckOk;
+    const mayBeTriggeredByApp = defaultMayContainHead || associatedPrs?.length !== 0 || !initialCheckOk;
 
     if (mayBeTriggeredByApp) {
       const appearCapMs = Math.min(capMs, appearWaitMs);
@@ -1029,7 +988,13 @@ export async function appReview({
         const elapsed = Math.max(0, now() - t0);
         const rem = appearCapMs - elapsed;
         if (rem <= 0) { appearTimedOut = Number.isFinite(capMs) && elapsed >= capMs; break; }
-        await sleep(Math.min(sleepMs, rem), signal);
+        const slept = await raceWithDeadline((callSignal) => sleep(Math.min(sleepMs, rem), callSignal), {
+          signal, remainingMs: rem, now, t0, waitMs: appearCapMs,
+        });
+        if (slept.interrupted) {
+          if (slept.interrupted === 'aborted' || appearCapMs === capMs) return stopBeforeCheck(slept.interrupted);
+          break;
+        }
         const elapsedAfter = Math.max(0, now() - t0);
         const remAfter = appearCapMs - elapsedAfter;
         if (remAfter <= 0 || signal?.aborted) { appearTimedOut = Number.isFinite(capMs) && elapsedAfter >= capMs; break; }
@@ -1058,8 +1023,8 @@ export async function appReview({
         return { text: acc, code: 4, aborted: true, noCheck: true, safeToFallback: false };
       }
       const msg = mayBeTriggeredByApp
-        ? `No MegaLens review check has appeared for this commit yet. The MegaLens GitHub App may still be queueing it, or reviews may be turned off for ${pre.nwo} at ${APP_INSTALL_URL}. Nothing else was started so you are not charged twice.\n`
-        : `The MegaLens GitHub App reviews pull requests and pushes to ${pre.defaultBranch}. Open a pull request (e.g. \`gh pr create\`) or push to ${pre.defaultBranch}, then run /megalens:review again.\n`;
+        ? `No MegaLens review check has appeared for this commit yet. The GitHub App may still be queueing it, or reviews may be turned off for ${pre.nwo} at ${APP_INSTALL_URL}. Run /megalens:result when the check appears. Nothing else was started so you are not charged twice.${allowNoCheckFallback ? ' If you confirm the App is disabled for this repository and has no active review, use /megalens:review --runner github.' : ''}\n`
+        : `No review was started. Open a pull request (e.g. \`gh pr create\`) or push a commit to ${pre.defaultBranch} to trigger the MegaLens GitHub App, then run /megalens:review to see the result.\n`;
       emit(msg);
       return { text: acc, code: 4, setup: true, noCheck: true, safeToFallback: false };
     }
@@ -1075,14 +1040,14 @@ export async function appReview({
     return { text: acc, code: rendered.code, id };
   }
   if (!wait) {
-    emit(`Review started\n${STILL_RUNNING_LINE}\n`);
+    emit(`Following the GitHub App review\n${STILL_RUNNING_LINE}\n`);
     return { text: acc, code: 0, id };
   }
   const baseCtx = { exec, cwd, env, nwo: pre.nwo };
   const w = await waitForReview({
     poll: (callSignal) => appStatus({ ...baseCtx, signal: callSignal }, id, { showId: false }),
     onLine: emit,
-    startedLine: 'Review started',
+    startedLine: 'Following the GitHub App review',
     queuedLine: 'Waiting for MegaLens review machine...',
     runningLine: 'Running on MegaLens...',
     waitMs,
@@ -1107,9 +1072,7 @@ export async function appReview({
 
 /**
  * Fallback lookup when `/megalens:result` or `/megalens:status` is called with no id:
- * checks BOTH MegaLens App check runs across HEAD, recently updated PR heads (up to 20), and recent
- * default-branch commits (up to 10), AND the latest MegaLens Dispatch workflow runs, returning whichever
- * started more recently.
+ * Compare workflow runs with App checks on HEAD, PR heads, and commits visible on the default branch.
  */
 export async function findLatestRemoteReview({ exec, cwd, env, signal = null }) {
   const rv = await exec('gh', ['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef'], { cwd, env: ghEnv(env), signal });
@@ -1120,43 +1083,33 @@ export async function findLatestRemoteReview({ exec, cwd, env, signal = null }) 
     ? repo.defaultBranchRef.name
     : null;
 
-  const refs = [];
-  const addRef = (ref) => { if (ref && !refs.includes(ref)) refs.push(ref); };
-  const hs = await exec('git', ['rev-parse', '--verify', 'HEAD^{commit}'], { cwd, env: ghEnv(env), signal });
-  if (hs.code === 0 && SHA_RE.test(hs.stdout.trim())) addRef(hs.stdout.trim());
-
-  const prs = await exec('gh', [
-    'api', '-X', 'GET', `repos/${nwo}/pulls`,
-    '-f', 'state=all', '-f', 'sort=updated', '-f', 'direction=desc', '-f', 'per_page=20',
-    '--jq', '[.[]?.head?.sha // empty]',
-  ], { cwd, env: ghEnv(env), signal });
-  if (prs.code === 0) {
-    const parsed = jsonOf(prs.stdout);
-    if (Array.isArray(parsed)) {
-      for (const item of parsed) {
-        const sha = typeof item === 'string' ? item.trim() : item?.head?.sha;
-        if (typeof sha === 'string' && SHA_RE.test(sha)) addRef(sha);
-      }
-    }
-  }
-  if (defaultBranch) {
-    const commits = await exec('gh', [
+  const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
+  const [head, prs, commits, rows] = await Promise.all([
+    run('git', ['rev-parse', '--verify', 'HEAD^{commit}']),
+    run('gh', [
+      'api', '-X', 'GET', `repos/${nwo}/pulls`,
+      '-f', 'state=all', '-f', 'sort=updated', '-f', 'direction=desc', '-f', 'per_page=100', '--paginate',
+      '--jq', '[.[]?.head?.sha // empty]',
+    ]),
+    defaultBranch ? run('gh', [
       'api', '-X', 'GET', `repos/${nwo}/commits`,
-      '-f', `sha=${defaultBranch}`, '-f', 'per_page=10',
+      '-f', `sha=${defaultBranch}`, '-f', 'per_page=100', '--paginate',
       '--jq', '[.[]?.sha // empty]',
-    ], { cwd, env: ghEnv(env), signal });
-    let addedDefaultCommit = false;
-    if (commits.code === 0) {
-      const parsed = jsonOf(commits.stdout);
-      if (Array.isArray(parsed)) {
-        for (const item of parsed) {
-          const sha = typeof item === 'string' ? item.trim() : item?.sha;
-          if (typeof sha === 'string' && SHA_RE.test(sha)) { addRef(sha); addedDefaultCommit = true; }
-        }
-      }
-    }
-    if (!addedDefaultCommit) addRef(defaultBranch);
-  }
+    ]) : null,
+    listRuns(run, nwo, 5),
+  ]);
+  const validSha = (value) => typeof value === 'string' && SHA_RE.test(value);
+  const parseRefs = (response, shaOf) => response?.code === 0
+    ? (parsePaginatedList(response.stdout) ?? []).map((item) => typeof item === 'string' ? item.trim() : shaOf(item)).filter(validSha)
+    : [];
+  const prRefs = parseRefs(prs, (item) => item?.head?.sha);
+  const branchRefs = parseRefs(commits, (item) => item?.sha);
+  const headSha = head.stdout.trim();
+  const refs = [...new Set([
+    ...(head.code === 0 && validSha(headSha) ? [headSha] : []),
+    ...prRefs,
+    ...(branchRefs.length ? branchRefs : defaultBranch ? [defaultBranch] : []),
+  ])];
 
   let appCand = null;
   const BATCH = 5;
@@ -1173,8 +1126,6 @@ export async function findLatestRemoteReview({ exec, cwd, env, signal = null }) 
   }
 
   let ghCand = null;
-  const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
-  const rows = await listRuns(run, nwo, 5);
   if (rows && rows.length > 0) {
     const sorted = [...rows].sort((a, b) => (parseTs(b.createdAt) - parseTs(a.createdAt)) || (b.databaseId - a.databaseId));
     ghCand = { id: `gh:${sorted[0].databaseId}`, runner: 'github', nwo, startedAt: parseTs(sorted[0].createdAt) };

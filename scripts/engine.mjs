@@ -13,11 +13,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   scrubExact, chooseRoute, shouldFallBack, isSandboxPrecheckDoc, isRunnerId, isAppId,
-  detectRemoteRunner, hasDispatchWorkflow, appReview, appStatus, appResult,
+  detectRemoteRunner, appReview, appStatus, appResult,
   runnerReview, runnerStatus, runnerResult, findLatestRemoteReview, realExec, MSG,
 } from './lib/gh-runner.mjs';
-import { DOUBLE_TIER_ENABLED, DOUBLE_OFF_MESSAGE, UsageError, parseReviewArgs, assertReviewId, chooseAuth, childEnv, scrub, normalizeFirstReview, renderResult } from './lib/engine-core.mjs';
+import { DOUBLE_TIER_ENABLED, DOUBLE_OFF_MESSAGE, UsageError, parseReviewArgs, assertReviewId, chooseAuth, childEnv, scrub, normalizeFirstReview, renderResult, effectiveStatus } from './lib/engine-core.mjs';
 import { resolveRepoKey, saveLatestReview, loadLatestReview } from './lib/latest-review.mjs';
+import { createStandardReview, isStandardReviewId, readStandardReview, saveStandardOutcome, writeStandardPid } from './lib/local-standard.mjs';
 import { DEFAULT_POLL_MS, DEFAULT_PROGRESS_MS, DEFAULT_WAIT_MS, STILL_RUNNING_LINE, defaultSleep, formatElapsed, raceWithDeadline, waitForReview } from './lib/wait-loop.mjs';
 
 const MAX_OUT = 1 << 22; // bytes we keep from the engine's output streams
@@ -219,6 +220,7 @@ export async function main(argv, {
   platform = process.platform,
   probe = null,
   signal = null,
+  reviewStartedAt = null,
 } = {}) {
   const [cmd, ...rest0] = argv;
   let rest = rest0; let runnerFlag = null;
@@ -235,12 +237,11 @@ export async function main(argv, {
   const timing = flags.runnerTiming ?? {};
   const nowFn = timing.now ?? (() => Date.now());
   const sleepFn = timing.sleep ?? defaultSleep;
-  const repoKeyPromise = (useExec = true) => useExec
-    ? resolveRepoKey({ exec, cwd, env })
-    : resolveRepoKey({ exec: async (_cmd, args) => { const r = await runGit(args, cwd); return { code: r.code, stdout: r.out, stderr: '' }; }, cwd, env });
-  const recordLatest = async ({ id, runner, nwo = null, tier = 'standard', startedAt = null }, useExec = true) => {
-    const repoKey = await repoKeyPromise(useExec);
-    saveLatestReview({ env, repoKey, id, runner, nwo, tier, startedAt, now: nowFn });
+  const repoKeyPromise = (useExec = true, callSignal = signal) => resolveRepoKey({
+    exec: useExec ? exec : realExec, cwd, env, signal: callSignal,
+  });
+  const recordLatest = ({ id, runner, nwo = null, tier = 'standard', startedAt = null }, repoKey) => {
+    return saveLatestReview({ env, repoKey, id, runner, nwo, tier, startedAt, now: nowFn });
   };
 
   try {
@@ -271,8 +272,15 @@ export async function main(argv, {
       if (!explicitId) {
         const repoKey = await repoKeyPromise(false);
         const saved = loadLatestReview({ env, repoKey }) || loadLatestReview({ env, repoKey: await repoKeyPromise(true) });
-        const remote = await findLatestRemoteReview({ exec, cwd, env, signal });
-        const latest = pickNewerReview(saved, remote);
+        const remote = await raceWithDeadline(
+          (callSignal) => findLatestRemoteReview({ exec, cwd, env, signal: callSignal }),
+          { signal, remainingMs: DEFAULT_WAIT_MS },
+        );
+        if (remote.interrupted) {
+          say('The latest review lookup did not finish. Try the command again or supply the review id.\n');
+          return 4;
+        }
+        const latest = pickNewerReview(saved, remote.value);
         if (!latest) {
           say('No recent MegaLens review found for this repository. Run /megalens:review to start one.\n');
           return 4;
@@ -290,6 +298,24 @@ export async function main(argv, {
         sayExact(r.text); return r.code;
       }
       const id = assertReviewId(targetId);
+      if (isStandardReviewId(id)) {
+        const review = readStandardReview(env, id);
+        if (!review) {
+          say('The local Standard review stopped without a saved result. Check the engine before retrying.\n');
+          return 4;
+        }
+        if (review.state === 'running') {
+          say(`${explicitId ? `Review ${id}: ` : ''}${STILL_RUNNING_LINE}\n`);
+          return cmd === 'status' ? 0 : 4;
+        }
+        if (cmd === 'status') {
+          say(`${explicitId ? `Review ${id}: ` : 'MegaLens standard review is '}${review.state}.\n`);
+          return 0;
+        }
+        say(review.text);
+        if (explicitId && review.state === 'complete') say(`Review id: ${id}\n`);
+        return review.code;
+      }
       const auth = chooseAuth(env, flags);
       if (auth.error) { say(`MegaLens engine not started: ${auth.error}\n`); return 4; }
       const bin = env.MEGALENS_REVIEW_BIN || 'megalens-review';
@@ -301,13 +327,25 @@ export async function main(argv, {
     // ---- review ----
     const o = parseReviewArgs(rest, flags);
     const route = chooseRoute({ platform, runner: runnerFlag });
+    const t0 = reviewStartedAt ?? nowFn();
+    const waitMs = timing.waitMs ?? DEFAULT_WAIT_MS;
+    const capMs = o.wait ? waitMs : Infinity;
+    const remaining = () => Math.max(0, capMs - Math.max(0, nowFn() - t0));
+    const prepare = async (fn) => {
+      const r = await raceWithDeadline(fn, { signal, remainingMs: remaining(), now: nowFn, t0, waitMs: capMs });
+      if (r.interrupted) {
+        const label = r.interrupted === 'aborted' ? 'Interrupted' : 'Timed out';
+        throw new UsageError(`${label} before starting a review. Nothing was started by this command.`);
+      }
+      return r.value;
+    };
 
     const runViaApp = async (preRepo = null, { allowNoCheckFallback = false } = {}) => {
-      const repoKey = await repoKeyPromise();
+      const repoKey = await prepare((callSignal) => repoKeyPromise(true, callSignal));
       let streamed = false;
       const r = await appReview({
         exec, cwd, env, tier: o.tier, base: o.base, head: o.head, wait: o.wait,
-        ...timing, signal, preRepo, allowNoCheckFallback,
+        ...timing, t0, signal, preRepo, allowNoCheckFallback,
         onLine: (s) => { streamed = true; sayExact(s); },
         saveLatest: (rec) => saveLatestReview({ env, repoKey, ...rec, now: nowFn }),
       });
@@ -317,11 +355,11 @@ export async function main(argv, {
     };
 
     const runViaGithub = async (note = '') => {
-      const repoKey = await repoKeyPromise();
+      const repoKey = await prepare((callSignal) => repoKeyPromise(true, callSignal));
       let streamed = false;
       const r = await runnerReview({
         exec, cwd, env, tier: o.tier, base: o.base, head: o.head, wait: o.wait,
-        ...timing, signal,
+        ...timing, t0, signal,
         onLine: (s) => {
           if (!streamed && note) sayExact(note);
           streamed = true;
@@ -334,10 +372,9 @@ export async function main(argv, {
     };
 
     const runAutoRemote = async ({ allowLocalFallback = false } = {}) => {
-      const detected = await detectRemoteRunner({ exec, cwd, env, signal });
-      if (signal?.aborted) return 4;
-      if (detected.runner === 'app') {
-        const hasWf = detected.hasWorkflow ?? await hasDispatchWorkflow({ exec, cwd, env, nwo: detected.nwo, defaultBranch: detected.defaultBranch, signal });
+      const detected = await prepare((callSignal) => detectRemoteRunner({ exec, cwd, env, signal: callSignal }));
+      if (detected.runner === 'app' || (detected.guardApp && o.tier === 'standard' && o.base === null)) {
+        const hasWf = detected.hasWorkflow;
         if (o.tier === 'deep') {
           if (hasWf) return await runViaGithub();
           sayExact(`${MSG.appDeepUnsupported}\n`);
@@ -360,7 +397,7 @@ export async function main(argv, {
       const hasLocalCreds = Boolean(env.MEGALENS_TOKEN || String(env.MEGALENS_BYO ?? '').trim());
       if (allowLocalFallback && hasLocalCreds) {
         let buf = ''; const sig = { setup: false };
-        const code = await main(['review', ...rest, '--runner', 'local'], { env, cwd, out: (t) => { buf += t; }, err, stdin, flags, exec, platform, probe: sig, signal });
+        const code = await main(['review', ...rest, '--runner', 'local'], { env, cwd, out: (t) => { buf += t; }, err, stdin, flags, exec, platform, probe: sig, signal, reviewStartedAt: t0 });
         if (sig.setup && detected.reason === 'not_setup') {
           sayExact(`${detected.message}\n`);
           return 4;
@@ -386,6 +423,58 @@ export async function main(argv, {
     if (o.base !== null) args.push('--target', 'range', '--base', o.base, '--head', o.head);
     if (o.quiet) args.push('--quiet');
 
+    if (o.tier === 'standard') {
+      const repoKey = await prepare((callSignal) => repoKeyPromise(false, callSignal));
+      const id = createStandardReview(env);
+      const startedAt = nowFn();
+      const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '--local-standard-worker', id, bin, ...args], {
+        cwd, env: base.env, detached: true, stdio: 'ignore', windowsHide: true,
+      });
+      const completed = new Promise((resolve) => {
+        child.once('error', resolve);
+        child.once('exit', resolve);
+      });
+      try {
+        if (!child.pid) {
+          await completed;
+          say('Could not start the local Standard review worker.\n');
+          return 4;
+        }
+        writeStandardPid(env, id, child.pid);
+        const progressMs = timing.progressMs ?? DEFAULT_PROGRESS_MS;
+        const progress = o.wait && Number.isFinite(progressMs) && progressMs > 0
+          ? setInterval(() => say(`${formatElapsed(nowFn() - t0)}\n`), progressMs)
+          : null;
+        let finished;
+        try {
+          finished = o.wait && !(await raceWithDeadline(() => completed, {
+            signal, remainingMs: remaining(), now: nowFn, t0, waitMs,
+          })).interrupted;
+        } finally {
+          if (progress) clearInterval(progress);
+        }
+        if (!finished) {
+          if (recordLatest({ id, runner: 'local', startedAt }, repoKey)) {
+            say(`${STILL_RUNNING_LINE}\n`);
+          } else {
+            say(`The local review can be retrieved with /megalens:result ${id}.\n`);
+          }
+          return 0;
+        }
+        const outcome = readStandardReview(env, id);
+        if (!outcome || outcome.state === 'running') {
+          say('The local Standard review stopped without a saved result. Check the engine before retrying.\n');
+          return 4;
+        }
+        if (outcome.setup && probe) probe.setup = true;
+        if (!outcome.setup) recordLatest({ id, runner: 'local', startedAt }, repoKey);
+        say(outcome.text);
+        return outcome.code;
+      } finally {
+        child.unref();
+      }
+    }
+
     let tmpDirs = []; const p = o.firstReview !== null ? path.resolve(cwd, o.firstReview) : null;
     try {
       if (o.firstReview !== null) {
@@ -400,14 +489,13 @@ export async function main(argv, {
       } else if (o.tier === 'double') {
         say('Note: no review of your own was supplied, so the engine runs its own cheap first pass instead.\n');
       }
-      const waitMs = timing.waitMs ?? DEFAULT_WAIT_MS;
       const pollMs = timing.pollMs ?? DEFAULT_POLL_MS;
       const progressMs = timing.progressMs ?? DEFAULT_PROGRESS_MS;
       const cancelGraceMs = timing.cancelGraceMs ?? LOCAL_CANCEL_GRACE_MS;
 
       if (o.tier === 'deep') {
         args.push('--background');
-        const t0 = nowFn();
+        const repoKey = await prepare((callSignal) => repoKeyPromise(false, callSignal));
         const startAc = new AbortController();
         let startInterrupted = null;
         const onStartAbort = () => { if (!startInterrupted) { startInterrupted = 'aborted'; startAc.abort(); } };
@@ -416,14 +504,15 @@ export async function main(argv, {
           else signal.addEventListener('abort', onStartAbort, { once: true });
         }
         let startTimer = null;
-        if (o.wait && Number.isFinite(waitMs) && waitMs > 0 && !startInterrupted) {
-          startTimer = setTimeout(() => { if (!startInterrupted) { startInterrupted = 'timeout'; startAc.abort(); } }, waitMs);
-        } else if (o.wait && waitMs <= 0 && !startInterrupted) {
+        const startMs = remaining();
+        if (Number.isFinite(startMs) && startMs > 0 && !startInterrupted) {
+          startTimer = setTimeout(() => { if (!startInterrupted) { startInterrupted = 'timeout'; startAc.abort(); } }, startMs);
+        } else if (startMs <= 0 && !startInterrupted) {
           startInterrupted = 'timeout'; startAc.abort();
         }
         let r;
         try {
-          r = await runBin(bin, args, { ...base, signal: startAc.signal, graceMs: cancelGraceMs, waitForExitOnAbort: true });
+          r = await runBin(bin, args, { ...base, signal: startAc.signal, waitForExitOnAbort: true });
         } finally {
           if (startTimer !== null) clearTimeout(startTimer);
           if (signal) signal.removeEventListener('abort', onStartAbort);
@@ -431,7 +520,7 @@ export async function main(argv, {
         if (r.code === 127) { if (probe) probe.setup = true; say(missingBin()); return 4; }
         let j; try { j = JSON.parse(r.stdout); } catch { j = null; }
         if (j && REVIEW_ID(j.review_id)) {
-          await recordLatest({ id: j.review_id, runner: 'local', tier: 'deep' }, false);
+          recordLatest({ id: j.review_id, runner: 'local', tier: 'deep' }, repoKey);
           if (r.aborted || startInterrupted || signal?.aborted) {
             say(`${STILL_RUNNING_LINE}\n`);
             return 0;
@@ -482,9 +571,8 @@ export async function main(argv, {
         return 0;
       }
 
-      // Local Standard (or Double): enforce wait cap, abort handling, and elapsed progress updates,
+      // Local Double: enforce wait cap, abort handling, and elapsed progress updates,
       // and wait for engine-v2's SIGTERM finalization (gateway POST /complete + workspace cleanup) before printing CANCELLED.
-      const t0 = nowFn();
       const callAc = new AbortController();
       let interruptKind = null;
       const triggerInterrupt = (kind) => {
@@ -498,9 +586,9 @@ export async function main(argv, {
         else signal.addEventListener('abort', onUserAbort, { once: true });
       }
       let deadlineTimer = null;
-      if (Number.isFinite(waitMs) && waitMs > 0 && !interruptKind) {
-        deadlineTimer = setTimeout(() => triggerInterrupt('timeout'), waitMs);
-      } else if (waitMs <= 0 && !interruptKind) {
+      if (Number.isFinite(remaining()) && remaining() > 0 && !interruptKind) {
+        deadlineTimer = setTimeout(() => triggerInterrupt('timeout'), remaining());
+      } else if (remaining() <= 0 && !interruptKind) {
         triggerInterrupt('timeout');
       }
       let progressTimer = null;
@@ -518,7 +606,7 @@ export async function main(argv, {
         progressTimer.unref?.();
       }
       try {
-        // Local Standard/Double runs in the foreground (engine-v2 rejects --background for non-deep tiers
+        // Local Double runs in the foreground (engine-v2 rejects --background for non-deep tiers
         // and does not persist status/result state on disk). Interrupting or hitting the wait cap sends SIGTERM,
         // waits up to cancelGraceMs for engine-v2 to close the gateway review and remove its workspace, then
         // reports CANCELLED / NOT COMPLETED (exit 4) instead of claiming it is still running.
@@ -599,7 +687,7 @@ async function finishNoDoc(r, say, env, probe = null) {
   say(renderResult(null, { exit: r.code, stderrText: scrub(firstLine(r.stderr), env) })); return r.code === 0 ? 4 : r.code;
 }
 
-async function fetchAndRender(bin, args, base, say, env, probe = null, { showId = false, onDoc = null, meta = null, shouldSuppress = null } = {}) {
+async function fetchAndRender(bin, args, base, say, env, probe = null, { showId = false, meta = null, shouldSuppress = null, reviewId = null } = {}) {
   const d = privateDir();
   try {
     const outFile = path.join(d, 'findings.json');
@@ -618,16 +706,32 @@ async function fetchAndRender(bin, args, base, say, env, probe = null, { showId 
       return 4;
     }
     if (!doc && /unknown review id/i.test(r.stderr)) { say('The engine does not know that review id (wrong id, or it was cleaned up). No result.\n'); return 4; }
-    if (doc && onDoc) await onDoc(doc);
-    say(renderResult(doc, { exit: r.code, stderrText: scrub(firstLine(r.stderr), env), showId }));
+    if (meta && doc?.schema === 'megalens.findings/v1' && Array.isArray(doc.findings)) {
+      const passes = Array.isArray(doc.passes) ? doc.passes : [];
+      meta.state = effectiveStatus(doc, passes, passes.filter((p) => p?.status === 'failed'), r.code);
+    }
+    say(renderResult(doc && reviewId ? { ...doc, review_id: reviewId } : doc, { exit: r.code, stderrText: scrub(firstLine(r.stderr), env), showId }));
     return r.code !== 0 ? r.code : (!doc || doc.status === 'failed' || !doc.passes?.some?.((x) => x?.status === 'ok' && x.name !== 'first-review') ? 4 : 0);
   } finally { rmSync(d, { recursive: true, force: true }); }
 }
 
+async function runStandardWorker(id, bin, args) {
+  const env = process.env;
+  const probe = { setup: false };
+  const meta = { state: 'failed' };
+  let text = '';
+  const code = await fetchAndRender(bin, args, { env, cwd: process.cwd() }, (line) => { text += scrub(line, env); }, env, probe, { meta, reviewId: id });
+  saveStandardOutcome(env, id, { code, text, state: meta.state, setup: probe.setup });
+}
+
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
-  const ac = new AbortController();
-  const stop = () => { ac.abort(); };
-  process.once('SIGINT', stop);
-  process.once('SIGTERM', stop);
-  process.exitCode = await main(process.argv.slice(2), { signal: ac.signal });
+  if (process.argv[2] === '--local-standard-worker') {
+    const [, , , id, bin, ...args] = process.argv;
+    try { await runStandardWorker(id, bin, args); } catch { process.exitCode = 4; }
+  } else {
+    const ac = new AbortController();
+    process.once('SIGINT', () => ac.abort());
+    process.once('SIGTERM', () => ac.abort());
+    process.exitCode = await main(process.argv.slice(2), { signal: ac.signal });
+  }
 }

@@ -67,7 +67,7 @@ export async function raceWithDeadline(fn, {
       }, remainingMs);
     }
     Promise.resolve()
-      .then(() => fn(callAc.signal))
+      .then(() => callAc.signal.aborted ? undefined : fn(callAc.signal))
       .then(
         (value) => finish({ interrupted: null, value }),
         (error) => finish({ interrupted: 'error', error }),
@@ -80,6 +80,7 @@ export async function raceWithDeadline(fn, {
     if (res.interrupted) return res;
     if (signal?.aborted) return { interrupted: 'aborted', value: undefined };
     if (Number.isFinite(waitMs) && Math.max(0, now() - t0) >= waitMs) {
+      callAc.abort();
       return { interrupted: 'timeout', value: undefined };
     }
     return res;
@@ -147,9 +148,10 @@ export async function waitForReview({
     }
     const remaining = waitMs - elapsed;
     if (remaining <= 0 || signal?.aborted) break;
-    await sleep(Math.min(pollMs, remaining), signal);
-    const afterSleep = Math.max(0, now() - start);
-    if (afterSleep >= waitMs || signal?.aborted) break;
+    const slept = await raceWithDeadline((callSignal) => sleep(Math.min(pollMs, remaining), callSignal), {
+      signal, remainingMs: remaining, now, t0: start, waitMs,
+    });
+    if (slept.interrupted) break;
   }
 
   onLine(`${STILL_RUNNING_LINE}\n`);

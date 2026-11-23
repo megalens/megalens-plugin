@@ -37,9 +37,9 @@ function readMap(file) {
 }
 
 /** Resolve a stable key for the current repo: git toplevel if available, else resolved cwd. */
-export async function resolveRepoKey({ exec, cwd, env }) {
+export async function resolveRepoKey({ exec, cwd, env, signal = null }) {
   try {
-    const r = await exec('git', ['rev-parse', '--show-toplevel'], { cwd, env });
+    const r = await exec('git', ['rev-parse', '--show-toplevel'], { cwd, env, signal });
     if (r.code === 0 && r.stdout.trim()) return path.resolve(r.stdout.trim());
   } catch { /* fall through */ }
   return path.resolve(cwd || '.');
@@ -58,6 +58,8 @@ export function saveLatestReview({ env = process.env, repoKey, id, runner, nwo =
     const ts = typeof startedAt === 'number' && Number.isFinite(startedAt) && startedAt > 0
       ? startedAt
       : (Number(now()) || Date.now());
+    const previous = map[String(repoKey)];
+    if (previous && isAnyReviewId(previous.id) && Number(previous.startedAt) > ts) return false;
     map[String(repoKey)] = {
       id,
       runner,
