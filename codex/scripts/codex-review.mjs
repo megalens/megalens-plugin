@@ -69,6 +69,11 @@ export function adaptCodexOutput(text) {
   if (!APP_PATH_ENABLED && out === `${MSG.notSetup}\n`) {
     out = `GitHub Actions workflow setup required (${MSG.notSetup.match(/https:\/\/\S+/)?.[0] ?? 'https://megalens.ai/app/start'}).\n${CODEX_WORKFLOW_SETUP_NOTE}\n`;
   }
+  if (out === `${MSG.noSecret}\n`) {
+    out = 'The repository secret MEGALENS_TOKEN is missing. No review was started.\n'
+      + 'Zero-copy GitHub setup is blocked. `codex mcp login megalens` signs in to the editor only.\n'
+      + 'Ask a repository administrator to configure the Actions secret with `gh secret set MEGALENS_TOKEN`, then run $megalens-review again.\n';
+  }
   return out;
 }
 
@@ -133,7 +138,7 @@ export async function main(argv, {
     out: (s) => out(adaptCodexOutput(s)),
     err: (s) => err(adaptCodexOutput(s)),
     stdin,
-    flags,
+    flags: { ...flags, reportGitHubSetupErrors: true },
     exec,
     signal,
   });

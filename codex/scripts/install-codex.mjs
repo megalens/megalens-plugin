@@ -21,14 +21,14 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
   rmdirSync,
   unlinkSync,
-  writeSync,
+  writeFileSync,
 } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -95,20 +95,30 @@ export function resolveCodexHome(env = process.env, home = homedir(), explicit =
 
 function isSubpath(parent, child) {
   const rel = path.relative(path.resolve(parent), path.resolve(child));
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  return rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
+}
+
+function realLocation(file) {
+  try {
+    return realpathSync(file);
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e;
+    const parent = path.dirname(file);
+    return path.join(realLocation(parent), path.basename(file));
+  }
 }
 
 function assertSafeScriptPath(p) {
   const abs = path.resolve(p);
-  if (/[\r\n\0'"]/.test(abs)) {
-    throw new Error(`Unsafe characters in script path: ${abs}`);
+  if (/[\r\n\0'"`$]/.test(abs) || (process.platform !== 'win32' && abs.includes('\\'))) {
+    throw new Error('Unsafe characters in the installed runner path.');
   }
   return abs;
 }
 
 function renderTemplate(relPath, scriptPath) {
   const raw = readFileSync(path.join(CODEX_DIR, relPath), 'utf8');
-  return raw.replaceAll(SKILL_RUNNER_TOKEN, scriptPath);
+  return raw.replaceAll(SKILL_RUNNER_TOKEN, () => scriptPath);
 }
 
 const SECRETISH = /(token|api[_-]?key|secret|password|authorization|bearer)["']?\s*[:=]\s*["']?(?!\$)[A-Za-z0-9_\-./+=]{8,}/i;
@@ -126,8 +136,7 @@ class Plan {
   rootFor(file) {
     const abs = path.resolve(file);
     for (const r of this.allowedRoots) {
-      const rel = path.relative(r, abs);
-      if (!rel.startsWith('..') && !path.isAbsolute(rel)) return r;
+      if (isSubpath(r, abs)) return r;
     }
     throw new Error(`${file} is outside allowed roots; nothing was changed.`);
   }
@@ -170,40 +179,10 @@ class Plan {
     this.ops.push({ kind: 'write', file, content, st, old, defaultMode });
   }
 
-  removeFile(file, { backup = true, pruneTo = null } = {}) {
+  removeFile(file, { pruneTo = null } = {}) {
     const st = this.check(file);
     if (!st) return;
-    const old = backup ? readFileSync(file, 'utf8') : null;
-    this.ops.push({ kind: 'removeFile', file, st, old, backup, pruneTo });
-  }
-
-  removeDirTree(dir, { stopPruneAt = null } = {}) {
-    const absDir = path.resolve(dir);
-    const st = this.checkPathNoSymlinks(absDir);
-    if (!st) return;
-    if (!st.isDirectory()) throw new Error(`${absDir} is not a directory; nothing was changed.`);
-    const files = [];
-    const dirs = [];
-    const visit = (d) => {
-      for (const entry of readdirSync(d)) {
-        const p = path.join(d, entry);
-        const est = lstatSync(p);
-        if (est.isSymbolicLink()) {
-          throw new Error(`${p} is a symbolic link; refusing to remove through it. Nothing was changed.`);
-        }
-        if (est.isDirectory()) {
-          visit(p);
-          dirs.push(p);
-        } else if (est.isFile()) {
-          files.push(p);
-        } else {
-          throw new Error(`${p} is not a regular file or directory; nothing was changed.`);
-        }
-      }
-    };
-    visit(absDir);
-    dirs.push(absDir);
-    this.ops.push({ kind: 'removeDirTree', dir: absDir, files, dirs, stopPruneAt });
+    this.ops.push({ kind: 'removeFile', file, pruneTo });
   }
 
   skip(file, why) {
@@ -219,8 +198,9 @@ class Plan {
     const dir = path.join(this.backupRoot, stamp);
     let used = false;
     const ensureBackupDir = () => {
-      mkdirSync(dir, { recursive: true, mode: 0o700 });
       if (!used) {
+        this.checkPathNoSymlinks(dir);
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
         for (let d = dir; ; d = path.dirname(d)) {
           chmodSync(d, 0o700);
           if (d === this.backupRoot) break;
@@ -234,7 +214,7 @@ class Plan {
         ensureBackupDir();
         const fd = openSync(backup, 'wx', 0o600);
         try {
-          writeSync(fd, old);
+          writeFileSync(fd, old);
         } finally {
           closeSync(fd);
         }
@@ -246,40 +226,31 @@ class Plan {
       const stopAbs = path.resolve(stopAt);
       let cur = path.resolve(startDir);
       while (cur !== stopAbs && isSubpath(stopAbs, cur)) {
-        let st;
-        try { st = lstatSync(cur); } catch { break; }
-        if (st.isSymbolicLink() || !st.isDirectory()) break;
-        if (readdirSync(cur).length > 0) break;
-        rmdirSync(cur);
+        try {
+          rmdirSync(cur);
+        } catch (e) {
+          if (['ENOENT', 'ENOTEMPTY', 'EEXIST', 'ENOTDIR'].includes(e.code)) break;
+          throw e;
+        }
         cur = path.dirname(cur);
       }
     };
 
     for (const op of this.ops) {
       if (op.kind === 'removeFile') {
-        const { file, old, backup: doBackup, pruneTo } = op;
-        const backup = doBackup && old !== null ? writeBackup(file, old) : '';
+        const { file, pruneTo } = op;
+        if (!this.check(file)) continue;
+        const backup = writeBackup(file, readFileSync(file));
         if (!this.dryRun) {
           unlinkSync(file);
           if (pruneTo) pruneEmptyDirs(path.dirname(file), pruneTo);
         }
         this.report.push(
           `${this.dryRun ? 'would ' : ''}removed    ${file}`
-          + (backup ? `\n           backup (outside the repo, owner-only): ${backup}` : ''),
+          + `\n           backup (outside the repo, owner-only): ${backup}`,
         );
         continue;
       }
-      if (op.kind === 'removeDirTree') {
-        const { dir: targetDir, files, dirs, stopPruneAt } = op;
-        if (!this.dryRun) {
-          for (const f of files) unlinkSync(f);
-          for (const d of dirs) rmdirSync(d);
-          if (stopPruneAt) pruneEmptyDirs(path.dirname(targetDir), stopPruneAt);
-        }
-        this.report.push(`${this.dryRun ? 'would ' : ''}removed    ${targetDir}`);
-        continue;
-      }
-
       const { file, content, st, old, defaultMode } = op;
       const oldMode = st ? st.mode & 0o777 : null;
       const mode = oldMode === null ? defaultMode : oldMode;
@@ -293,7 +264,7 @@ class Plan {
         const fd = openSync(tmp, 'wx', mode);
         try {
           fchmodSync(fd, mode);
-          writeSync(fd, content);
+          writeFileSync(fd, content);
         } catch (e) {
           closeSync(fd);
           try { unlinkSync(tmp); } catch {}
@@ -327,23 +298,22 @@ function spliceBlock(old, begin, end, bodyLines) {
   return { text: (trimmed ? trimmed + eol + eol : '') + block, had: false };
 }
 
-function stripManagedBlock(raw, begin, end) {
-  return String(raw ?? '').replace(
-    new RegExp(`${escRe(begin)}[\\s\\S]*?${escRe(end)}(\\r?\\n)?`, 'g'),
-    '',
-  );
-}
-
 function readManagedBlockLines(raw, begin, end) {
   const m = new RegExp(`${escRe(begin)}\\r?\\n([\\s\\S]*?)${escRe(end)}`).exec(String(raw ?? ''));
   if (!m) return [];
   return m[1].split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
 }
 
-/** True if config.toml already defines mcp_servers.megalens outside our managed block (TOML-aware). */
+const OAUTH_BLOCK = [
+  '[mcp_servers.megalens]',
+  `url = ${JSON.stringify(CODEX_MCP_URL)}`,
+  'startup_timeout_sec = 20',
+  'tool_timeout_sec = 1800  # reviews can take several minutes',
+];
+
+/** True if config.toml already defines mcp_servers.megalens (TOML-aware). */
 export function hasExistingMegalensMcp(raw) {
-  const withoutManaged = stripManagedBlock(raw, BEGIN, END);
-  return hasTomlPath(withoutManaged, ['mcp_servers', 'megalens']);
+  return hasTomlPath(raw, ['mcp_servers', 'megalens']);
 }
 
 function mergeOauthMcpToml(plan, file) {
@@ -356,20 +326,15 @@ function mergeOauthMcpToml(plan, file) {
 
   // If the user defines `mcp_servers = { ... }` as an inline table, TOML 1.0 forbids
   // extending it with a `[mcp_servers.megalens]` table header; splice directly into the inline table.
-  const withoutManaged = stripManagedBlock(old, BEGIN, END);
-  const inlineSpan = findTomlInlineTable(withoutManaged, ['mcp_servers']);
+  const inlineSpan = findTomlInlineTable(old, ['mcp_servers']);
   let text;
   if (inlineSpan) {
     const inlineValue = `{ url = ${JSON.stringify(CODEX_MCP_URL)}, startup_timeout_sec = 20, tool_timeout_sec = 1800 }`;
-    text = insertIntoTomlInlineTable(withoutManaged, inlineSpan, 'megalens', inlineValue);
+    text = insertIntoTomlInlineTable(old, inlineSpan, 'megalens', inlineValue);
   } else {
-    const body = [
-      '[mcp_servers.megalens]',
-      `url = ${JSON.stringify(CODEX_MCP_URL)}`,
-      'startup_timeout_sec = 20',
-      'tool_timeout_sec = 1800  # reviews can take several minutes',
-    ];
-    text = spliceBlock(old, BEGIN, END, body).text;
+    const eol = eolOf(old);
+    const separator = old ? (old.endsWith('\n') ? eol : eol + eol) : '';
+    text = old + separator + [BEGIN, ...OAUTH_BLOCK, END, ''].join(eol);
   }
 
   try {
@@ -378,7 +343,8 @@ function mergeOauthMcpToml(plan, file) {
       throw new Error('merged config is missing mcp_servers.megalens');
     }
   } catch (e) {
-    throw new Error(`${file} cannot take the MegaLens MCP block: ${e.message}. Nothing was changed.`);
+    const line = /^line \d+/.exec(e.message)?.[0];
+    throw new Error(`${file} cannot take the MegaLens MCP block${line ? ` (near ${line})` : ''}. Nothing was changed.`);
   }
   plan.write(file, text);
 }
@@ -392,13 +358,17 @@ function cleanupLegacyProjectPlugin(plan, project) {
   const legacyPluginDir = path.join(project, '.codex', 'plugins', 'megalens');
   const pluginSt = plan.checkPathNoSymlinks(legacyPluginDir);
   if (pluginSt && pluginSt.isDirectory()) {
-    const isLegacyMegalens = [
-      path.join(legacyPluginDir, '.codex-plugin', 'plugin.json'),
-      path.join(legacyPluginDir, 'scripts', 'codex-review.mjs'),
-      path.join(legacyPluginDir, PREVIEW_OPT_IN_FILENAME),
-    ].some((p) => existsSync(p));
+    const legacyMarkers = ['.codex-plugin/plugin.json', 'scripts/codex-review.mjs', PREVIEW_OPT_IN_FILENAME];
+    const isLegacyMegalens = legacyMarkers.some((file) => existsSync(path.join(legacyPluginDir, file)));
     if (isLegacyMegalens) {
-      plan.removeDirTree(legacyPluginDir, { stopPruneAt: project });
+      const files = BUNDLED_PLUGIN_FILES.filter((file) => !legacyMarkers.includes(file));
+      for (const skill of SKILLS) {
+        files.push(`skills/${skill}/SKILL.md`, `skills/${skill}/agents/openai.yaml`);
+      }
+      // Keep the markers until the other files have been removed so an interrupted upgrade can resume.
+      for (const file of [...files, ...legacyMarkers]) {
+        plan.removeFile(path.join(legacyPluginDir, file), { pruneTo: project });
+      }
     }
   }
 
@@ -423,7 +393,7 @@ function cleanupLegacyProjectPlugin(plan, project) {
       );
       if (remaining.length !== doc.plugins.length) {
         if (remaining.length === 0 && doc.name === 'local-repo') {
-          plan.removeFile(legacyMarketplace, { backup: true, pruneTo: project });
+          plan.removeFile(legacyMarketplace, { pruneTo: project });
         } else {
           plan.write(legacyMarketplace, JSON.stringify({ ...doc, plugins: remaining }, null, 2) + '\n');
         }
@@ -443,13 +413,13 @@ function resolveGitInfoExclude(projectDir) {
     const dotGit = path.join(cur, '.git');
     try {
       const st = lstatSync(dotGit);
-      if (st.isSymbolicLink()) return null;
+      if (st.isSymbolicLink()) throw new Error('Cannot safely update Git excludes through a symbolic .git path. Nothing was changed.');
       if (st.isDirectory() || st.isFile()) {
         repoRoot = cur;
         break;
       }
     } catch (e) {
-      if (e.code !== 'ENOENT') return null;
+      if (e.code !== 'ENOENT') throw e;
     }
     const parent = path.dirname(cur);
     if (parent === cur) return null;
@@ -477,19 +447,21 @@ function resolveGitInfoExclude(projectDir) {
   } catch { /* normal repo without commondir */ }
 
   const relFromRoot = path.relative(repoRoot, path.resolve(projectDir)).split(path.sep).filter(Boolean).join('/');
-  const prefix = relFromRoot ? `${relFromRoot}/` : '';
+  const prefix = relFromRoot ? `${relFromRoot.replace(/[\\*?\[\]]/g, '\\$&')}/` : '';
   return {
+    repoRoot,
     excludeRoot: commonGitDir,
     excludeFile: path.join(commonGitDir, 'info', 'exclude'),
     prefix,
   };
 }
 
-function mergeGitExclude(plan, excludeFile, patterns) {
-  plan.check(excludeFile);
-  const old = existsSync(excludeFile) ? readFileSync(excludeFile, 'utf8') : '';
-  const { text } = spliceBlock(old, BEGIN, END, patterns);
-  plan.write(excludeFile, text);
+function isTrackedConfig(project) {
+  const r = spawnSync('git', ['--literal-pathspecs', '-C', project, 'ls-files', '-z', '--', '.codex/config.toml'], {
+    encoding: 'utf8',
+  });
+  if (r.status !== 0) throw new Error('Could not check whether the project Codex config is tracked. Nothing was changed.');
+  return r.stdout.length > 0;
 }
 
 function mergeMarketplaceJson(plan, file, pluginRelPath, marketplaceName, displayName) {
@@ -553,28 +525,32 @@ export function installCodex(opts = {}, { env = process.env, flags = {} } = {}) 
   }
 
   const o = { scope: 'global', dir: '', home: '', codexHome: '', withOauthMcp: false, dryRun: false, ...opts };
-  const home = path.resolve(o.home || env.HOME || homedir());
-  const project = path.resolve(o.dir || process.cwd());
+  const home = realLocation(path.resolve(o.home || env.HOME || homedir()));
+  const project = realLocation(path.resolve(o.dir || process.cwd()));
   const codexHome = resolveCodexHome(env, home, o.codexHome);
   const skillsRoot = o.scope === 'global' ? home : project;
+  const gitExclude = o.scope === 'project' ? resolveGitInfoExclude(project) : null;
+  const checkout = gitExclude?.repoRoot ?? project;
+  const defaultCodexHome = path.join(home, '.codex');
+  const userCodexHome = o.scope === 'project' && isSubpath(checkout, realLocation(codexHome))
+    ? defaultCodexHome
+    : codexHome;
   // ALWAYS install executable runtime + opt-in marker in user-owned storage, NEVER inside the reviewed repo.
   // In global mode, place under ~/.codex/plugins/megalens so ~/.agents/plugins/marketplace.json resolves `./.codex/plugins/megalens`.
-  let pluginDir = o.scope === 'global'
-    ? path.join(home, '.codex', 'plugins', 'megalens')
-    : path.join(codexHome, 'plugins', 'megalens');
-  if (o.scope === 'project' && isSubpath(project, pluginDir)) {
-    pluginDir = path.join(home, '.codex', 'plugins', 'megalens');
-  }
+  const pluginDir = path.join(o.scope === 'global' ? defaultCodexHome : userCodexHome, 'plugins', 'megalens');
   const installedRunner = path.join(pluginDir, 'scripts', 'codex-review.mjs');
   const scriptPath = assertSafeScriptPath(o.scriptPath || installedRunner);
-  const gitExclude = o.scope === 'project' ? resolveGitInfoExclude(project) : null;
+  const backupRoot = path.join(home, '.megalens', 'backups', 'codex-plugin');
+  if (o.scope === 'project' && [pluginDir, scriptPath, userCodexHome, backupRoot].some((p) => isSubpath(checkout, realLocation(p)))) {
+    throw new Error('Project installation needs a user profile outside the Git checkout. Nothing was changed.');
+  }
   const allowedRoots = o.scope === 'global'
     ? [home, codexHome]
     : [project, codexHome, home, ...(gitExclude ? [gitExclude.excludeRoot] : [])];
   const plan = new Plan({
     dryRun: Boolean(o.dryRun),
     allowedRoots,
-    backupRoot: path.join(home, '.megalens', 'backups', 'codex-plugin'),
+    backupRoot,
   });
 
   // 0. Project scope upgrade: remove any stale repo-local MegaLens plugin runtime or marketplace entry
@@ -652,20 +628,28 @@ export function installCodex(opts = {}, { env = process.env, flags = {} } = {}) 
   const projectConfigPath = path.join(project, '.codex', 'config.toml');
   let projectConfigSt = null;
   let projectConfigIsManagedOnly = false;
+  let projectConfigIsTracked = false;
   if (o.scope === 'project') {
-    projectConfigSt = plan.checkPathNoSymlinks(projectConfigPath);
-    if (projectConfigSt && projectConfigSt.isFile()) {
+    projectConfigSt = plan.check(projectConfigPath);
+    projectConfigIsTracked = Boolean(gitExclude && (projectConfigSt || o.withOauthMcp) && isTrackedConfig(project));
+    if (projectConfigSt && !projectConfigIsTracked) {
       const existingProjectCfg = readFileSync(projectConfigPath, 'utf8');
-      projectConfigIsManagedOnly = existingProjectCfg.includes(BEGIN)
-        && stripManagedBlock(existingProjectCfg, BEGIN, END).trim() === '';
+      projectConfigIsManagedOnly = existingProjectCfg.trim() === [BEGIN, ...OAUTH_BLOCK, END].join(eolOf(existingProjectCfg));
     }
   }
-  const projectCreatedConfig = o.scope === 'project' && o.withOauthMcp && !projectConfigSt;
+  const projectCreatedConfig = o.scope === 'project' && o.withOauthMcp && !projectConfigSt && !projectConfigIsTracked;
   if (o.withOauthMcp) {
-    const configPath = o.scope === 'global'
-      ? path.join(codexHome, 'config.toml')
-      : projectConfigPath;
-    mergeOauthMcpToml(plan, configPath);
+    if (projectConfigIsTracked) {
+      const projectConfig = projectConfigSt ? readFileSync(projectConfigPath, 'utf8') : '';
+      if (hasExistingMegalensMcp(projectConfig)) {
+        plan.skip(projectConfigPath, 'tracked config already defines mcp_servers.megalens');
+      } else {
+        plan.skip(projectConfigPath, 'tracked config; adding MCP to the user profile');
+        mergeOauthMcpToml(plan, path.join(userCodexHome, 'config.toml'));
+      }
+    } else {
+      mergeOauthMcpToml(plan, o.scope === 'global' ? path.join(codexHome, 'config.toml') : projectConfigPath);
+    }
   }
 
   // 5. Project scope: exclude only the installer's own untracked files in local `.git/info/exclude`
@@ -674,16 +658,17 @@ export function installCodex(opts = {}, { env = process.env, flags = {} } = {}) 
   if (o.scope === 'project' && gitExclude) {
     const configExcludePattern = `/${gitExclude.prefix}.codex/config.toml`;
     const existingExcludeSt = plan.check(gitExclude.excludeFile);
-    const prevExcludeLines = existingExcludeSt
-      ? readManagedBlockLines(readFileSync(gitExclude.excludeFile, 'utf8'), BEGIN, END)
-      : [];
+    const old = existingExcludeSt ? readFileSync(gitExclude.excludeFile, 'utf8') : '';
+    const prevExcludeLines = readManagedBlockLines(old, BEGIN, END);
     const prevExcludedConfig = prevExcludeLines.includes(configExcludePattern);
-    const shouldExcludeConfig = projectCreatedConfig
+    const shouldExcludeConfig = !projectConfigIsTracked && (projectCreatedConfig
       || projectConfigIsManagedOnly
-      || (prevExcludedConfig && Boolean(projectConfigSt || o.withOauthMcp));
-    const excludePatterns = SKILLS.map((s) => `/${gitExclude.prefix}.agents/skills/${s}/`);
-    if (shouldExcludeConfig) excludePatterns.push(configExcludePattern);
-    mergeGitExclude(plan, gitExclude.excludeFile, excludePatterns);
+      || (prevExcludedConfig && Boolean(projectConfigSt || o.withOauthMcp)));
+    const excludePatterns = new Set(prevExcludeLines);
+    for (const skill of SKILLS) excludePatterns.add(`/${gitExclude.prefix}.agents/skills/${skill}/`);
+    if (shouldExcludeConfig) excludePatterns.add(configExcludePattern);
+    else excludePatterns.delete(configExcludePattern);
+    plan.write(gitExclude.excludeFile, spliceBlock(old, BEGIN, END, [...excludePatterns]).text);
   }
 
   plan.flush();

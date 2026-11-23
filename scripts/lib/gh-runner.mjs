@@ -2,7 +2,7 @@
 // Every `gh` / `git` call goes through an injectable `exec(cmd, args, {cwd, env, signal})` -> {code, stdout, stderr}, so tests use a fake.
 // This file never reads, prints or passes MEGALENS_TOKEN or any secret value. It only asks `gh secret list` for the NAME.
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +13,7 @@ export const WORKFLOW_FILE = 'megalens-dispatch.yml';
 export const WORKFLOW_PATH = `.github/workflows/${WORKFLOW_FILE}`;
 export const WORKFLOW_NAME = 'MegaLens Dispatch';
 export const ARTIFACT_NAME = 'megalens-findings';
+const RETRY_ARTIFACT_NAME = 'megalens-findings-retry';
 export const SECRET_NAME = 'MEGALENS_TOKEN';
 export const CHECK_NAME = 'MegaLens review';
 export const APP_INSTALL_URL = 'https://megalens.ai/app/start';
@@ -328,11 +329,11 @@ export async function isAppInstalled(opts) {
  *   2. Else the user's GitHub Actions runner when `.github/workflows/megalens-dispatch.yml` is present;
  *   3. Else `none` with one clear setup line.
  */
-export async function detectRemoteRunner({ exec, cwd, env, signal = null }) {
+export async function detectRemoteRunner({ exec, cwd, env, signal = null, reportSetupErrors = false }) {
   let repo;
   try { repo = await ghRepoPreflight({ exec, cwd, env, signal }); }
   catch (e) {
-    if (e instanceof SetupError) return { runner: 'none', message: MSG.notSetup };
+    if (e instanceof SetupError) return { runner: 'none', message: reportSetupErrors ? e.message : MSG.notSetup };
     throw e;
   }
   const { nwo, defaultBranch } = repo;
@@ -593,24 +594,42 @@ export async function runnerResult(ctx, rawId, { showId = true } = {}) {
   }
   const dir = mkdtempSync(path.join(tmpdir(), 'megalens-'), { mode: 0o700 });
   try {
-    const d = await ctx.exec('gh', scoped(['run', 'download', id, '-n', ARTIFACT_NAME, '-D', dir], nwo), { cwd: ctx.cwd, env: ghEnv(ctx.env), signal: ctx.signal ?? null });
-    if (d.aborted || ctx.signal?.aborted) return { text: '', code: 4, aborted: true };
     let doc = null;
-    const file = path.join(dir, 'findings.json');
-    if (d.code === 0) { try { if (statSync(file).size <= MAX_FINDINGS) doc = JSON.parse(readFileSync(file, 'utf8')); } catch { doc = null; } }
-    const valid = doc && typeof doc === 'object' && doc.schema === 'megalens.findings/v1' && Array.isArray(doc.findings);
-    const passes = valid && Array.isArray(doc.passes) ? doc.passes : [];
-    const eff = valid ? effectiveStatus(doc, passes, passes.filter((p) => p && p.status === 'failed'), state === 'done' ? 0 : 4) : 'failed';
-    const ok = state === 'done' && valid && eff !== 'failed';
+    let stderrText = '';
+    for (const artifact of [ARTIFACT_NAME, RETRY_ARTIFACT_NAME]) {
+      if (ctx.signal?.aborted) return { text: '', code: 4, aborted: true };
+      const dest = path.join(dir, artifact);
+      mkdirSync(dest);
+      const result = await ctx.exec('gh', scoped(['run', 'download', id, '-n', artifact, '-D', dest], nwo), {
+        cwd: ctx.cwd, env: ghEnv(ctx.env), signal: ctx.signal ?? null,
+      });
+      if (result.aborted || ctx.signal?.aborted) return { text: '', code: 4, aborted: true };
+      stderrText ||= firstLine(result.stderr);
+      if (result.code !== 0) continue;
+      const file = path.join(dest, 'findings.json');
+      try {
+        const artifactFile = lstatSync(file);
+        if (!artifactFile.isFile() || artifactFile.size > MAX_FINDINGS) continue;
+        const candidate = JSON.parse(readFileSync(file, 'utf8'));
+        if (candidate?.schema === 'megalens.findings/v1' && Array.isArray(candidate.findings)) {
+          doc = candidate;
+          break;
+        }
+      } catch { /* Try the other artifact if this file is unavailable or invalid. */ }
+    }
+    const passes = Array.isArray(doc?.passes) ? doc.passes : [];
+    const eff = doc ? effectiveStatus(doc, passes, passes.filter((p) => p && p.status === 'failed'), state === 'done' ? 0 : 4) : 'failed';
+    const ok = state === 'done' && eff !== 'failed';
     const somethingWrong = !ok || eff !== 'complete';
     const text = scrub(renderResult(doc, {
       exit: state === 'done' ? 0 : 4,
-      stderrText: doc ? '' : firstLine(d.stderr) || `no ${ARTIFACT_NAME} artifact on that run (it may have expired or never been written)`,
+      stderrText: doc ? '' : stderrText || 'no readable MegaLens findings artifact on that run',
       showId: showId || somethingWrong,
     }), ctx.env);
     const url = String(v.j.url ?? '').slice(0, 300);
     const trailer = (showId || somethingWrong) ? `${somethingWrong && !showId ? `Review id: gh:${id}\n` : ''}Run: ${url}\n` : '';
-    return { text: `${text}${trailer}`, code: ok ? 0 : 4, doc };
+    const recovery = doc ? '' : 'Check the same run for delivery errors. Avoid starting a new review to retrieve these findings because that can incur another charge.\n';
+    return { text: `${text}${trailer}${recovery}`, code: ok ? 0 : 4, doc };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 

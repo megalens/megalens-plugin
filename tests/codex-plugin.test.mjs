@@ -343,6 +343,7 @@ test('codex review: auto-pick uses GitHub workflow when present (skipping disabl
   assert.equal(r.text.includes('gh:8001'), false);
   assert.equal(r.text.includes('/megalens:'), false);
   assert.equal(sc.calls.filter(({ args }) => args[0] === 'workflow' && args[1] === 'run').length, 1);
+  assert.equal(sc.calls.filter(({ args }) => args[0] === 'run' && args[1] === 'download').length, 1);
   // Zero App installation/check API calls while APP_PATH_ENABLED is false
   assert.equal(sc.calls.some(({ args }) => args.some((a) => /installations|check-runs/.test(a))), false);
 });
@@ -365,7 +366,59 @@ test('FIX 4: missing workflow keeps runner order, never falls back to local engi
   assert.match(r.text, /--runner github/);
   assert.match(r.text, /gh secret set MEGALENS_TOKEN/);
   assert.match(r.text, /zero-copy GitHub setup is blocked/i);
+  const explicit = await runCodex(['review', '--runner', 'github'], { exec: sc.exec, stateDir });
+  assert.equal(explicit.code, 4);
+  assert.match(explicit.text, /not on your default branch/);
+  assert.match(explicit.text, /workflow_dispatch:/);
+  assert.match(explicit.text, /secrets\.MEGALENS_TOKEN/);
   assert.equal(sc.calls.some(({ args }) => args[0] === 'workflow'), false);
+});
+
+test('first GitHub review reports missing gh login, then blocks a missing Actions credential without dispatching', async (t) => {
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'mlcodex-first-github-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const setup = makeScenario({ workflowPresent: true });
+  const login = await runCodex(['review'], {
+    stateDir,
+    exec: (cmd, args, opts) => cmd === 'gh' && args[0] === 'auth' ? bad() : setup.exec(cmd, args, opts),
+  });
+  assert.equal(login.code, 4);
+  assert.match(login.text, /^GitHub CLI .* is not logged in\./);
+
+  const missingSecret = (cmd, args, opts) => {
+    if (cmd === 'gh' && args[0] === 'secret') return ok('[]');
+    if (cmd === 'gh' && args.some((arg) => arg.endsWith('/organization-secrets'))) return bad('HTTP 404');
+    return setup.exec(cmd, args, opts);
+  };
+  for (const args of [['review'], ['review', '--runner', 'github']]) {
+    const blocked = await runCodex(args, { stateDir, exec: missingSecret });
+    assert.equal(blocked.code, 4);
+    assert.match(blocked.text, /repository secret MEGALENS_TOKEN is missing/);
+    assert.match(blocked.text, /zero-copy GitHub setup is blocked/i);
+    assert.match(blocked.text, /codex mcp login megalens/);
+    assert.doesNotMatch(blocked.text, /paste/i);
+  }
+  assert.equal(setup.calls.some(({ args }) => args[0] === 'workflow'), false);
+});
+
+test('findings can be retrieved from the same run after primary artifact upload fails', async (t) => {
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'mlcodex-upload-recovery-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const scenario = makeScenario({ workflowPresent: true });
+  const downloads = [];
+  const exec = (cmd, args, opts) => {
+    if (cmd === 'gh' && args[0] === 'run' && args[1] === 'download') {
+      const artifact = args[args.indexOf('-n') + 1];
+      downloads.push([args[2], artifact]);
+      if (artifact === 'megalens-findings') return bad('no valid artifacts found to download');
+    }
+    return scenario.exec(cmd, args, opts);
+  };
+  const review = await runCodex(['review'], { exec, stateDir });
+  assert.equal(review.code, 0, review.text);
+  assert.match(review.text, /Off-by-one tax discount/);
+  assert.deepEqual(downloads, [['8001', 'megalens-findings'], ['8001', 'megalens-findings-retry']]);
+  assert.equal(scenario.calls.filter(({ args }) => args[0] === 'workflow').length, 1);
 });
 
 test('FIX 5: forced artifact upload failure reports NOT COMPLETED with run URL and never claims clean', async (t) => {
@@ -395,14 +448,19 @@ test('FIX 5: forced artifact upload failure reports NOT COMPLETED with run URL a
   assert.equal(rRes.code, 4);
   assert.match(rRes.text, /## MegaLens review: NOT COMPLETED/);
   assert.match(rRes.text, /no valid artifacts found to download/i);
+  assert.match(rRes.text, /avoid starting a new review/i);
   assert.match(rRes.text, /https:\/\/github\.com\/acme\/codex-app\/actions\/runs\/8001/);
+  assert.equal(missingArtifact.calls.filter(({ args }) => args[0] === 'run' && args[1] === 'download').length, 2);
+  assert.equal(missingArtifact.calls.some(({ args }) => args[0] === 'workflow'), false);
 
   // Codex bundled workflow template includes transient upload retry while keeping pinned action SHAs
   const codexWf = readFileSync(path.join(CODEX_DIR, 'runtime', 'templates', 'megalens-dispatch.yml'), 'utf8');
   assert.match(codexWf, /id:\s*upload-findings/);
   assert.match(codexWf, /continue-on-error:\s*true/);
   assert.match(codexWf, /steps\.upload-findings\.outcome == 'failure'/);
-  assert.match(codexWf, /overwrite:\s*true/);
+  assert.match(codexWf, /id: retry-findings[\s\S]*name: megalens-findings-retry/);
+  assert.doesNotMatch(codexWf, /overwrite:\s*true/);
+  assert.match(codexWf, /name: \$\{\{ needs\.review\.outputs\.artifact_name \}\}/);
   assert.match(codexWf, /megalens\/review-action@950eb5f1eeff21008fcf585587b88fc83546cdcf/);
   assert.match(codexWf, /actions\/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02/);
 });
@@ -1068,6 +1126,101 @@ test('FIX 7: --with-oauth-mcp handles inline-table mcp_servers and skips existin
   assert.equal(baks.length, 1);
   assert.equal(statSync(baks[0]).mode & 0o777, 0o600);
   assert.equal(readFileSync(baks[0], 'utf8'), orig);
+});
+
+test('OAuth installation preserves marker text in a valid multiline TOML string', (t) => {
+  const home = mkdtempSync(path.join(tmpdir(), 'mlcodex-oauth-marker-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const codexHome = path.join(home, '.codex');
+  mkdirSync(codexHome);
+  const cfg = path.join(codexHome, 'config.toml');
+  const original = "developer_instructions = '''\n"
+    + '# >>> megalens-codex-plugin (managed block, safe to delete) >>>\n'
+    + 'Example managed block\n'
+    + '# <<< megalens-codex-plugin <<<\n'
+    + "'''\n";
+  writeFileSync(cfg, original);
+  const opts = { home, codexHome, withOauthMcp: true };
+  const context = { flags: { codexPlugin: true } };
+  assert.equal(installCodex(opts, context).code, 0);
+  const merged = readFileSync(cfg, 'utf8');
+  assert.ok(merged.startsWith(original));
+  assert.ok(hasTomlPath(merged, ['mcp_servers', 'megalens']));
+  assert.equal(installCodex(opts, context).code, 0);
+  assert.equal(readFileSync(cfg, 'utf8'), merged);
+});
+
+test('subdirectory installs keep the runner out of the whole checkout and preserve other installed scopes', (t) => {
+  const tmp = mkdtempSync(path.join(tmpdir(), 'mlcodex-nested-project-'));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  const repo = path.join(tmp, 'repo');
+  const home = path.join(tmp, 'profile');
+  const codexHome = path.join(repo, '.codex');
+  const project = path.join(repo, 'packages', 'service');
+  const second = path.join(repo, 'packages', '[other]');
+  const linkedCodexHome = path.join(tmp, 'profile-link');
+  mkdirSync(project, { recursive: true });
+  mkdirSync(second, { recursive: true });
+  mkdirSync(codexHome);
+  symlinkSync(codexHome, linkedCodexHome, 'dir');
+  execFileSync('git', ['init', '-q', repo]);
+  const context = { flags: { codexPlugin: true } };
+  assert.equal(installCodex({ scope: 'project', dir: project, home, codexHome }, context).code, 0);
+  assert.equal(installCodex({ scope: 'project', dir: second, home, codexHome: linkedCodexHome }, context).code, 0);
+  assert.equal(existsSync(path.join(codexHome, 'plugins')), false);
+  const runner = path.join(home, '.codex', 'plugins', 'megalens', 'scripts', 'codex-review.mjs');
+  for (const dir of [project, second]) {
+    const skill = readFileSync(path.join(dir, '.agents', 'skills', 'megalens-review', 'SKILL.md'), 'utf8');
+    assert.ok(skill.includes(runner));
+  }
+  assert.equal(execFileSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8' }), '');
+});
+
+test('project OAuth install keeps a tracked config unchanged and adds OAuth to the user profile', (t) => {
+  const tmp = mkdtempSync(path.join(tmpdir(), 'mlcodex-tracked-config-'));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  const repo = path.join(tmp, 'repo');
+  const home = path.join(tmp, 'profile');
+  const codexHome = path.join(home, '.codex');
+  const cfg = path.join(repo, '.codex', 'config.toml');
+  const original = 'approval_policy = "on-request"\n';
+  mkdirSync(path.dirname(cfg), { recursive: true });
+  writeFileSync(cfg, original);
+  execFileSync('git', ['init', '-q', repo]);
+  execFileSync('git', ['-C', repo, 'add', '.codex/config.toml']);
+  const status = () => execFileSync('git', ['-C', repo, 'status', '--porcelain'], { encoding: 'utf8' });
+  const before = status();
+  assert.equal(installCodex({ scope: 'project', dir: repo, home, codexHome, withOauthMcp: true },
+    { flags: { codexPlugin: true } }).code, 0);
+  assert.equal(readFileSync(cfg, 'utf8'), original);
+  assert.equal(status(), before);
+  assert.ok(hasTomlPath(readFileSync(path.join(codexHome, 'config.toml'), 'utf8'), ['mcp_servers', 'megalens']));
+});
+
+test('legacy upgrade keeps customer files in place and backs up removed plugin files byte for byte', (t) => {
+  const tmp = mkdtempSync(path.join(tmpdir(), 'mlcodex-legacy-data-'));
+  t.after(() => rmSync(tmp, { recursive: true, force: true }));
+  const home = path.join(tmp, 'profile');
+  const repo = path.join(tmp, 'repo');
+  const legacy = path.join(repo, '.codex', 'plugins', 'megalens');
+  const notes = path.join(legacy, 'local-review-notes.md');
+  const runner = path.join(legacy, 'scripts', 'codex-review.mjs');
+  const bytes = Buffer.from([0, 255, 10, 65]);
+  mkdirSync(path.dirname(runner), { recursive: true });
+  writeFileSync(runner, bytes);
+  writeFileSync(notes, 'customer notes\n');
+  execFileSync('git', ['init', '-q', repo]);
+  const context = { flags: { codexPlugin: true } };
+  assert.equal(installCodex({ scope: 'project', dir: repo, home }, context).code, 0);
+  assert.equal(existsSync(runner), false);
+  assert.ok(existsSync(notes));
+  assert.equal(readFileSync(notes, 'utf8'), 'customer notes\n');
+  const backup = walk(path.join(home, '.megalens', 'backups')).find((file) => file.endsWith('codex-review.mjs'));
+  assert.ok(backup);
+  assert.deepEqual(readFileSync(backup), bytes);
+  assert.equal(statSync(backup).mode & 0o777, 0o600);
+  assert.equal(installCodex({ scope: 'project', dir: repo, home }, context).code, 0);
+  assert.equal(readFileSync(notes, 'utf8'), 'customer notes\n');
 });
 
 test('FIX 1 + NEW HIGH: project-scoped install keeps runtime/opt-in out of repo, excludes skills in .git/info/exclude, and does not block default GitHub review', async (t) => {

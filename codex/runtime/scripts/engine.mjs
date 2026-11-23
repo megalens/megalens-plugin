@@ -373,7 +373,9 @@ export async function main(argv, {
     if (runnerFlag === 'app') return await runViaApp();
     if (runnerFlag === 'github') return await runViaGithub();
     if (runnerFlag === null) {
-      const detected = await prepare((callSignal) => detectRemoteRunner({ exec, cwd, env, signal: callSignal }));
+      const detected = await prepare((callSignal) => detectRemoteRunner({
+        exec, cwd, env, signal: callSignal, reportSetupErrors: flags.reportGitHubSetupErrors,
+      }));
       if (detected.runner === 'none') {
         sayExact(`${detected.message}\n`);
         return 4;
