@@ -285,10 +285,11 @@ function fakeBin(exit, stderr) {
   const d = mkdtempSync(path.join(tmpdir(), 'mlfake-')); const bin = path.join(d, 'megalens-review');
   writeFileSync(bin, `#!/usr/bin/env node\nprocess.stderr.write(${JSON.stringify(stderr)}+'\\n');process.exit(${exit});\n`); chmodSync(bin, 0o755); return bin;
 }
-async function viaMain(argv, { bin, exec, env: e = {}, timing = {} } = {}) {
+async function viaMain(argv, { bin, exec, fetch, env: e = {}, timing = {} } = {}) {
   const stateDir = mkdtempSync(path.join(tmpdir(), 'mlstate-'));
   let text = '';
-  const code = await main(argv, { exec, env: { PATH: process.env.PATH, HOME: stateDir, MEGALENS_STATE_DIR: stateDir, MEGALENS_TOKEN: TOKEN, GH_TOKEN: 'ghp_x', ...(bin ? { MEGALENS_REVIEW_BIN: bin } : {}), ...e }, cwd: stateDir, out: (s) => { text += s; }, err: () => {}, flags: { runnerTiming: { sleepMs: 1, tries: 2, ...timing } } });
+  const defaultFetch = async () => new Response(JSON.stringify({ installed: false, linked: false, notice_accepted: false, suspended: false }), { status: 200, headers: { 'content-type': 'application/json' } });
+  const code = await main(argv, { exec, fetch: fetch ?? defaultFetch, env: { PATH: process.env.PATH, HOME: stateDir, MEGALENS_STATE_DIR: stateDir, MEGALENS_TOKEN: TOKEN, GH_TOKEN: 'ghp_x', ...(bin ? { MEGALENS_REVIEW_BIN: bin } : {}), ...e }, cwd: stateDir, out: (s) => { text += s; }, err: () => {}, flags: { runnerTiming: { sleepMs: 1, tries: 2, ...timing } } });
   return { code, text };
 }
 const T = (tier = 'standard') => `MegaLens ${tier} ${B}..${H}`;
@@ -355,7 +356,7 @@ test('main: --runner github forces the runner on Linux; --runner local never tou
   const l = await viaMain(['review', 'standard', '--runner', 'local'], { exec: f2.exec, env: { MEGALENS_REVIEW_BIN: '/nonexistent/megalens-review' } });
   assert.equal(f2.calls.length, 0); assert.match(l.text, /not installed/);
   const bad1 = await viaMain(['review', '--runner', 'cloud'], { exec: f2.exec });
-  assert.match(bad1.text, /--runner needs github or local/);
+  assert.match(bad1.text, /--runner needs app, github or local/);
 });
 
 test('main: status and result take gh: ids; junk ids are refused; no secret value reaches gh or the output', async () => {

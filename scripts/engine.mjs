@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Front end for MegaLens reviews, used by /megalens:review, /megalens:status, /megalens:result.
 //   engine.mjs review [deep] (standard default; double exists but is off: DOUBLE_TIER_ENABLED)
-//              [--quiet] [--first-review FILE] [--base REF --head REF] [--runner github|local] [--wait|--no-wait]
+//              [--quiet] [--first-review FILE] [--base REF --head REF] [--runner app|github|local] [--wait|--no-wait]
 //   engine.mjs status [review-id]      engine.mjs result [review-id]
 //   engine.mjs first-review-write      (reads the host's review JSON on stdin, writes a clean 0600 file in a private folder, prints its path)
 // Prints text for the user. Never prints credentials.
@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  scrubExact, shouldFallBack, isSandboxPrecheckDoc, isRunnerId, isAppId, APP_PATH_ENABLED,
+  scrubExact, shouldFallBack, isSandboxPrecheckDoc, isRunnerId, isAppId, APP_PATH_ENABLED, ghEnv,
   detectRemoteRunner, appReview, appStatus, appResult,
   runnerReview, runnerStatus, runnerResult, findLatestRemoteReview, realExec, MSG,
 } from './lib/gh-runner.mjs';
@@ -218,8 +218,10 @@ export async function main(argv, {
   stdin = () => readStdin(),
   flags = {},
   exec = realExec,
+  fetch = globalThis.fetch,
   signal = null,
 } = {}) {
+  const fetchImpl = flags.fetch ?? fetch;
   const [cmd, ...rest0] = argv;
   let rest = rest0; let runnerFlag = null;
   if (cmd === 'review') {
@@ -240,7 +242,7 @@ export async function main(argv, {
   const nowFn = timing.now ?? (() => Date.now());
   const sleepFn = timing.sleep ?? defaultSleep;
   const repoKeyPromise = (useExec = true, callSignal = signal) => resolveRepoKey({
-    exec: useExec ? exec : realExec, cwd, env, signal: callSignal,
+    exec: useExec ? exec : realExec, cwd, env: ghEnv(env), signal: callSignal,
   });
   const recordLatest = ({ id, runner, nwo = null, tier = 'standard', startedAt = null }, repoKey) => {
     return saveLatestReview({ env, repoKey, id, runner, nwo, tier, startedAt, now: nowFn });
@@ -292,9 +294,9 @@ export async function main(argv, {
         targetId = latest.id;
       }
       if (/^app:/.test(targetId)) {
-        if (!isAppId(targetId)) throw new UsageError('that is not a MegaLens App review id (they look like app:123456789)');
+        if (!isAppId(targetId)) throw new UsageError('that is not a MegaLens App review id (they look like app:00000000-0000-4000-8000-000000000001)');
         if (!APP_PATH_ENABLED) { sayExact(`${MSG.appDisabled}\n`); return 4; }
-        const r = await (cmd === 'status' ? appStatus : appResult)({ exec, cwd, env, signal }, targetId, { showId: explicitId });
+        const r = await (cmd === 'status' ? appStatus : appResult)({ exec, fetch: fetchImpl, cwd, env, signal }, targetId, { showId: explicitId });
         sayExact(r.text); return r.code;
       }
       if (/^gh:/.test(targetId)) {
@@ -351,10 +353,11 @@ export async function main(argv, {
       const repoKey = await prepare((callSignal) => repoKeyPromise(true, callSignal));
       let streamed = false;
       const r = await appReview({
-        exec, cwd, env, tier: o.tier, base: o.base, head: o.head, wait: o.wait,
+        exec, fetch: fetchImpl, cwd, env, tier: o.tier, base: o.base, head: o.head, wait: o.wait,
         ...timing, t0, signal, preRepo,
         onLine: (s) => { streamed = true; sayExact(s); },
         saveLatest: (rec) => saveLatestReview({ env, repoKey, ...rec, now: nowFn }),
+        loadLatest: () => loadLatestReview({ env, repoKey, nwo: preRepo?.nwo ?? null }),
       });
       if (!streamed) sayExact(r.text);
       return r.code;
@@ -376,12 +379,12 @@ export async function main(argv, {
     if (runnerFlag === 'app') return await runViaApp();
     if (runnerFlag === 'github') return await runViaGithub();
     if (runnerFlag === null) {
-      const detected = await prepare((callSignal) => detectRemoteRunner({ exec, cwd, env, signal: callSignal }));
+      const detected = await prepare((callSignal) => detectRemoteRunner({ exec, fetch: fetchImpl, cwd, env, signal: callSignal, needWorkflow: o.base !== null }));
       if (detected.runner === 'none') {
         sayExact(`${detected.message}\n`);
         return 4;
       }
-      if (detected.runner === 'app' && (!detected.hasWorkflow || (o.tier === 'standard' && o.base === null))) {
+      if (detected.runner === 'app' && (o.base === null || !detected.hasWorkflow)) {
         return await runViaApp(detected);
       }
       return await runViaGithub(detected);

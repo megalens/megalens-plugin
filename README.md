@@ -4,7 +4,10 @@ Independent code review for your changes inside Claude Code. One command starts 
 
 ## Quick start (2 steps)
 
-You need Node 18+, `git`, and the GitHub CLI (`gh auth login`). Set up the MegaLens GitHub Actions workflow on your repository's default branch. The App runner is disabled in this plugin until the server can verify installations and start reviews on request. [Workflow setup](#running-on-your-own-github-actions-runner)
+You need Node 18+ and `git`, plus either:
+
+* **MegaLens GitHub App (easiest):** install the App on your repository at https://megalens.ai/app/start and set your MegaLens sign-in token (`MEGALENS_TOKEN`) in your environment. (`gh auth login` is optional; when installed, it also lets MegaLens detect your open pull request automatically.)
+* **Or your own GitHub Actions runner:** set up the MegaLens workflow on your default branch with the GitHub CLI (`gh auth login`). [Workflow setup](#running-on-your-own-github-actions-runner)
 
 1. **Install the plugin.**
 
@@ -18,15 +21,15 @@ You need Node 18+, `git`, and the GitHub CLI (`gh auth login`). Set up the MegaL
    /megalens:review
    ```
 
-MegaLens starts the review on your GitHub Actions runner, prints progress while it runs, and shows the findings when it finishes. If the workflow is missing, the command prints one line.
+If the MegaLens GitHub App is installed on this repository, MegaLens starts the review on its review machine, shows short progress lines while it runs, and prints the findings right in the same answer. If the App is not installed, MegaLens uses your GitHub Actions workflow when present. If neither is set up, the command prints one line:
 
 ```text
-Copy the plugin's templates/megalens-dispatch.yml to .github/workflows/megalens-dispatch.yml on your repository's default branch and push the change, then run this again.
+Install the MegaLens GitHub App or add the workflow: https://megalens.ai/app/start
 ```
 
 Standard is the default tier. For a deeper pass, run `/megalens:review deep`.
 
-If you stop waiting or reach the 20 minute limit, MegaLens prints `Still running. Run /megalens:result to see it.` You can also run `/megalens:status` to check progress. Both commands use the saved review or a newer GitHub Actions review of your checked out commit. They show the commit range for GitHub Actions reviews.
+If you stop waiting or reach the 20 minute limit, MegaLens prints `Still running. Run /megalens:result to see it.` You can also run `/megalens:status` to check progress, or run `/megalens:review` again (MegaLens reuses your in-flight review for the same commit and tier instead of charging twice). Findings from GitHub App reviews stay available for 24 hours.
 
 MegaLens asks before pushing commits, reports partial or failed reviews as incomplete, and keeps tokens out of the output.
 
@@ -54,7 +57,7 @@ Read https://megalens.ai/privacy before reviewing code you do not own or that is
 npm test
 ```
 
-The tests cover runner selection, status and result without an ID, the 20 minute wait limit, the installer, the collector, the local MCP server, the engine front end and the GitHub runner. They use temporary repositories and simulated responses, with no network or model calls.
+The tests cover GitHub App on-demand reviews, runner selection, out-of-credits and failure handling, lost-reply deduplication, status and result without an ID, the 20 minute wait limit, the installer, the collector, the local MCP server, the engine front end and the GitHub Actions runner. They use temporary repositories and simulated responses, with no network or model calls.
 
 ---
 
@@ -62,11 +65,20 @@ The tests cover runner selection, status and result without an ID, the 20 minute
 
 ### Flags and explicit review ids
 
-* `/megalens:review --runner github|local` selects the GitHub Actions runner or the local engine.
-* `/megalens:review --base REF --head REF` reviews an explicit commit range.
+* `/megalens:review --runner app|github|local` selects the MegaLens GitHub App, your GitHub Actions runner, or the local engine.
+* `/megalens:review --base REF --head REF` reviews an explicit commit range (uses the GitHub Actions workflow or `--runner local`).
 * `/megalens:review --quiet` enables the engine's optional filter (off by default).
 * `/megalens:review --no-wait` starts the review without waiting in the same command.
-* `/megalens:status <id>` and `/megalens:result <id>` accept workflow IDs (`gh:<run-id>`) and local review IDs (`rv_<id>`).
+* `/megalens:status <id>` and `/megalens:result <id>` accept App job IDs (`app:<uuid>`), workflow IDs (`gh:<run-id>`), and local review IDs (`rv_<id>`).
+
+### MegaLens GitHub App details
+
+When `MEGALENS_TOKEN` is set, `/megalens:review` checks `GET /api/github-app/status?repo=<owner/name>`. If the App is installed, linked to your account, active, and its setup notice is accepted, MegaLens submits the review to `POST /api/github-app/review-now` (with your open non-draft pull request number when `gh` detects one on `HEAD`, or your pushed commit SHA otherwise) and polls `GET /api/github-app/review-now/<id>` until completion.
+
+* Only pushed commits are reviewed; uncommitted changes stop before anything starts.
+* One charge per review: re-running `/megalens:review` for the same commit and tier (or retrying after a lost network reply) reuses the in-flight or retained job.
+* Results stay stored on MegaLens for 24 hours.
+* `MEGALENS_API_URL` (optional, must be `https://` or loopback `http://127.0.0.1|localhost`) overrides the MegaLens API origin for testing.
 
 ### Running on your own GitHub Actions runner
 

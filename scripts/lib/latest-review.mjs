@@ -1,4 +1,5 @@
-// Per-repo latest-review bookmark so `/megalens:result` and `/megalens:status` work with no id.
+// Per-repo latest-review bookmark so `/megalens:result` and `/megalens:status` work with no id,
+// and re-running `/megalens:review` can reuse an in-flight App job without starting a second review.
 // Stored outside the repository (under MEGALENS_STATE_DIR or ~/.megalens/plugin-state/latest-reviews.json),
 // owner-only (0700 dir, 0600 file), symlink-safe, and holds ONLY routing ids (never tokens or code).
 import { lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
@@ -6,9 +7,10 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { REVIEW_ID_RE } from './engine-core.mjs';
 
-export const APP_ID_RE = /^app:([1-9][0-9]{0,17})$/;
+export const APP_ID_RE = /^app:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 export const GH_ID_RE = /^gh:([1-9][0-9]{0,17})$/;
 const NWO_RE = /^[\w.-]+\/[\w.-]+$/;
+const SHA_RE = /^[0-9a-f]{40}$/i;
 const MAX_ENTRIES = 100;
 
 export const isAnyReviewId = (id) => typeof id === 'string' && (REVIEW_ID_RE.test(id) || GH_ID_RE.test(id) || APP_ID_RE.test(id));
@@ -45,7 +47,21 @@ export async function resolveRepoKey({ exec, cwd, env, signal = null }) {
   return path.resolve(cwd || '.');
 }
 
-export function saveLatestReview({ env = process.env, repoKey, id, runner, nwo = null, tier = 'standard', startedAt = null, now = () => Date.now() }) {
+const cleanSha = (v) => (typeof v === 'string' && SHA_RE.test(v) ? v.toLowerCase() : null);
+const cleanPr = (v) => (Number.isInteger(v) && v > 0 && v <= 2_147_483_647 ? v : null);
+
+export function saveLatestReview({
+  env = process.env,
+  repoKey,
+  id,
+  runner,
+  nwo = null,
+  tier = 'standard',
+  headSha = null,
+  prNumber = null,
+  startedAt = null,
+  now = () => Date.now(),
+}) {
   if (!repoKey || !isAnyReviewId(id)) return false;
   if (!['app', 'github', 'local'].includes(runner)) return false;
   const dir = stateDir(env);
@@ -60,13 +76,18 @@ export function saveLatestReview({ env = process.env, repoKey, id, runner, nwo =
       : (Number(now()) || Date.now());
     const previous = map[String(repoKey)];
     if (previous && isAnyReviewId(previous.id) && Number(previous.startedAt) > ts) return false;
-    map[String(repoKey)] = {
+    const rec = {
       id,
       runner,
       nwo: typeof nwo === 'string' && NWO_RE.test(nwo) ? nwo : null,
       tier: ['standard', 'deep', 'double'].includes(tier) ? tier : 'standard',
       startedAt: ts,
     };
+    const sha = cleanSha(headSha);
+    if (sha) rec.headSha = sha;
+    const pr = cleanPr(prNumber);
+    if (pr !== null) rec.prNumber = pr;
+    map[String(repoKey)] = rec;
     const entries = Object.entries(map)
       .filter(([, v]) => v && typeof v === 'object' && isAnyReviewId(v.id))
       .sort((a, b) => (Number(b[1].startedAt) || 0) - (Number(a[1].startedAt) || 0))
@@ -87,12 +108,24 @@ export function loadLatestReview({ env = process.env, repoKey, nwo = null }) {
   const pick = (rec) => {
     if (!rec || typeof rec !== 'object' || !isAnyReviewId(rec.id)) return null;
     if (!['app', 'github', 'local'].includes(rec.runner)) return null;
-    return { id: rec.id, runner: rec.runner, nwo: typeof rec.nwo === 'string' && NWO_RE.test(rec.nwo) ? rec.nwo : null, tier: rec.tier ?? 'standard', startedAt: Number(rec.startedAt) || 0 };
+    return {
+      id: rec.id,
+      runner: rec.runner,
+      nwo: typeof rec.nwo === 'string' && NWO_RE.test(rec.nwo) ? rec.nwo : null,
+      tier: rec.tier ?? 'standard',
+      headSha: cleanSha(rec.headSha),
+      prNumber: cleanPr(rec.prNumber),
+      startedAt: Number(rec.startedAt) || 0,
+    };
   };
   const hit = pick(exact);
   if (hit) return hit;
   if (nwo && NWO_RE.test(nwo)) {
-    const byNwo = Object.values(map).map(pick).filter((r) => r && r.nwo === nwo).sort((a, b) => b.startedAt - a.startedAt)[0];
+    const target = nwo.toLowerCase();
+    const byNwo = Object.values(map)
+      .map(pick)
+      .filter((r) => r && r.nwo && r.nwo.toLowerCase() === target)
+      .sort((a, b) => b.startedAt - a.startedAt)[0];
     if (byNwo) return byNwo;
   }
   return null;

@@ -9,7 +9,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, sym
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { checkAppInstallation, appReview, appResult, mapCheckState, findLatestRemoteReview, startRun, runnerReview, realExec, CHECK_NAME, WORKFLOW_PATH } from '../scripts/lib/gh-runner.mjs';
+import { APP_INSTALL_URL, appReview, appResult, checkAppStatus, mapAppJobState, findLatestRemoteReview, startRun, runnerReview, realExec, WORKFLOW_PATH } from '../scripts/lib/gh-runner.mjs';
 import { waitForReview, DEFAULT_WAIT_MS, STILL_RUNNING_LINE } from '../scripts/lib/wait-loop.mjs';
 import { saveLatestReview, loadLatestReview, stateFilePath } from '../scripts/lib/latest-review.mjs';
 import { secretContent } from '../scripts/lib/safety.mjs';
@@ -18,11 +18,16 @@ import { main, pickNewerReview } from '../scripts/engine.mjs';
 const H = 'a'.repeat(40);
 const B = 'b'.repeat(40);
 const TOKEN = 'ml_SECRETTOKEN1234567890';
+const APP_JOB = '00000000-0000-4000-8000-000000000001';
 const WORKFLOW_TITLE = `MegaLens standard ${B}..${H}`;
 const REVIEWED_LINE = 'Reviewed bbbbbbb..aaaaaaa';
-const SETUP_LINE = `Copy the plugin's templates/megalens-dispatch.yml to ${WORKFLOW_PATH} on your repository's default branch and push the change, then run this again.`;
+const SETUP_LINE = `Install the MegaLens GitHub App or add the workflow: ${APP_INSTALL_URL}`;
 const ok = (stdout = '') => ({ code: 0, stdout, stderr: '' });
 const bad = (stderr = 'err', code = 1) => ({ code, stdout: '', stderr });
+const jsonRes = (status, body, headers = {}) => new Response(JSON.stringify(body), {
+  status,
+  headers: { 'content-type': 'application/json', ...headers },
+});
 
 function fakeClock() {
   let t = 1_700_000_000_000;
@@ -51,20 +56,46 @@ function makeDoc(extra = {}) {
   };
 }
 
-function makeAppCheckRun(overrides = {}) {
+function makeAppJob(overrides = {}) {
   return {
-    id: 55501,
-    name: CHECK_NAME,
-    status: 'completed',
-    conclusion: 'neutral',
-    html_url: 'https://github.com/acme/widget/runs/55501',
-    app: { slug: 'megalens' },
-    output: {
-      title: '1 strong finding, 1 in total',
-      summary: '### Strong findings\n- **P1** `total.js:3`: Adds instead of multiplying',
-    },
+    job_id: APP_JOB,
+    status: 'done',
+    reason: null,
+    result_status: 'complete',
+    tier: 'standard',
+    head_sha: H,
+    pr_url: null,
+    check_url: 'https://github.com/acme/widget/runs/55501',
+    findings: makeDoc(),
     ...overrides,
   };
+}
+
+function makeAppFetch({
+  installed = false,
+  linked = installed,
+  noticeAccepted = installed,
+  suspended = false,
+  pollSequence = [makeAppJob()],
+} = {}) {
+  let idx = 0;
+  const requests = [];
+  const fetch = async (url, init = {}) => {
+    const u = new URL(String(url));
+    const method = (init.method || 'GET').toUpperCase();
+    requests.push({ method, pathname: u.pathname, search: u.search, body: init.body ? JSON.parse(String(init.body)) : null });
+    if (method === 'GET' && u.pathname === '/api/github-app/status') {
+      return jsonRes(200, { installed, linked, notice_accepted: noticeAccepted, suspended });
+    }
+    if (method === 'POST' && u.pathname === '/api/github-app/review-now') {
+      return jsonRes(202, { job_id: APP_JOB, status_url: `/api/github-app/review-now/${APP_JOB}` });
+    }
+    if (method === 'GET' && u.pathname === `/api/github-app/review-now/${APP_JOB}`) {
+      return jsonRes(200, pollSequence[Math.min(idx++, pollSequence.length - 1)]);
+    }
+    return jsonRes(404, { error: 'not_found' });
+  };
+  return { fetch, requests };
 }
 
 /** Flexible fake gh + git for testing auto-pick, App reviews, GitHub runner reviews, and no-id result/status. */
@@ -148,11 +179,13 @@ function makeScenario({
   return { exec, calls };
 }
 
-async function runMain(argv, { exec, stateDir, cwd = '/repo-a', env = {}, timing = {}, signal = null, flags = {} } = {}) {
+async function runMain(argv, { exec, fetch, stateDir, cwd = '/repo-a', env = {}, timing = {}, signal = null, flags = {} } = {}) {
   const dir = stateDir ?? mkdtempSync(path.join(tmpdir(), 'mlone-'));
   let text = '';
+  const defaultFetch = makeAppFetch({ installed: false }).fetch;
   const code = await main(argv, {
     exec,
+    fetch: fetch ?? defaultFetch,
     cwd,
     env: { PATH: process.env.PATH, HOME: dir, MEGALENS_STATE_DIR: dir, GH_TOKEN: 'ghp_testtoken1234567890', ...env },
     out: (s) => { text += s; },
@@ -170,40 +203,35 @@ function appRequests({ calls }) {
     && args.some((a) => /(?:^|\/)(?:installations|check-runs|check-suites)(?:\/|$)/.test(a)));
 }
 
-test('auto-pick: dispatches the workflow once even when the App is installed or already has a check', async () => {
-  for (const app of [
-    {},
-    { orgInstallations: [{ id: 10, app_slug: 'megalens', repository_selection: 'all' }] },
-    { appChecks: [makeAppCheckRun()] },
-    { appChecks: [makeAppCheckRun({ status: 'in_progress', conclusion: null })] },
-    { appSuites: [{ app: { slug: 'megalens' }, status: 'queued' }] },
-  ]) {
-    const sc = makeScenario({ ...app, workflowPresent: true });
-    const r = await runMain(['review'], { exec: sc.exec });
-    assert.equal(r.code, 0);
-    assert.match(r.text, /Review started/);
-    assert.match(r.text, /## MegaLens standard review: complete/);
-    assert.match(r.text, /Adds instead of multiplying/);
-    assert.equal(r.text.includes('gh:9001'), false);
-    assert.equal(sc.calls.filter(({ args }) => args[0] === 'workflow' && args[1] === 'run').length, 1);
-    assert.deepEqual(appRequests(sc), []);
-    const workflowChecks = sc.calls.filter(({ args }) => args.some((arg) => arg.includes('/contents/')));
-    assert.equal(workflowChecks.length, 1);
-    assert.ok(workflowChecks[0].args.includes('ref=main'));
-  }
+test('auto-pick: prefers the installed MegaLens GitHub App over workflow, and falls back to workflow when App is not installed', async () => {
+  const scWithWf = makeScenario({ workflowPresent: true });
+  const appOn = makeAppFetch({ installed: true });
+  const rApp = await runMain(['review'], { exec: scWithWf.exec, fetch: appOn.fetch, env: { MEGALENS_TOKEN: TOKEN } });
+  assert.equal(rApp.code, 0);
+  assert.match(rApp.text, /Review started/);
+  assert.match(rApp.text, /## MegaLens standard review: complete/);
+  assert.match(rApp.text, /Adds instead of multiplying/);
+  assert.equal(rApp.text.includes(APP_JOB), false);
+  assert.equal(scWithWf.calls.filter(({ args }) => args[0] === 'workflow' && args[1] === 'run').length, 0);
+  assert.equal(appOn.requests.filter((x) => x.method === 'POST').length, 1);
+
+  const scFallback = makeScenario({ workflowPresent: true });
+  const appOff = makeAppFetch({ installed: false });
+  const rWf = await runMain(['review'], { exec: scFallback.exec, fetch: appOff.fetch, env: { MEGALENS_TOKEN: TOKEN } });
+  assert.equal(rWf.code, 0);
+  assert.match(rWf.text, /Review started/);
+  assert.match(rWf.text, /## MegaLens standard review: complete/);
+  assert.match(rWf.text, /Adds instead of multiplying/);
+  assert.equal(rWf.text.includes('gh:9001'), false);
+  assert.equal(scFallback.calls.filter(({ args }) => args[0] === 'workflow' && args[1] === 'run').length, 1);
+  assert.deepEqual(appRequests(scFallback), []);
 });
 
-test('auto-pick: prints the exact setup line when the workflow is missing, including App-only repos', async () => {
-  for (const app of [
-    {},
-    {
-      orgInstallations: [{ id: 10, app_slug: 'megalens', repository_selection: 'all' }],
-      appChecks: [makeAppCheckRun()],
-      appSuites: [{ app: { slug: 'megalens' }, status: 'queued' }],
-    },
-  ]) {
-    const sc = makeScenario(app);
-    const r = await runMain(['review'], { exec: sc.exec });
+test('auto-pick: prints the exact setup line when neither the App nor the workflow is configured', async () => {
+  for (const env of [{}, { MEGALENS_TOKEN: TOKEN }]) {
+    const sc = makeScenario({ workflowPresent: false });
+    const appOff = makeAppFetch({ installed: false });
+    const r = await runMain(['review'], { exec: sc.exec, fetch: appOff.fetch, env });
     assert.equal(r.code, 4);
     assert.equal(r.text, SETUP_LINE + '\n');
     assert.deepEqual(appRequests(sc), []);
@@ -248,17 +276,26 @@ test('auto-pick: Deep uses the configured workflow and prints the setup line whe
   assert.equal(r2.text, SETUP_LINE + '\n');
 });
 
-test('App runner and explicit App status and result are disabled before any GitHub calls', async () => {
-  const sc = makeScenario({ workflowPresent: true, appChecks: [makeAppCheckRun()] });
-  for (const argv of [['review', '--runner', 'app'], ['status', 'app:55501'], ['result', 'app:55501']]) {
-    const r = await runMain(argv, { exec: sc.exec });
-    assert.equal(r.code, 4);
-    assert.match(r.text, /GitHub App path is disabled/);
-  }
-  const invalid = await runMain(['result', 'app:bad;id'], { exec: sc.exec });
+test('App runner and explicit App status and result work with valid UUID ids and reject invalid ids before any calls', async () => {
+  const sc = makeScenario({ workflowPresent: true });
+  const appOn = makeAppFetch({ installed: true });
+  const rRev = await runMain(['review', '--runner', 'app'], { exec: sc.exec, fetch: appOn.fetch, env: { MEGALENS_TOKEN: TOKEN } });
+  assert.equal(rRev.code, 0);
+  assert.match(rRev.text, /## MegaLens standard review: complete/);
+
+  const rSt = await runMain(['status', `app:${APP_JOB}`], { exec: sc.exec, fetch: appOn.fetch, env: { MEGALENS_TOKEN: TOKEN } });
+  assert.equal(rSt.code, 0);
+  assert.match(rSt.text, new RegExp(`Review app:${APP_JOB}.*: done`));
+
+  const rRes = await runMain(['result', `app:${APP_JOB}`], { exec: sc.exec, fetch: appOn.fetch, env: { MEGALENS_TOKEN: TOKEN } });
+  assert.equal(rRes.code, 0);
+  assert.match(rRes.text, /Adds instead of multiplying/);
+
+  const scIdle = makeScenario();
+  const invalid = await runMain(['result', 'app:bad;id'], { exec: scIdle.exec });
   assert.equal(invalid.code, 4);
   assert.match(invalid.text, /not a MegaLens App review id/);
-  assert.deepEqual(sc.calls, []);
+  assert.deepEqual(scIdle.calls, []);
 });
 
 // ---- 2. Wait loop (fake clock) + progress lines + 20-minute cap + abort ----
@@ -368,33 +405,33 @@ test('end-to-end GitHub runner wait loop (fake clock): progress lines, inline re
   assert.match(rFail.text, /actions\/runs\/9001/);
 });
 
-test('App review helper wait loop (fake clock): waits for check run, prints progress and inline result, handles partial/failed safely', async () => {
+test('App review helper wait loop (fake clock): waits for job, prints progress and inline result, handles no_credits/partial safely', async () => {
   const clk = fakeClock();
-  const queuedCr = makeAppCheckRun({ status: 'queued', conclusion: null, output: { title: 'Waiting for the review machine', summary: '' } });
-  const runningCr = makeAppCheckRun({ status: 'in_progress', conclusion: null, output: { title: 'Reviewing', summary: '' } });
-  const doneCr = makeAppCheckRun({ status: 'completed', conclusion: 'neutral' });
-  const sc = makeScenario({
-    appChecks: [queuedCr],
-    checkRunSequence: [queuedCr, runningCr, ...Array.from({ length: 8 }, () => runningCr), doneCr],
+  const queuedJob = makeAppJob({ status: 'queued', result_status: null, findings: null });
+  const runningJob = makeAppJob({ status: 'running', result_status: null, findings: null });
+  const doneJob = makeAppJob();
+  const sc = makeScenario();
+  const appSrv = makeAppFetch({
+    installed: true,
+    pollSequence: [queuedJob, runningJob, ...Array.from({ length: 8 }, () => runningJob), doneJob],
   });
-  const r = await appReview({ exec: sc.exec, cwd: '/repo-a', env: {}, now: clk.now, sleep: clk.sleep });
+  const r = await appReview({ exec: sc.exec, fetch: appSrv.fetch, cwd: '/repo-a', env: { MEGALENS_TOKEN: TOKEN }, now: clk.now, sleep: clk.sleep });
   assert.equal(r.code, 0);
-  assert.match(r.text, /Following the GitHub App review/);
+  assert.match(r.text, /Review started/);
   assert.match(r.text, /Waiting for MegaLens review machine\.\.\./);
   assert.match(r.text, /Running on MegaLens\.\.\./);
   assert.match(r.text, /About 2 minutes so far/);
   assert.match(r.text, /## MegaLens standard review: complete/);
-  assert.equal(r.text.includes('app:55501'), false, 'no app id on clean completion');
+  assert.equal(r.text.includes(`app:${APP_JOB}`), false, 'no app id on clean completion');
 
-  // No-credits / failed App check run is never called clean and shows id
-  const noCreditsCr = makeAppCheckRun({ status: 'completed', conclusion: 'neutral', output: { title: 'No credits left', summary: 'Add credits at https://megalens.ai/app/settings/billing' } });
-  const scFail = makeScenario({ appChecks: [noCreditsCr] });
-  const rf = await appReview({ exec: scFail.exec, cwd: '/repo-a', env: {} });
+  // No-credits App job is never called clean
+  const noCreditsJob = makeAppJob({ status: 'no_credits', reason: 'insufficient_credits', result_status: null, findings: null });
+  const appFail = makeAppFetch({ installed: true, pollSequence: [noCreditsJob] });
+  const rf = await appReview({ exec: sc.exec, fetch: appFail.fetch, cwd: '/repo-a', env: { MEGALENS_TOKEN: TOKEN } });
   assert.equal(rf.code, 4);
   assert.match(rf.text, /NOT COMPLETED/);
-  assert.match(rf.text, /No credits left/);
-  assert.match(rf.text, /app:55501/);
-  assert.equal(mapCheckState(makeAppCheckRun({ status: 'completed', conclusion: 'neutral', output: { title: 'Review incomplete, 1 finding so far' } })), 'partial');
+  assert.match(rf.text, /out of credits/i);
+  assert.equal(mapAppJobState(makeAppJob({ status: 'done', result_status: 'partial' })), 'partial');
 });
 
 // ---- 3. Cap message + no-id /megalens:result and /megalens:status ----
@@ -493,9 +530,9 @@ test('latest-review bookmarks isolate different repos and refuse symlinks', () =
   const dir = mkdtempSync(path.join(tmpdir(), 'mliso-'));
   const env = { MEGALENS_STATE_DIR: dir };
   assert.equal(saveLatestReview({ env, repoKey: '/repo-one', id: 'gh:111', runner: 'github', nwo: 'a/one' }), true);
-  assert.equal(saveLatestReview({ env, repoKey: '/repo-two', id: 'app:222', runner: 'app', nwo: 'a/two' }), true);
+  assert.equal(saveLatestReview({ env, repoKey: '/repo-two', id: `app:${APP_JOB}`, runner: 'app', nwo: 'a/two' }), true);
   assert.equal(loadLatestReview({ env, repoKey: '/repo-one' }).id, 'gh:111');
-  assert.equal(loadLatestReview({ env, repoKey: '/repo-two' }).id, 'app:222');
+  assert.equal(loadLatestReview({ env, repoKey: '/repo-two' }).id, `app:${APP_JOB}`);
   assert.equal(loadLatestReview({ env, repoKey: '/repo-other' }), null);
 
   // Symlinked state dir is refused
@@ -565,22 +602,30 @@ test('README main path is 2 steps (install plugin, /megalens:review) with no --r
   assert.match(mainPath, /claude --plugin-dir/);
   assert.match(mainPath, /\/megalens:review/);
   assert.ok(mainPath.includes(SETUP_LINE));
-  assert.match(mainPath, /App runner is disabled/);
+  assert.match(mainPath, /MegaLens GitHub App/);
   assert.equal(mainPath.includes('--runner'), false, '--runner must not appear in README main path');
-  assert.equal(/gh:<|gh:\d+|rv_|app:<|app:\d+/.test(mainPath), false, 'review ids must not appear in README main path');
+  assert.equal(/gh:<|gh:\d+|rv_|app:<|app:\d+|app:[0-9a-f-]{36}/.test(mainPath), false, 'review ids must not appear in README main path');
 });
 
-test('secrets are scrubbed from App check summaries and never printed (including stateless ghs_APPID_JWT and publisher-truncated JWT tail)', async () => {
+test('secrets are scrubbed from App job findings and never printed (including stateless ghs_APPID_JWT and publisher-truncated JWT tail)', async () => {
   const jwtTok = 'ghs_123456_eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJnaXRodWIiLCJleHAiOjE3MDAwMDAwMDB9.SigPayload_ABC-123';
   const pubPartial = '[redacted].eyJpc3MiOiJnaXRodWItcHViIiwiZXhwIjoxNzAwMDAwMDAxfQ.PubTailSig_XYZ-789';
-  const leakyCr = makeAppCheckRun({
-    output: {
-      title: `1 strong finding, 1 in total (${TOKEN})`,
-      summary: `Line leaks ${TOKEN} and ghp_${'A'.repeat(36)} and ${jwtTok} and ${pubPartial}`,
-    },
+  const leakyJob = makeAppJob({
+    findings: makeDoc({
+      findings: [{
+        id: 'f1',
+        file: 'src/a.js',
+        line_start: 1,
+        title: `Leaks ${TOKEN}`,
+        claim: `Line leaks ${TOKEN} and ghp_${'A'.repeat(36)} and ${jwtTok} and ${pubPartial}`,
+        priority: 'P1',
+        strength: 'strong',
+        found_by: ['codex-standard'],
+      }],
+    }),
   });
-  const sc = makeScenario({ checkRunSequence: [leakyCr] });
-  const r = await appResult({ exec: sc.exec, cwd: '/repo-a', env: { MEGALENS_TOKEN: TOKEN } }, 'app:55501');
+  const srv = makeAppFetch({ installed: true, pollSequence: [leakyJob] });
+  const r = await appResult({ fetch: srv.fetch, cwd: '/repo-a', env: { MEGALENS_TOKEN: TOKEN } }, `app:${APP_JOB}`);
   assert.equal(r.code, 0);
   for (const leaked of [TOKEN, 'ghp_AAAA', 'ghs_123456', 'eyJhbGci', 'eyJpc3Mi', 'SigPayload_ABC', 'PubTailSig_XYZ']) {
     assert.equal(r.text.includes(leaked), false, `must not leak ${leaked}`);
@@ -590,22 +635,13 @@ test('secrets are scrubbed from App check summaries and never printed (including
 
 // ---- 5. Fix round tests (SOL.md findings 1–9) ----
 
-test('App installation helper requires live installation and repository access', async () => {
-  const lookup = (sc) => checkAppInstallation({ exec: sc.exec, cwd: '/repo-a', env: {}, nwo: 'acme/widget' });
-  const active = { id: 10, app_slug: 'megalens', repository_selection: 'all' };
-  assert.equal((await lookup(makeScenario({ orgInstallations: [active] }))).installed, true);
-  assert.equal((await lookup(makeScenario({ orgInstallations: [] }))).installed, false);
-  assert.equal((await lookup(makeScenario({ orgInstallations: [{ ...active, suspended_at: '2026-11-20T00:00:00Z' }] }))).installed, false);
-
-  const selected = { id: 22, app_slug: 'megalens', repository_selection: 'selected', account_login: 'acme' };
-  for (const [repo, expected] of [['acme/widget', true], ['acme/other-repo', false]]) {
-    const sc = makeScenario({ userInstallations: [selected], installRepos: { 22: [repo] } });
-    assert.equal((await lookup(sc)).installed, expected);
-  }
-
-  const inaccessible = makeScenario({ appChecks: [makeAppCheckRun()] });
-  assert.equal((await lookup(inaccessible)).installed, null);
-  assert.equal(inaccessible.calls.some(({ args }) => args.some((a) => a.endsWith('/check-runs'))), false);
+test('App installation helper checks GET /api/github-app/status and requires active, linked, notice-accepted installation', async () => {
+  const check = (opts) => checkAppStatus({ env: { MEGALENS_TOKEN: TOKEN }, nwo: 'acme/widget', fetch: makeAppFetch(opts).fetch });
+  assert.equal((await check({ installed: true, linked: true, noticeAccepted: true, suspended: false })).ready, true);
+  assert.equal((await check({ installed: false })).ready, false);
+  assert.equal((await check({ installed: true, suspended: true })).ready, false);
+  assert.equal((await check({ installed: true, noticeAccepted: false })).ready, false);
+  assert.equal((await check({ installed: true, linked: false })).ready, false);
 });
 
 test('auto-pick: Linux returns setup without invoking a configured local engine', async (t) => {
@@ -694,11 +730,10 @@ test('SOL-4: deadline & abort interrupt in-flight polls, result downloads, and r
   assert.ok(performance.now() - tExec < 1000, 'realExec must resolve promptly on abort');
 });
 
-test('no-id status and result prefer a newer workflow run and skip saved App reviews', async (t) => {
+test('no-id status and result pick the newer review between saved App bookmark and remote workflow run', async (t) => {
   const stateDir = mkdtempSync(path.join(tmpdir(), 'mlnewest-'));
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));
   const sc = makeScenario({
-    appChecks: [makeAppCheckRun({ started_at: '2026-11-23T11:00:00Z' })],
     existingRuns: [
       { databaseId: 9101, displayTitle: `Unrelated review ${B}..${H}`, createdAt: '2026-11-23T10:32:00Z' },
       { databaseId: 9100, displayTitle: `MegaLens deep invalid-base..${H}`, createdAt: '2026-11-23T10:31:00Z' },
@@ -707,42 +742,41 @@ test('no-id status and result prefer a newer workflow run and skip saved App rev
     ghRunSequence: [{ status: 'completed', conclusion: 'success', displayTitle: `MegaLens deep ${B}..${H}` }],
     downloadDoc: makeDoc({ tier: 'deep' }),
   });
-  for (const saved of [
-    { id: 'gh:100', runner: 'github', startedAt: Date.parse('2026-11-23T10:00:00Z') },
-    { id: 'app:55501', runner: 'app', startedAt: Date.parse('2026-11-23T11:00:00Z') },
-  ]) {
-    saveLatestReview({ env: { MEGALENS_STATE_DIR: stateDir }, repoKey: '/repo-a', ...saved });
-    const status = await runMain(['status'], { exec: sc.exec, stateDir });
-    assert.equal(status.code, 0);
-    assert.match(status.text, /Finished/);
-    assert.ok(status.text.split('\n').includes(REVIEWED_LINE));
-    const result = await runMain(['result'], { exec: sc.exec, stateDir });
-    assert.equal(result.code, 0);
-    assert.match(result.text, /MegaLens deep review: complete/);
-    assert.ok(result.text.split('\n').includes(REVIEWED_LINE));
-  }
-  const viewed = sc.calls.filter(({ args }) => args[0] === 'run' && args[1] === 'view');
-  assert.deepEqual(viewed.map(({ args }) => args[2]), ['9099', '9099', '9099', '9099']);
-  assert.deepEqual(appRequests(sc), []);
+  // Older workflow bookmark -> prefers newer remote workflow 9099
+  saveLatestReview({ env: { MEGALENS_STATE_DIR: stateDir }, repoKey: '/repo-a', id: 'gh:100', runner: 'github', startedAt: Date.parse('2026-11-23T10:00:00Z') });
+  const statusWf = await runMain(['status'], { exec: sc.exec, stateDir });
+  assert.equal(statusWf.code, 0);
+  assert.match(statusWf.text, /Finished/);
+  assert.ok(statusWf.text.split('\n').includes(REVIEWED_LINE));
+  const resultWf = await runMain(['result'], { exec: sc.exec, stateDir });
+  assert.equal(resultWf.code, 0);
+  assert.match(resultWf.text, /MegaLens deep review: complete/);
+  assert.ok(resultWf.text.split('\n').includes(REVIEWED_LINE));
 
-  const appOnly = makeScenario({ appChecks: [makeAppCheckRun()] });
-  const result = await runMain(['result'], { exec: appOnly.exec, stateDir });
-  assert.equal(result.code, 4);
-  assert.match(result.text, /No recent MegaLens review found/);
-  assert.deepEqual(appRequests(appOnly), []);
+  // Newer App bookmark -> prefers saved App review over older remote workflow 9099
+  saveLatestReview({ env: { MEGALENS_STATE_DIR: stateDir }, repoKey: '/repo-a', id: `app:${APP_JOB}`, runner: 'app', nwo: 'acme/widget', tier: 'standard', headSha: H, startedAt: Date.parse('2026-11-23T11:00:00Z') });
+  const appSrv = makeAppFetch({ installed: true, pollSequence: [makeAppJob(), makeAppJob()] });
+  const statusApp = await runMain(['status'], { exec: sc.exec, fetch: appSrv.fetch, stateDir, env: { MEGALENS_TOKEN: TOKEN } });
+  assert.equal(statusApp.code, 0);
+  assert.match(statusApp.text, /Finished/);
+  const resultApp = await runMain(['result'], { exec: sc.exec, fetch: appSrv.fetch, stateDir, env: { MEGALENS_TOKEN: TOKEN } });
+  assert.equal(resultApp.code, 0);
+  assert.match(resultApp.text, /MegaLens standard review: complete/);
+  assert.equal(resultApp.text.includes(APP_JOB), false);
 });
 
-test('explicit ranges dispatch through the workflow or show the setup line if it is missing', async () => {
+test('explicit ranges dispatch through the workflow (even when App is installed) or show the setup line if neither is configured', async () => {
   const argv = ['review', '--base', 'main', '--head', 'HEAD'];
   const withWf = makeScenario({ workflowPresent: true });
-  const review = await runMain(argv, { exec: withWf.exec });
+  const appOn = makeAppFetch({ installed: true });
+  const review = await runMain(argv, { exec: withWf.exec, fetch: appOn.fetch, env: { MEGALENS_TOKEN: TOKEN } });
   assert.equal(review.code, 0);
   assert.equal(withWf.calls.some(({ args }) => args[0] === 'workflow'), true);
-  const withoutWf = makeScenario({ appChecks: [makeAppCheckRun()] });
+  assert.equal(appOn.requests.some((x) => x.method === 'POST'), false);
+  const withoutWf = makeScenario({ workflowPresent: false });
   const missing = await runMain(argv, { exec: withoutWf.exec });
   assert.equal(missing.code, 4);
   assert.equal(missing.text, SETUP_LINE + '\n');
-  assert.deepEqual(appRequests(withoutWf), []);
 });
 
 test('SOL-7: commands/review.md sets 10-min Bash timeout and specifies background-task continuation without restarting', () => {
@@ -754,37 +788,28 @@ test('SOL-7: commands/review.md sets 10-min Bash timeout and specifies backgroun
   assert.match(md, /Still running\. Run \/megalens:result to see it\./);
 });
 
-test('SOL-9: successful App results strip publisher-embedded rv_ review IDs and HTML markers when showId is false', async () => {
-  const pubSummary = [
-    '<!-- megalens-review-summary:standard -->',
-    '<!-- megalens-review-meta:{"sha":"aaaaaaa","tier":"standard","status":"complete","ts":1700000000000} -->',
-    '### MegaLens static review of `aaaaaaa`',
-    '',
-    'Tier: `standard` · Review: `rv_pub98765`',
-    '',
-    '**Strong findings (1):**',
-    '- **P1** `total.js:3`: Adds instead of multiplying',
-  ].join('\n');
-  const pubCr = makeAppCheckRun({ output: { title: '1 strong finding, 1 in total', summary: pubSummary } });
-  const sc = makeScenario({ checkRunSequence: [pubCr] });
-
-  const r = await appResult({ exec: sc.exec, cwd: '/repo-a', env: {} }, 'app:55501', { showId: false });
+test('SOL-9: successful App results hide rv_ and app: review IDs when showId is false and keep them on explicit/partial results', async () => {
+  const srv = makeAppFetch({ installed: true, pollSequence: [makeAppJob(), makeAppJob()] });
+  const r = await appResult({ fetch: srv.fetch, cwd: '/repo-a', env: { MEGALENS_TOKEN: TOKEN } }, `app:${APP_JOB}`, { showId: false });
   assert.equal(r.code, 0);
   assert.match(r.text, /Adds instead of multiplying/);
-  assert.match(r.text, /Tier: `standard`/);
-  assert.equal(r.text.includes('rv_pub98765'), false, 'publisher rv_ id must be stripped on clean App result');
-  assert.equal(r.text.includes('<!-- megalens-review-'), false, 'HTML markers must be stripped');
+  assert.equal(r.text.includes('rv_abc12345'), false, 'rv_ id must not appear on clean App result');
+  assert.equal(r.text.includes(APP_JOB), false, 'app UUID must not appear on clean App result');
 
-  const rExplicit = await appResult({ exec: sc.exec, cwd: '/repo-a', env: {} }, 'app:55501');
+  const rExplicit = await appResult({ fetch: srv.fetch, cwd: '/repo-a', env: { MEGALENS_TOKEN: TOKEN } }, `app:${APP_JOB}`);
   assert.equal(rExplicit.code, 0);
-  assert.match(rExplicit.text, /rv_pub98765/);
+  assert.match(rExplicit.text, /rv_abc12345/);
+  assert.match(rExplicit.text, new RegExp(`app:${APP_JOB}`));
 
-  // Failed/partial check run keeps rv_pub98765 for debugging
-  const partialCr = makeAppCheckRun({ status: 'completed', conclusion: 'neutral', output: { title: 'Review incomplete, 1 finding so far', summary: pubSummary } });
-  const scPart = makeScenario({ checkRunSequence: [partialCr] });
-  const rPart = await appResult({ exec: scPart.exec, cwd: '/repo-a', env: {} }, 'app:55501', { showId: false });
+  const partialJob = makeAppJob({
+    status: 'done',
+    result_status: 'partial',
+    findings: makeDoc({ status: 'partial', passes: [{ name: 'a', status: 'ok' }, { name: 'b', status: 'failed' }] }),
+  });
+  const srvPart = makeAppFetch({ installed: true, pollSequence: [partialJob] });
+  const rPart = await appResult({ fetch: srvPart.fetch, cwd: '/repo-a', env: { MEGALENS_TOKEN: TOKEN } }, `app:${APP_JOB}`, { showId: false });
   assert.equal(rPart.code, 2);
-  assert.match(rPart.text, /rv_pub98765/);
+  assert.match(rPart.text, /rv_abc12345/);
 });
 
 // ---- 6. Loop-confirm round 2 tests (LOOP-CONFIRM1.md: SOL #2, #4, #5 + NEW #1, #2, #3) ----
@@ -1086,34 +1111,36 @@ setInterval(() => {}, 1000);
   assert.match(rStub.text, /force-stopped/);
 });
 
-test('LC2-SOL4: appReview bounds initial check-runs lookup by waitMs and never accepts an overtime check as complete', async () => {
-  let checkSignalAborted = false;
+test('LC2-SOL4: appReview bounds submit request by waitMs and never accepts an overtime submit as complete', async () => {
+  let submitSignalAborted = false;
   const tStart = performance.now();
   const res = await appReview({
     cwd: '/repo-a',
-    env: {},
-    preRepo: { nwo: 'acme/widget', defaultBranch: 'main' },
+    env: { MEGALENS_TOKEN: TOKEN },
+    preRepo: { nwo: 'acme/widget', defaultBranch: 'main', hasGh: true },
     waitMs: 15,
     now: () => performance.now(),
-    exec: async (cmd, args, opts) => {
+    exec: async (cmd, args) => {
       if (cmd === 'git' && args[0] === 'rev-parse') return ok(`${H}\n`);
       if (cmd === 'git' && args[0] === 'status') return ok('');
-      if (args.some((a) => a.endsWith('/check-runs'))) {
-        return await new Promise((resolve) => {
-          opts?.signal?.addEventListener('abort', () => { checkSignalAborted = true; }, { once: true });
-          const t = setTimeout(() => resolve(ok(JSON.stringify({ check_runs: [makeAppCheckRun({ id: 777, started_at: '2026-11-23T10:00:00Z' })] }))), 200);
-          t.unref?.();
-        });
-      }
+      if (cmd === 'gh' && args[0] === 'pr') return bad('no pr');
       if (args.some((a) => a === `repos/acme/widget/commits/${H}`)) return ok(`${H}\n`);
       return bad(`unexpected ${cmd} ${args.join(' ')}`);
     },
+    fetch: async (_url, init) => new Promise((resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => {
+        submitSignalAborted = true;
+        reject(new Error('aborted'));
+      }, { once: true });
+      const t = setTimeout(() => resolve(jsonRes(202, { job_id: APP_JOB, status_url: `/api/github-app/review-now/${APP_JOB}` })), 200);
+      t.unref?.();
+    }),
   });
   const elapsed = performance.now() - tStart;
   assert.equal(res.code, 4);
   assert.equal(res.timedOut, true);
-  assert.equal(checkSignalAborted, true, 'overtime initial check-runs call must be aborted');
-  assert.equal(res.text.includes('## MegaLens standard review: complete'), false, 'must never accept overtime check as complete');
+  assert.equal(submitSignalAborted, true, 'overtime submit request must be aborted');
+  assert.equal(res.text.includes('## MegaLens standard review: complete'), false, 'must never accept overtime submit as complete');
   assert.ok(elapsed < 180, `appReview should time out promptly around waitMs, took ${Math.round(elapsed)}ms`);
 });
 

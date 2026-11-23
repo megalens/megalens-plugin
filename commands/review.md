@@ -8,7 +8,7 @@ Run a MegaLens review of the current repository. Arguments given: `$ARGUMENTS`
 
 Run `node ${CLAUDE_PLUGIN_ROOT}/scripts/engine.mjs review $ARGUMENTS` (if `$ARGUMENTS` is empty, run `node ${CLAUDE_PLUGIN_ROOT}/scripts/engine.mjs review` with no extra words). Do not invent flags.
 
-Standard is the default tier. `deep` is the only optional word users need. The script starts the review on the user's GitHub Actions runner when the workflow is present, prints progress for up to 20 minutes, and shows the result inline. If the workflow is missing, relay only the setup line exactly as printed. Advanced flags (`--runner`, `--base REF --head REF`, `--quiet`, `--no-wait`) are passed through only when the user typed them. If the user asks for `double`, the script explains that the Double tier is unavailable and suggests Standard or Deep. Relay that response.
+Standard is the default tier. `deep` is the only optional word users need. When the MegaLens GitHub App is installed on this repository, the script starts the review on MegaLens; otherwise it uses the user's GitHub Actions workflow if present. It prints short progress lines for up to 20 minutes and shows the result inline in the same answer. If neither is set up, relay only the setup line exactly as printed. Advanced flags (`--runner`, `--base REF --head REF`, `--quiet`, `--no-wait`) are passed through only when the user typed them. If the user asks for `double`, the script explains that the Double tier is unavailable and suggests Standard or Deep. Relay that response.
 
 **Waiting for long reviews (up to 20 minutes):**
 - Pass the maximum foreground Bash timeout (`timeout: 600000`, 10 minutes) on the initial call so most Standard reviews finish in one foreground step without moving to the background.
