@@ -101,6 +101,7 @@ export async function waitForReview({
   startedLine = 'Review started',
   queuedLine = null,
   runningLine = 'Running on GitHub...',
+  stillRunningLine = STILL_RUNNING_LINE,
   waitMs = DEFAULT_WAIT_MS,
   pollMs = DEFAULT_POLL_MS,
   progressMs = DEFAULT_PROGRESS_MS,
@@ -133,7 +134,7 @@ export async function waitForReview({
     if (st === 'done' || st === 'complete' || st === 'partial' || st === 'failed' || st === 'cancelled' || st === 'error') {
       return { finished: true, timedOut: false, aborted: false, last };
     }
-    if (st !== lastState) {
+    if (st !== 'retry' && st !== lastState) {
       if (st === 'queued' && queuedLine) onLine(`${queuedLine}\n`);
       else if (st === 'running' && runningLine) onLine(`${runningLine}\n`);
       lastState = st;
@@ -148,12 +149,15 @@ export async function waitForReview({
     }
     const remaining = waitMs - elapsed;
     if (remaining <= 0 || signal?.aborted) break;
-    const slept = await raceWithDeadline((callSignal) => sleep(Math.min(pollMs, remaining), callSignal), {
+    const delayMs = (st === 'retry' && Number.isFinite(last?.retryAfterMs) && last.retryAfterMs > 0)
+      ? last.retryAfterMs
+      : pollMs;
+    const slept = await raceWithDeadline((callSignal) => sleep(Math.min(delayMs, remaining), callSignal), {
       signal, remainingMs: remaining, now, t0: start, waitMs,
     });
     if (slept.interrupted) break;
   }
 
-  onLine(`${STILL_RUNNING_LINE}\n`);
+  onLine(`${stillRunningLine}\n`);
   return { finished: false, timedOut: !signal?.aborted, aborted: Boolean(signal?.aborted), last };
 }

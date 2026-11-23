@@ -13,11 +13,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   scrubExact, shouldFallBack, isSandboxPrecheckDoc, isRunnerId, isAppId, APP_PATH_ENABLED, ghEnv,
-  detectRemoteRunner, appReview, appStatus, appResult,
+  extractAppToken, detectRemoteRunner, resolveMatchingAppBookmark, appReview, appStatus, appResult,
   runnerReview, runnerStatus, runnerResult, findLatestRemoteReview, realExec, MSG,
 } from './lib/gh-runner.mjs';
 import { DOUBLE_TIER_ENABLED, DOUBLE_OFF_MESSAGE, UsageError, parseReviewArgs, assertReviewId, chooseAuth, childEnv, scrub, normalizeFirstReview, renderResult, effectiveStatus } from './lib/engine-core.mjs';
-import { resolveRepoKey, saveLatestReview, loadLatestReview } from './lib/latest-review.mjs';
+import { resolveRepoKey, canSaveLatestReview, saveLatestReview, loadLatestReview } from './lib/latest-review.mjs';
 import { createStandardReview, isStandardReviewId, readStandardReview, saveStandardOutcome, writeStandardPid } from './lib/local-standard.mjs';
 import { DEFAULT_POLL_MS, DEFAULT_PROGRESS_MS, DEFAULT_WAIT_MS, STILL_RUNNING_LINE, defaultSleep, formatElapsed, raceWithDeadline, waitForReview } from './lib/wait-loop.mjs';
 
@@ -349,13 +349,14 @@ export async function main(argv, {
       return r.value;
     };
 
-    const runViaApp = async (preRepo = null) => {
-      const repoKey = await prepare((callSignal) => repoKeyPromise(true, callSignal));
+    const runViaApp = async (preRepo = null, { repoKey: existingKey = null, resumeAttempt = null } = {}) => {
+      const repoKey = existingKey ?? await prepare((callSignal) => repoKeyPromise(true, callSignal));
       let streamed = false;
       const r = await appReview({
         exec, fetch: fetchImpl, cwd, env, tier: o.tier, base: o.base, head: o.head, wait: o.wait,
-        ...timing, t0, signal, preRepo,
+        ...timing, t0, signal, preRepo, resumeAttempt,
         onLine: (s) => { streamed = true; sayExact(s); },
+        canSaveLatest: () => canSaveLatestReview({ env, repoKey }),
         saveLatest: (rec) => saveLatestReview({ env, repoKey, ...rec, now: nowFn }),
         loadLatest: () => loadLatestReview({ env, repoKey, nwo: preRepo?.nwo ?? null }),
       });
@@ -363,8 +364,8 @@ export async function main(argv, {
       return r.code;
     };
 
-    const runViaGithub = async (preRepo = null) => {
-      const repoKey = await prepare((callSignal) => repoKeyPromise(true, callSignal));
+    const runViaGithub = async (preRepo = null, { repoKey: existingKey = null } = {}) => {
+      const repoKey = existingKey ?? await prepare((callSignal) => repoKeyPromise(true, callSignal));
       let streamed = false;
       const r = await runnerReview({
         exec, cwd, env, tier: o.tier, base: o.base, head: o.head, wait: o.wait,
@@ -379,15 +380,51 @@ export async function main(argv, {
     if (runnerFlag === 'app') return await runViaApp();
     if (runnerFlag === 'github') return await runViaGithub();
     if (runnerFlag === null) {
+      let knownRepoKey = null;
+      if (APP_PATH_ENABLED && o.base === null && extractAppToken(env)) {
+        knownRepoKey = await prepare((callSignal) => repoKeyPromise(true, callSignal));
+        const saved = loadLatestReview({ env, repoKey: knownRepoKey });
+        if (saved && saved.runner === 'app' && isAppId(saved.id) && saved.tier === o.tier && saved.headSha) {
+          const check = await raceWithDeadline(
+            (callSignal) => resolveMatchingAppBookmark({
+              exec,
+              fetch: fetchImpl,
+              cwd,
+              env,
+              saved,
+              tier: o.tier,
+              head: o.head,
+              signal: callSignal,
+              saveLatest: (rec) => saveLatestReview({ env, repoKey: knownRepoKey, ...rec, now: nowFn }),
+            }),
+            { signal, remainingMs: remaining(), now: nowFn, t0, waitMs: capMs },
+          );
+          if (check.interrupted || check.value?.action === 'aborted') {
+            sayExact(`${STILL_RUNNING_LINE}\n`);
+            return 0;
+          }
+          if (check.value?.action === 'stop') {
+            sayExact(check.value.text);
+            return check.value.code;
+          }
+          if (check.value?.action === 'rendered') {
+            sayExact(check.value.text);
+            return check.value.code;
+          }
+          if (check.value?.action === 'resume') {
+            return await runViaApp(null, { repoKey: knownRepoKey, resumeAttempt: check.value.resumeAttempt });
+          }
+        }
+      }
       const detected = await prepare((callSignal) => detectRemoteRunner({ exec, fetch: fetchImpl, cwd, env, signal: callSignal, needWorkflow: o.base !== null }));
       if (detected.runner === 'none') {
         sayExact(`${detected.message}\n`);
         return 4;
       }
       if (detected.runner === 'app' && (o.base === null || !detected.hasWorkflow)) {
-        return await runViaApp(detected);
+        return await runViaApp(detected, { repoKey: knownRepoKey });
       }
-      return await runViaGithub(detected);
+      return await runViaGithub(detected, { repoKey: knownRepoKey });
     }
 
     // ---- local engine route (explicit --runner local) ----

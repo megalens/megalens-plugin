@@ -2,14 +2,14 @@
 //   GET /api/github-app/status, POST /api/github-app/review-now, GET /api/github-app/review-now/[id]
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   APP_BILLING_URL, APP_INSTALL_URL, APP_PATH_ENABLED, WORKFLOW_PATH,
-  appResult, appReview, appStatus, checkAppStatus, isAppId, parseGitHubRemote, resolveAppApiBase,
+  appResult, appReview, appStatus, checkAppStatus, extractAppToken, isAppId, parseGitHubRemote, resolveAppApiBase,
 } from '../scripts/lib/gh-runner.mjs';
-import { loadLatestReview, saveLatestReview, stateFilePath } from '../scripts/lib/latest-review.mjs';
+import { canSaveLatestReview, loadLatestReview, saveLatestReview, stateFilePath } from '../scripts/lib/latest-review.mjs';
 import { DEFAULT_WAIT_MS, STILL_RUNNING_LINE } from '../scripts/lib/wait-loop.mjs';
 import { main } from '../scripts/engine.mjs';
 
@@ -85,13 +85,14 @@ function jsonResp(status, body, headers = {}) {
 function makeGitGhExec({
   repoRoot = '/repo-app',
   nwo = 'acme/widget',
+  repoUrl = `https://github.com/${nwo}`,
   defaultBranch = 'main',
   hasGh = true,
   remoteUrl = `https://github.com/${nwo}.git`,
   workflowPresent = false,
   dirty = false,
   pushed = true,
-  openPr = null, // { number, state: 'OPEN', isDraft: false, headRefOid: H, isCrossRepository: false }
+  openPr = null, // { number, state: 'OPEN', isDraft: false, headRefOid: H, isCrossRepository: false, url }
   existingRuns = [],
   runsAfterDispatch = null,
 } = {}) {
@@ -103,7 +104,7 @@ function makeGitGhExec({
     if (cmd === 'gh' && !hasGh) return bad('gh: command not found', 127);
     if (k.startsWith('gh --version')) return ok('gh version 2.60.0');
     if (k.startsWith('gh auth')) return ok('Logged in');
-    if (k.startsWith('gh repo')) return ok(JSON.stringify({ nameWithOwner: nwo, defaultBranchRef: { name: defaultBranch }, url: `https://github.com/${nwo}` }));
+    if (k.startsWith('gh repo')) return ok(JSON.stringify({ nameWithOwner: nwo, defaultBranchRef: { name: defaultBranch }, url: repoUrl }));
     if (k.startsWith('gh pr')) return openPr ? ok(JSON.stringify(openPr)) : bad('no pull requests found for branch');
     if (k.startsWith('gh secret')) return ok(JSON.stringify([{ name: 'MEGALENS_TOKEN' }]));
     if (k.startsWith('gh api') && args.some((a) => a.includes('/contents/'))) return workflowPresent ? ok('file\n') : bad('HTTP 404');
@@ -239,7 +240,14 @@ test('App installed (deep + open PR): sends {repo, tier: "deep", pr} and renders
   const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-deep-'));
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));
   const gh = makeGitGhExec({
-    openPr: { number: 42, state: 'OPEN', isDraft: false, headRefOid: H, isCrossRepository: false },
+    openPr: {
+      number: 42,
+      state: 'OPEN',
+      isDraft: false,
+      headRefOid: H,
+      isCrossRepository: false,
+      url: 'https://github.com/acme/widget/pull/42',
+    },
   });
   const srv = makeAppServer({
     pollSequence: [makeJob({ tier: 'deep', pr_url: 'https://github.com/acme/widget/pull/42', findings: makeDoc({ tier: 'deep' }) })],
@@ -251,6 +259,10 @@ test('App installed (deep + open PR): sends {repo, tier: "deep", pr} and renders
   const post = srv.requests.find((x) => x.method === 'POST');
   assert.deepEqual(post.body, { repo: 'acme/widget', tier: 'deep', pr: 42 });
   assert.equal(r.text.includes(JOB1), false);
+  const prCall = gh.calls.find((c) => c.cmd === 'gh' && c.args[0] === 'pr');
+  assert.ok(prCall, 'expected gh pr view call');
+  assert.deepEqual(prCall.args.slice(0, 5), ['pr', 'view', 'feat/payments', '-R', 'github.com/acme/widget']);
+  assert.match(prCall.args.join(' '), /\burl\b/);
 });
 
 test('App installed without gh CLI installed: resolves owner/repo from git origin and runs App review', async (t) => {
@@ -458,7 +470,7 @@ test('One charge per review: lost POST reply retries once and reuses server dedu
   assert.match(rDown.text, /Could not confirm whether MegaLens started the review/);
   assert.match(rDown.text, /reuses an in-flight review/i);
 
-  // 409 review_finishing must NOT auto-retry into a second paid review
+  // 409 review_finishing must NOT auto-retry and must direct the user to GitHub without inviting a rerun
   let finishPosts = 0;
   const srvFinishing = makeAppServer({
     submitHandler: () => {
@@ -469,7 +481,10 @@ test('One charge per review: lost POST reply retries once and reuses server dedu
   const rFin = await runCli(['review'], { exec: gh.exec, fetch: srvFinishing.fetch, stateDir: stateDir2, timing: { now: clk.now, sleep: clk.sleep } });
   assert.equal(rFin.code, 4);
   assert.equal(finishPosts, 1);
-  assert.match(rFin.text, /finishing on GitHub right now/i);
+  assert.match(rFin.text, /already finishing on GitHub/i);
+  assert.match(rFin.text, new RegExp(`https://github\\.com/acme/widget/commit/${H}`));
+  assert.match(rFin.text, /do not run \/megalens:review again/i);
+  assert.equal(/or run \/megalens:review again in a moment/i.test(rFin.text), false);
 });
 
 test('Submit errors (429 daily_cap, 409 suspended/notice_required, 401 unauthorized, 422 target_unavailable) report plain messages', async (t) => {
@@ -496,25 +511,41 @@ test('Submit errors (429 daily_cap, 409 suspended/notice_required, 401 unauthori
   }
 });
 
-test('Token & URL security: refuses plain http non-loopback, refuses redirects, scrubs token everywhere', async (t) => {
+test('Token & URL security: origin pinned to https://megalens.ai (ignores env overrides), refuses redirects, scrubs token everywhere', async (t) => {
   const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-sec-'));
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));
 
-  assert.equal(resolveAppApiBase({}).origin, 'https://megalens.ai');
-  assert.equal(resolveAppApiBase({ MEGALENS_API_URL: 'https://staging.megalens.ai/api/v2' }).origin, 'https://staging.megalens.ai');
-  assert.equal(resolveAppApiBase({ MEGALENS_API_URL: 'http://127.0.0.1:3000/api/v2' }).origin, 'http://127.0.0.1:3000');
-  assert.match(resolveAppApiBase({ MEGALENS_API_URL: 'http://evil.example/api' }).error, /must be https/);
-  assert.match(resolveAppApiBase({ MEGALENS_API_URL: 'https://user:pass@megalens.ai' }).error, /credentials/);
+  // Finding 1: Production App client is pinned to https://megalens.ai regardless of MEGALENS_API_URL or MEGALENS_URL
+  for (const overrideEnv of [
+    {},
+    { MEGALENS_API_URL: 'https://attacker.example/api' },
+    { MEGALENS_URL: 'https://attacker.example/api/mcp' },
+    { MEGALENS_API_URL: 'http://127.0.0.1:3000/api/v2' },
+    { MEGALENS_API_URL: 'http://evil.example/api' },
+    { MEGALENS_API_URL: 'https://user:pass@megalens.ai' },
+  ]) {
+    assert.equal(resolveAppApiBase(overrideEnv).origin, 'https://megalens.ai');
+  }
 
-  // Plain http non-loopback makes ZERO fetch calls
-  let fetchCalled = false;
-  const stBadUrl = await checkAppStatus({
-    env: { MEGALENS_TOKEN: TOKEN, MEGALENS_API_URL: 'http://evil.example' },
-    nwo: 'acme/widget',
-    fetch: async () => { fetchCalled = true; return jsonResp(200, {}); },
+  // End-to-end review with project-injected MEGALENS_API_URL / MEGALENS_URL sends ZERO requests to attacker host
+  const gh = makeGitGhExec();
+  const seenUrls = [];
+  const srv = makeAppServer();
+  const spyFetch = async (url, init) => {
+    seenUrls.push(String(url));
+    return srv.fetch(url, init);
+  };
+  const rPinned = await runCli(['review'], {
+    exec: gh.exec,
+    fetch: spyFetch,
+    stateDir,
+    env: { MEGALENS_API_URL: 'https://attacker.example', MEGALENS_URL: 'https://attacker.example/api/mcp' },
   });
-  assert.equal(fetchCalled, false);
-  assert.equal(stBadUrl.state, 'bad_url');
+  assert.equal(rPinned.code, 0, rPinned.text);
+  assert.ok(seenUrls.length >= 3);
+  for (const u of seenUrls) {
+    assert.equal(new URL(u).origin, 'https://megalens.ai', `token must never be sent to ${u}`);
+  }
 
   // 302 redirect is refused without leaking token
   const stRedir = await checkAppStatus({
@@ -555,41 +586,387 @@ test('Token & URL security: refuses plain http non-loopback, refuses redirects, 
   assert.match(rLeaky.text, /Check: https:\/\/github\.com\/acme\/widget\/runs\/777/);
 });
 
-test('Transient 502 during poll retries GET once and keeps bookmark on repeated poll error', async (t) => {
-  const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-poll-'));
-  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+test('Finding 9: retryable polling respects Retry-After: 60 within 20-min cap, keeps waiting across transient errors, and hides internal IDs in no-flag output', async (t) => {
   const gh = makeGitGhExec();
 
-  // 1 transient 502 -> retries GET and completes cleanly (still only 1 POST)
+  // 1. 429 rate_limited with Retry-After: 60 waits full 60s (NOT 5s) and recovers cleanly within 20-min budget
+  const stateDir1 = mkdtempSync(path.join(tmpdir(), 'mlapp-poll429-'));
+  t.after(() => rmSync(stateDir1, { recursive: true, force: true }));
+  const clk1 = fakeClock();
   let polls1 = 0;
   const srv1 = makeAppServer({
-    pollHandler: () => (++polls1 === 1 ? jsonResp(502, { error: 'bad_gateway' }) : jsonResp(200, makeJob())),
+    pollHandler: () => {
+      polls1 += 1;
+      if (polls1 <= 2) return jsonResp(429, { error: 'rate_limited' }, { 'retry-after': '60' });
+      return jsonResp(200, makeJob());
+    },
   });
-  const r1 = await runCli(['review'], { exec: gh.exec, fetch: srv1.fetch, stateDir });
+  const r1 = await runCli(['review'], { exec: gh.exec, fetch: srv1.fetch, stateDir: stateDir1, timing: { now: clk1.now, sleep: clk1.sleep } });
   assert.equal(r1.code, 0, r1.text);
   assert.equal(srv1.requests.filter((x) => x.method === 'POST').length, 1);
+  assert.equal(polls1, 3);
+  assert.deepEqual(clk1.sleeps, [60_000, 60_000], 'must honour Retry-After: 60 instead of clamping to 5s');
   assert.match(r1.text, /Off-by-one in discount calculation/);
+  assert.equal(r1.text.includes(JOB1), false);
 
-  // 2 consecutive 502s -> fails wait, keeps bookmark so /megalens:result can recover
-  const stateDir2 = mkdtempSync(path.join(tmpdir(), 'mlapp-poll2-'));
+  // 2. Multiple consecutive 502s keep waiting with backoff and recover cleanly when API returns
+  const stateDir2 = mkdtempSync(path.join(tmpdir(), 'mlapp-poll502-'));
   t.after(() => rmSync(stateDir2, { recursive: true, force: true }));
+  const clk2 = fakeClock();
+  let polls2 = 0;
   const srv2 = makeAppServer({
-    pollHandler: () => jsonResp(502, { error: 'bad_gateway' }),
+    pollHandler: () => (++polls2 <= 4 ? jsonResp(502, { error: 'bad_gateway' }) : jsonResp(200, makeJob())),
   });
-  const r2 = await runCli(['review'], { exec: gh.exec, fetch: srv2.fetch, stateDir: stateDir2 });
-  assert.equal(r2.code, 4);
-  assert.equal(loadLatestReview({ env: { MEGALENS_STATE_DIR: stateDir2 }, repoKey: '/repo-app' })?.id, `app:${JOB1}`);
+  const r2 = await runCli(['review'], { exec: gh.exec, fetch: srv2.fetch, stateDir: stateDir2, timing: { now: clk2.now, sleep: clk2.sleep } });
+  assert.equal(r2.code, 0, r2.text);
+  assert.equal(polls2, 5);
+  assert.equal(r2.text.includes(JOB1), false);
 
-  // Explicit app: status on a newly saved bookmark when API recovers
-  const srvRecover = makeAppServer({ pollSequence: [makeJob({ status: 'done', result_status: 'complete' })] });
-  const rStatus = await appStatus({ env: { MEGALENS_TOKEN: TOKEN }, fetch: srvRecover.fetch }, `app:${JOB1}`, { showId: false });
-  assert.equal(rStatus.code, 0);
-  assert.match(rStatus.text, /Finished\. Run \/megalens:result to see it\./);
+  // 3. Persistent 502s wait through the full 20-min cap, keep bookmark, emit STILL_RUNNING_LINE, and hide UUID
+  const stateDir3 = mkdtempSync(path.join(tmpdir(), 'mlapp-pollcap-'));
+  t.after(() => rmSync(stateDir3, { recursive: true, force: true }));
+  const clk3 = fakeClock();
+  const srv3 = makeAppServer({ pollHandler: () => jsonResp(502, { error: 'bad_gateway' }) });
+  const r3 = await runCli(['review'], { exec: gh.exec, fetch: srv3.fetch, stateDir: stateDir3, timing: { now: clk3.now, sleep: clk3.sleep } });
+  assert.equal(r3.code, 0);
+  assert.equal(clk3.sleeps.reduce((a, b) => a + b, 0), DEFAULT_WAIT_MS);
+  assert.ok(r3.text.includes(STILL_RUNNING_LINE));
+  assert.equal(r3.text.includes(JOB1), false, 'must not expose App UUID on capped transient polling');
+  assert.equal(loadLatestReview({ env: { MEGALENS_STATE_DIR: stateDir3 }, repoKey: '/repo-app' })?.id, `app:${JOB1}`);
 
-  // Bookmark for different commit/tier does NOT reuse old job
-  saveLatestReview({ env: { MEGALENS_STATE_DIR: stateDir2 }, repoKey: '/repo-app', id: `app:${JOB2}`, runner: 'app', nwo: 'acme/widget', tier: 'deep', headSha: H });
+  // 4. Permanent 404 poll error stops immediately in no-flag mode without exposing App UUID
+  const stateDir4 = mkdtempSync(path.join(tmpdir(), 'mlapp-poll404-'));
+  t.after(() => rmSync(stateDir4, { recursive: true, force: true }));
+  const srv404 = makeAppServer({ pollHandler: () => jsonResp(404, { error: 'not_found' }) });
+  const r404 = await runCli(['review'], { exec: gh.exec, fetch: srv404.fetch, stateDir: stateDir4, timing: { pollMs: 1 } });
+  assert.equal(r404.code, 4);
+  assert.equal(r404.text.includes(JOB1), false, 'no-flag poll error must not expose App UUID');
+
+  // 5. Ordinary failed results (with or without findings doc, including publish_failed) hide app: and rv_ IDs in no-flag mode,
+  //    while explicit /megalens:result app:<uuid> keeps them for diagnostics
+  for (const failedJob of [
+    makeJob({ status: 'failed', reason: 'worker_lost', result_status: null, findings: null }),
+    makeJob({ status: 'failed', reason: 'publish_failed', result_status: null, findings: null }),
+    makeJob({ status: 'failed', reason: 'review_failed', result_status: 'failed', findings: makeDoc({ status: 'failed', passes: [{ name: 'codex-standard', status: 'failed', reason: 'crash' }] }) }),
+  ]) {
+    const srvF = makeAppServer({ pollSequence: [failedJob, failedJob] });
+    const noFlag = await appResult({ env: { MEGALENS_TOKEN: TOKEN }, fetch: srvF.fetch }, `app:${JOB1}`, { showId: false });
+    assert.equal(noFlag.code, 4);
+    assert.match(noFlag.text, /FAILED/);
+    assert.equal(noFlag.text.includes(JOB1), false, `no-flag failed output must hide app UUID for ${failedJob.reason}`);
+    assert.equal(noFlag.text.includes('rv_app12345'), false, `no-flag failed output must hide rv_ id for ${failedJob.reason}`);
+    if (failedJob.reason === 'publish_failed') {
+      assert.match(noFlag.text, /could not publish/i);
+      assert.equal(/nothing more was charged/i.test(noFlag.text), false);
+    }
+    const explicit = await appResult({ env: { MEGALENS_TOKEN: TOKEN }, fetch: srvF.fetch }, `app:${JOB1}`, { showId: true });
+    assert.equal(explicit.code, 4);
+    assert.match(explicit.text, new RegExp(`Review id: app:${JOB1}`));
+  }
+
+  // 6. Bookmark for different commit/tier does NOT reuse old job
+  saveLatestReview({ env: { MEGALENS_STATE_DIR: stateDir3 }, repoKey: '/repo-app', id: `app:${JOB2}`, runner: 'app', nwo: 'acme/widget', tier: 'deep', headSha: H });
   const srvNew = makeAppServer({ pollSequence: [makeJob({ tier: 'standard' })] });
-  const rStd = await runCli(['review'], { exec: gh.exec, fetch: srvNew.fetch, stateDir: stateDir2 });
+  const rStd = await runCli(['review'], { exec: gh.exec, fetch: srvNew.fetch, stateDir: stateDir3 });
   assert.equal(rStd.code, 0);
   assert.equal(srvNew.requests.filter((x) => x.method === 'POST').length, 1, 'different tier must submit fresh job');
+});
+
+test('Finding 2: lost PR reply never retries into a second billable job, and PR head drift rejects wrong-head result and fixes bookmark', async (t) => {
+  const H2 = 'c'.repeat(40);
+  const openPr = {
+    number: 42,
+    state: 'OPEN',
+    isDraft: false,
+    headRefOid: H,
+    isCrossRepository: false,
+    url: 'https://github.com/acme/widget/pull/42',
+  };
+
+  // 2a. Lost PR reply (network drop / 503): stops after 1 POST (even if teammate pushes H2) and points to PR on GitHub
+  const stateDir1 = mkdtempSync(path.join(tmpdir(), 'mlapp-prlost-'));
+  t.after(() => rmSync(stateDir1, { recursive: true, force: true }));
+  const gh1 = makeGitGhExec({ openPr });
+  let prPosts = 0;
+  const srvPrLost = makeAppServer({
+    submitHandler: () => {
+      prPosts += 1;
+      throw new Error('socket hang up');
+    },
+  });
+  const rLost = await runCli(['review'], { exec: gh1.exec, fetch: srvPrLost.fetch, stateDir: stateDir1 });
+  assert.equal(rLost.code, 4);
+  assert.equal(prPosts, 1, 'must NEVER retry a mutable PR submission after a lost reply');
+  assert.match(rLost.text, /do NOT start another one/i);
+  assert.match(rLost.text, /https:\/\/github\.com\/acme\/widget\/pull\/42/);
+
+  // 2b. PR head drift between preflight and server resolution: server returns JOB2 for H2;
+  //     CLI must NOT render H2 findings as a review of H1 and must bookmark JOB2 under H2 (not H1)
+  const stateDir2 = mkdtempSync(path.join(tmpdir(), 'mlapp-prdrift-'));
+  t.after(() => rmSync(stateDir2, { recursive: true, force: true }));
+  const gh2 = makeGitGhExec({ openPr });
+  const srvDrift = makeAppServer({
+    submitHandler: () => jsonResp(202, { job_id: JOB2, status_url: `/api/github-app/review-now/${JOB2}` }),
+    pollSequence: [makeJob({ job_id: JOB2, head_sha: H2, pr_url: 'https://github.com/acme/widget/pull/42' })],
+  });
+  const rDrift = await runCli(['review'], { exec: gh2.exec, fetch: srvDrift.fetch, stateDir: stateDir2 });
+  assert.equal(rDrift.code, 4);
+  assert.match(rDrift.text, /NOT COMPLETED/);
+  assert.match(rDrift.text, /Pull request #42 on GitHub moved to commit ccccccc/);
+  assert.equal(rDrift.text.includes('Off-by-one in discount calculation'), false, 'must never render wrong-head findings');
+  const savedAfterDrift = loadLatestReview({ env: { MEGALENS_STATE_DIR: stateDir2 }, repoKey: '/repo-app' });
+  assert.equal(savedAfterDrift?.id, `app:${JOB2}`);
+  assert.equal(savedAfterDrift?.headSha, H2, 'bookmark must record actual server head_sha, not stale local SHA');
+
+  // 2c. 409 review_finishing on PR directs user to the PR URL and warns against rerunning
+  const srvFinPr = makeAppServer({
+    submitHandler: () => jsonResp(409, { error: 'review_finishing' }, { 'retry-after': '2' }),
+  });
+  const stateDir3 = mkdtempSync(path.join(tmpdir(), 'mlapp-prfin-'));
+  t.after(() => rmSync(stateDir3, { recursive: true, force: true }));
+  const rFinPr = await runCli(['review'], { exec: gh2.exec, fetch: srvFinPr.fetch, stateDir: stateDir3 });
+  assert.equal(rFinPr.code, 4);
+  assert.match(rFinPr.text, /https:\/\/github\.com\/acme\/widget\/pull\/42/);
+  assert.match(rFinPr.text, /do not run \/megalens:review again/i);
+});
+
+test('Finding 3: App status 503 outage resumes matching App bookmark and never falls back to dispatch Actions', async (t) => {
+  // 3a. Both App and workflow configured: start App job -> cap -> rerun while /status returns 503.
+  //     Must read and resume JOB1 directly without touching Actions!
+  const stateDir1 = mkdtempSync(path.join(tmpdir(), 'mlapp-outage-resume-'));
+  t.after(() => rmSync(stateDir1, { recursive: true, force: true }));
+  const clk = fakeClock();
+  const gh1 = makeGitGhExec({ workflowPresent: true });
+  const srvStart = makeAppServer({
+    pollHandler: () => jsonResp(200, makeJob({ status: 'running', result_status: null, findings: null })),
+  });
+  const r1 = await runCli(['review'], { exec: gh1.exec, fetch: srvStart.fetch, stateDir: stateDir1, timing: { now: clk.now, sleep: clk.sleep } });
+  assert.equal(r1.code, 0);
+  assert.ok(r1.text.includes(STILL_RUNNING_LINE));
+
+  const gh2 = makeGitGhExec({ workflowPresent: true });
+  let reads = 0;
+  const srvOutage = makeAppServer({
+    statusHttp: 503,
+    statusResp: { error: 'unavailable' },
+    pollHandler: () => {
+      reads += 1;
+      return jsonResp(200, reads === 1 ? makeJob({ status: 'running', result_status: null, findings: null }) : makeJob());
+    },
+  });
+  const r2 = await runCli(['review'], { exec: gh2.exec, fetch: srvOutage.fetch, stateDir: stateDir1, timing: { pollMs: 1 } });
+  assert.equal(r2.code, 0, r2.text);
+  assert.ok(reads >= 2, 'must read the saved App job directly before runner selection');
+  assert.equal(srvOutage.requests.some((x) => x.method === 'POST'), false, 'zero second POST');
+  assert.equal(gh2.calls.some((c) => c.args[0] === 'workflow'), false, 'must NEVER dispatch Actions during App status 503');
+  assert.match(r2.text, /Off-by-one in discount calculation/);
+
+  // 3b. Both App and workflow configured, NO bookmark yet, /status returns 503 -> stops cleanly, ZERO workflow dispatch
+  const stateDir2 = mkdtempSync(path.join(tmpdir(), 'mlapp-outage-fresh-'));
+  t.after(() => rmSync(stateDir2, { recursive: true, force: true }));
+  const gh3 = makeGitGhExec({ workflowPresent: true });
+  const srv503 = makeAppServer({ statusHttp: 503, statusResp: { error: 'unavailable' } });
+  const r3 = await runCli(['review'], { exec: gh3.exec, fetch: srv503.fetch, stateDir: stateDir2 });
+  assert.equal(r3.code, 4);
+  assert.match(r3.text, /Could not reach MegaLens to check GitHub App status/);
+  assert.equal(gh3.calls.some((c) => c.args[0] === 'workflow'), false, 'transient 503 is not a definitive fallback signal');
+
+  // 3c. Matching App bookmark exists AND GET /review-now/<id> returns 503 -> stops cleanly, ZERO workflow dispatch and ZERO POST
+  const gh4 = makeGitGhExec({ workflowPresent: true });
+  const srvJob503 = makeAppServer({
+    statusHttp: 503,
+    statusResp: { error: 'unavailable' },
+    pollHandler: () => jsonResp(503, { error: 'unavailable' }),
+  });
+  const r4 = await runCli(['review'], { exec: gh4.exec, fetch: srvJob503.fetch, stateDir: stateDir1 });
+  assert.equal(r4.code, 4);
+  assert.equal(gh4.calls.some((c) => c.args[0] === 'workflow'), false);
+  assert.equal(srvJob503.requests.some((x) => x.method === 'POST'), false);
+  assert.equal(r4.text.includes(JOB1), false);
+});
+
+test('Finding 5: browser sign-in credential in user ~/.claude.json connects /megalens:review with empty shell env', async (t) => {
+  const homeDir = mkdtempSync(path.join(tmpdir(), 'mlapp-claude-home-'));
+  const customCfgDir = mkdtempSync(path.join(tmpdir(), 'mlapp-claude-cfg-'));
+  t.after(() => {
+    rmSync(homeDir, { recursive: true, force: true });
+    rmSync(customCfgDir, { recursive: true, force: true });
+  });
+  const browserTok = 'ml_tok_' + 'a'.repeat(32);
+  writeFileSync(path.join(homeDir, '.claude.json'), JSON.stringify({
+    mcpServers: {
+      megalens: {
+        type: 'http',
+        url: 'https://megalens.ai/api/mcp?ide=claude-code',
+        headers: { Authorization: `Bearer ${browserTok}` },
+      },
+    },
+  }), { mode: 0o600 });
+
+  // Empty shell env (no MEGALENS_TOKEN!) -> discovers browser sign-in token and runs App review
+  const gh = makeGitGhExec({ workflowPresent: true });
+  const srv = makeAppServer();
+  const r = await runCli(['review'], {
+    exec: gh.exec,
+    fetch: srv.fetch,
+    stateDir: homeDir,
+    env: { HOME: homeDir, MEGALENS_TOKEN: undefined },
+  });
+  assert.equal(r.code, 0, r.text);
+  assert.equal(srv.requests[0].headers.Authorization, `Bearer ${browserTok}`);
+  assert.equal(gh.calls.some((c) => c.args[0] === 'workflow'), false);
+  assert.equal(r.text.includes(browserTok), false);
+  for (const c of gh.calls) assert.equal(Object.values(c.env ?? {}).includes(browserTok), false);
+
+  // CLAUDE_CONFIG_DIR override works too
+  const customTok = 'ml_tok_' + 'b'.repeat(32);
+  writeFileSync(path.join(customCfgDir, '.claude.json'), JSON.stringify({
+    mcpServers: {
+      megalens: {
+        type: 'http',
+        url: 'https://megalens.ai/api/mcp?ide=claude-code',
+        headers: { authorization: `Bearer ${customTok}` },
+      },
+    },
+  }), { mode: 0o600 });
+  assert.equal(extractAppToken({ HOME: homeDir, CLAUDE_CONFIG_DIR: customCfgDir }), customTok);
+  // Relative CLAUDE_CONFIG_DIR (which could point inside a repository) is ignored in favor of HOME
+  assert.equal(extractAppToken({ HOME: homeDir, CLAUDE_CONFIG_DIR: './.evil-claude' }), browserTok);
+  // Explicit env MEGALENS_TOKEN takes precedence
+  assert.equal(extractAppToken({ HOME: homeDir, MEGALENS_TOKEN: TOKEN }), TOKEN);
+
+  // Foreign MCP URL in .claude.json is rejected (never extracts token for a non-megalens.ai server)
+  const foreignDir = mkdtempSync(path.join(tmpdir(), 'mlapp-foreign-'));
+  t.after(() => rmSync(foreignDir, { recursive: true, force: true }));
+  writeFileSync(path.join(foreignDir, '.claude.json'), JSON.stringify({
+    mcpServers: {
+      megalens: {
+        type: 'http',
+        url: 'https://evil.example/api/mcp',
+        headers: { Authorization: `Bearer ${browserTok}` },
+      },
+    },
+  }), { mode: 0o600 });
+  assert.equal(extractAppToken({ HOME: foreignDir }), '');
+});
+
+test('Finding 6: confirmed missing App setup without gh prints the App-or-workflow setup line (not gh install error)', async (t) => {
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-nogh-unlinked-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const gh = makeGitGhExec({ hasGh: false, remoteUrl: 'git@github.com:acme/widget.git' });
+  const srv = makeAppServer({
+    statusResp: { installed: false, linked: false, notice_accepted: false, suspended: false },
+  });
+  const r = await runCli(['review'], { exec: gh.exec, fetch: srv.fetch, stateDir });
+  assert.equal(r.code, 4);
+  assert.equal(r.text, `${SETUP_LINE}\n`);
+  assert.equal(r.text.includes('cli.github.com'), false);
+});
+
+test('Finding 7: GitHub Enterprise never selects the github.com App and PR discovery is bound to github.com/<nwo>', async (t) => {
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-ghe-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+
+  // 7a. Enterprise URL + no workflow -> ZERO App API calls, clear GHE message
+  const ghGheNoWf = makeGitGhExec({ repoUrl: 'https://ghe.corp.example/acme/widget', workflowPresent: false });
+  const srvGhe = makeAppServer();
+  const rNoWf = await runCli(['review'], { exec: ghGheNoWf.exec, fetch: srvGhe.fetch, stateDir });
+  assert.equal(rNoWf.code, 4);
+  assert.equal(srvGhe.requests.length, 0, 'Enterprise repo must NEVER call github.com App API');
+  assert.match(rNoWf.text, /github\.com/i);
+  assert.match(rNoWf.text, /ghe\.corp\.example/);
+
+  // 7b. Enterprise URL + workflow present -> uses GitHub Actions workflow, ZERO App API calls
+  const ghGheWf = makeGitGhExec({ repoUrl: 'https://ghe.corp.example/acme/widget', workflowPresent: true });
+  const execGheDl = async (cmd, args, opts) => {
+    if (cmd === 'gh' && args[0] === 'run' && args[1] === 'download') {
+      writeFileSync(path.join(args[args.indexOf('-D') + 1], 'findings.json'), JSON.stringify(makeDoc()));
+      return ok('');
+    }
+    return ghGheWf.exec(cmd, args, opts);
+  };
+  const rWf = await runCli(['review'], { exec: execGheDl, fetch: srvGhe.fetch, stateDir });
+  assert.equal(rWf.code, 0, rWf.text);
+  assert.equal(srvGhe.requests.length, 0);
+  assert.equal(ghGheWf.calls.some((c) => c.args[0] === 'workflow' && c.args[1] === 'run'), true);
+
+  // 7c. Explicit --runner app on Enterprise repo -> refused before any App API call
+  const rForced = await runCli(['review', '--runner', 'app'], { exec: ghGheNoWf.exec, fetch: srvGhe.fetch, stateDir });
+  assert.equal(rForced.code, 4);
+  assert.equal(srvGhe.requests.length, 0);
+  assert.match(rForced.text, /github\.com/i);
+
+  // 7d. PR discovery rejects a PR URL from another repo or Enterprise host and falls back to commit ref
+  for (const wrongPrUrl of ['https://github.com/upstream/widget/pull/42', 'https://ghe.corp.example/acme/widget/pull/42']) {
+    const dirPr = mkdtempSync(path.join(tmpdir(), 'mlapp-prbind-'));
+    t.after(() => rmSync(dirPr, { recursive: true, force: true }));
+    const ghWrongPr = makeGitGhExec({
+      openPr: { number: 42, state: 'OPEN', isDraft: false, headRefOid: H, isCrossRepository: false, url: wrongPrUrl },
+    });
+    const srvPr = makeAppServer();
+    const rPr = await runCli(['review'], { exec: ghWrongPr.exec, fetch: srvPr.fetch, stateDir: dirPr });
+    assert.equal(rPr.code, 0, rPr.text);
+    const post = srvPr.requests.find((x) => x.method === 'POST');
+    assert.deepEqual(post.body, { repo: 'acme/widget', tier: 'standard', ref: H }, `must reject PR URL ${wrongPrUrl}`);
+  }
+});
+
+test('Finding 8: unwritable/symlinked state dir stops before POST, and post-acceptance save failure gives explicit ID recovery path', async (t) => {
+  const gh = makeGitGhExec();
+
+  // 8a. Symlinked plugin-state dir stops BEFORE submitting any billable POST
+  const trapDir = mkdtempSync(path.join(tmpdir(), 'mlapp-trap-'));
+  const targetDir = mkdtempSync(path.join(tmpdir(), 'mlapp-target-'));
+  t.after(() => {
+    rmSync(trapDir, { recursive: true, force: true });
+    rmSync(targetDir, { recursive: true, force: true });
+  });
+  symlinkSync(targetDir, path.join(trapDir, 'plugin-state'));
+  assert.equal(canSaveLatestReview({ env: { MEGALENS_STATE_DIR: trapDir }, repoKey: '/repo-app' }), false);
+
+  const srvPre = makeAppServer();
+  const rPre = await runCli(['review'], { exec: gh.exec, fetch: srvPre.fetch, stateDir: trapDir });
+  assert.equal(rPre.code, 4);
+  assert.equal(srvPre.requests.some((x) => x.method === 'POST'), false, 'must NOT POST when bookmark cannot be saved');
+  assert.match(rPre.text, /Cannot save the local review bookmark.*Nothing was started/i);
+
+  // 8b. MEGALENS_STATE_DIR pointing to an existing regular file also stops before POST
+  const badStateFile = path.join(targetDir, 'not-a-dir');
+  writeFileSync(badStateFile, 'nope');
+  const srvFile = makeAppServer();
+  const rFile = await runCli(['review'], { exec: gh.exec, fetch: srvFile.fetch, stateDir: badStateFile });
+  assert.equal(rFile.code, 4);
+  assert.equal(srvFile.requests.some((x) => x.method === 'POST'), false);
+
+  // 8c. Post-acceptance saveLatest failure (e.g. disk full after POST accepted):
+  //     capped wait and --no-wait both print an accurate recovery command with app:<uuid> instead of broken no-ID /megalens:result
+  const clk = fakeClock();
+  const srvRunning = makeAppServer({
+    pollHandler: () => jsonResp(200, makeJob({ status: 'running', result_status: null, findings: null })),
+  });
+  const rCap = await appReview({
+    exec: gh.exec,
+    fetch: srvRunning.fetch,
+    cwd: '/repo-app',
+    env: { MEGALENS_TOKEN: TOKEN },
+    now: clk.now,
+    sleep: clk.sleep,
+    canSaveLatest: () => true,
+    saveLatest: () => false,
+  });
+  assert.equal(rCap.code, 0);
+  assert.equal(rCap.text.includes(STILL_RUNNING_LINE), false, 'must not promise broken no-ID /megalens:result when bookmark failed');
+  assert.match(rCap.text, new RegExp(`Could not save the local bookmark; run /megalens:result app:${JOB1} to see it\\.`));
+
+  const rNoWait = await appReview({
+    exec: gh.exec,
+    fetch: srvRunning.fetch,
+    cwd: '/repo-app',
+    env: { MEGALENS_TOKEN: TOKEN },
+    wait: false,
+    canSaveLatest: () => true,
+    saveLatest: () => false,
+  });
+  assert.equal(rNoWait.code, 0);
+  assert.match(rNoWait.text, new RegExp(`/megalens:result app:${JOB1}`));
 });

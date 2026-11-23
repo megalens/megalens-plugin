@@ -2,7 +2,7 @@
 // and re-running `/megalens:review` can reuse an in-flight App job without starting a second review.
 // Stored outside the repository (under MEGALENS_STATE_DIR or ~/.megalens/plugin-state/latest-reviews.json),
 // owner-only (0700 dir, 0600 file), symlink-safe, and holds ONLY routing ids (never tokens or code).
-import { lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { REVIEW_ID_RE } from './engine-core.mjs';
@@ -50,6 +50,29 @@ export async function resolveRepoKey({ exec, cwd, env, signal = null }) {
 const cleanSha = (v) => (typeof v === 'string' && SHA_RE.test(v) ? v.toLowerCase() : null);
 const cleanPr = (v) => (Number.isInteger(v) && v > 0 && v <= 2_147_483_647 ? v : null);
 
+/**
+ * Verify before starting a paid App review that the bookmark directory is writable and symlink-safe
+ * so `/megalens:result` can reliably recover the job if the wait is interrupted or capped.
+ */
+export function canSaveLatestReview({ env = process.env, repoKey } = {}) {
+  if (!repoKey) return false;
+  const dir = stateDir(env);
+  const file = stateFilePath(env);
+  let probe = null;
+  try {
+    if (isSymlink(dir)) return false;
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    if (isSymlink(dir) || isSymlink(file)) return false;
+    probe = `${file}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.probe`;
+    writeFileSync(probe, '', { mode: 0o600, flag: 'wx' });
+    unlinkSync(probe);
+    return true;
+  } catch {
+    if (probe) { try { unlinkSync(probe); } catch { /* ignore */ } }
+    return false;
+  }
+}
+
 export function saveLatestReview({
   env = process.env,
   repoKey,
@@ -75,13 +98,14 @@ export function saveLatestReview({
       ? startedAt
       : (Number(now()) || Date.now());
     const previous = map[String(repoKey)];
-    if (previous && isAnyReviewId(previous.id) && Number(previous.startedAt) > ts) return false;
+    if (previous && isAnyReviewId(previous.id) && previous.id !== id && Number(previous.startedAt) > ts) return false;
+    const effectiveTs = previous && previous.id === id ? Math.max(ts, Number(previous.startedAt) || 0) : ts;
     const rec = {
       id,
       runner,
       nwo: typeof nwo === 'string' && NWO_RE.test(nwo) ? nwo : null,
       tier: ['standard', 'deep', 'double'].includes(tier) ? tier : 'standard',
-      startedAt: ts,
+      startedAt: effectiveTs,
     };
     const sha = cleanSha(headSha);
     if (sha) rec.headSha = sha;

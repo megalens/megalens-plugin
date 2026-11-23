@@ -5,7 +5,7 @@
 // passed to `gh`/`git` subprocesses, never put in CLI args or URLs, never stored in bookmarks, and never printed.
 import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { effectiveStatus, renderResult, scrub } from './engine-core.mjs';
@@ -170,30 +170,69 @@ function parseTs(v) {
   return 0;
 }
 
-/** Read MEGALENS_TOKEN from env without accepting unexpanded placeholder strings. Never returns or logs secrets in errors. */
+const MAX_CLAUDE_CONFIG_BYTES = 5 * 1024 * 1024;
+const CLAUDE_BEARER_TOKEN_RE = /^Bearer\s+(ml_tok_[0-9a-f]{16,128})$/i;
+
+/**
+ * Resolve Claude Code's user-scoped MCP config path (matching `@megalens/mcp` browser sign-in):
+ * `$CLAUDE_CONFIG_DIR/.claude.json` when `CLAUDE_CONFIG_DIR` is set, otherwise `$HOME/.claude.json`.
+ * Never reads project/workspace `.mcp.json` or `.claude/settings.json`.
+ */
+export function resolveClaudeMcpConfigPath(env = {}) {
+  const custom = typeof env?.CLAUDE_CONFIG_DIR === 'string' ? env.CLAUDE_CONFIG_DIR.trim() : '';
+  if (custom && !custom.startsWith('${') && path.isAbsolute(custom)) return path.join(path.resolve(custom), '.claude.json');
+  const home = (typeof env?.HOME === 'string' && env.HOME.trim())
+    || (typeof env?.USERPROFILE === 'string' && env.USERPROFILE.trim())
+    || (env === process.env ? homedir() : '');
+  return home ? path.join(path.resolve(home), '.claude.json') : null;
+}
+
+/**
+ * Read a MegaLens bearer token stored by browser sign-in (`@megalens/mcp setup`) in Claude Code's
+ * user-scoped `.claude.json`. Accepts only entries pointing at `https://megalens.ai`.
+ */
+export function readClaudeMcpToken(env = {}) {
+  const file = resolveClaudeMcpConfigPath(env);
+  if (!file) return '';
+  try {
+    const st = statSync(file);
+    if (!st.isFile() || st.size <= 0 || st.size > MAX_CLAUDE_CONFIG_BYTES) return '';
+    const data = jsonOf(readFileSync(file, 'utf8'));
+    const entry = data?.mcpServers?.megalens;
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return '';
+    if (typeof entry.url !== 'string' || !entry.url.trim()) return '';
+    let u;
+    try { u = new URL(entry.url.trim()); } catch { return ''; }
+    if (u.origin !== DEFAULT_APP_ORIGIN) return '';
+    const headers = entry.headers;
+    if (!headers || typeof headers !== 'object' || Array.isArray(headers)) return '';
+    const authKey = Object.keys(headers).find((k) => k.toLowerCase() === 'authorization');
+    if (!authKey || typeof headers[authKey] !== 'string') return '';
+    const m = CLAUDE_BEARER_TOKEN_RE.exec(headers[authKey].trim());
+    return m ? m[1] : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Read the MegaLens bearer token from `MEGALENS_TOKEN` in env, or fall back to the trusted
+ * user-scoped Claude Code MCP config written by browser sign-in. Never accepts placeholders.
+ */
 export function extractAppToken(env = {}) {
   const v = typeof env?.MEGALENS_TOKEN === 'string' ? env.MEGALENS_TOKEN.trim() : '';
-  return v && !v.startsWith('${') ? v : '';
+  if (v && !v.startsWith('${')) return v;
+  return readClaudeMcpToken(env);
 }
 
 /**
  * Resolve the MegaLens API origin for the GitHub App endpoints.
- * The bearer token travels on every request, so only https URLs or loopback http (127.0.0.1, localhost, ::1) are accepted.
+ * Pinned unconditionally to `https://megalens.ai` so project settings (e.g. `.claude/settings.json`
+ * setting `MEGALENS_API_URL` or `MEGALENS_URL`) can never redirect the bearer token to another host.
+ * Tests use injected `fetch` transport instead of overriding the production origin.
  */
-export function resolveAppApiBase(env = {}) {
-  const raw = (typeof env?.MEGALENS_API_URL === 'string' && env.MEGALENS_API_URL.trim() && !env.MEGALENS_API_URL.startsWith('${'))
-    ? env.MEGALENS_API_URL.trim()
-    : ((typeof env?.MEGALENS_URL === 'string' && env.MEGALENS_URL.trim() && !env.MEGALENS_URL.startsWith('${'))
-      ? env.MEGALENS_URL.trim()
-      : '');
-  if (!raw) return { origin: DEFAULT_APP_ORIGIN };
-  let u;
-  try { u = new URL(raw); } catch { return { error: 'MEGALENS_API_URL is not a valid URL.' }; }
-  if (u.username || u.password) return { error: 'MEGALENS_API_URL must not contain credentials.' };
-  const host = u.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  const loopback = host === '127.0.0.1' || host === 'localhost' || host === '::1';
-  if (u.protocol === 'https:' || (u.protocol === 'http:' && loopback)) return { origin: u.origin };
-  return { error: 'MEGALENS_API_URL must be https, or http only for 127.0.0.1 / localhost. The sign-in token is not sent anywhere else.' };
+export function resolveAppApiBase() {
+  return { origin: DEFAULT_APP_ORIGIN };
 }
 
 /** Parse a GitHub owner/repo from a git remote URL (HTTPS or SSH). Returns null for non-GitHub URLs. */
@@ -301,6 +340,7 @@ async function appApiRequest({
   timeoutMs = APP_REQUEST_TIMEOUT_MS,
 }) {
   if (signal?.aborted) return { ok: false, aborted: true, retryable: false };
+  const scrubEnv = token ? { ...env, MEGALENS_TOKEN: token } : env;
   const url = `${origin}${pathname}`;
   const linked = linkedAbortSignal(signal, timeoutMs);
   try {
@@ -321,7 +361,7 @@ async function appApiRequest({
       if (signal?.aborted) return { ok: false, aborted: true, retryable: false };
       const msg = linked.isTimedOut()
         ? 'request to MegaLens timed out'
-        : scrubExact(oneLine(e?.message || 'network error', 200), env);
+        : scrubExact(oneLine(e?.message || 'network error', 200), scrubEnv);
       return { ok: false, status: 0, errorCode: null, retryable: true, networkError: msg };
     }
     if (res.status >= 300 && res.status < 400) {
@@ -339,7 +379,7 @@ async function appApiRequest({
       raw = await readBoundedResponseText(res, MAX_FINDINGS);
     } catch (e) {
       if (signal?.aborted) return { ok: false, aborted: true, retryable: false };
-      return { ok: false, status: res.status, errorCode: null, retryable: true, retryAfterSec, networkError: scrubExact(oneLine(e?.message || 'failed reading response', 200), env) };
+      return { ok: false, status: res.status, errorCode: null, retryable: true, retryAfterSec, networkError: scrubExact(oneLine(e?.message || 'failed reading response', 200), scrubEnv) };
     }
     if (raw === null) {
       return { ok: false, status: res.status, errorCode: 'response_too_large', retryable: false, networkError: 'MegaLens response exceeded the size limit.' };
@@ -375,11 +415,13 @@ export const MSG = {
     ? `Install the MegaLens GitHub App or add the workflow: ${APP_INSTALL_URL}`
     : `Copy the plugin's templates/${WORKFLOW_FILE} to ${WORKFLOW_PATH} on your repository's default branch and push the change, then run this again.`,
   appDisabled: 'The MegaLens GitHub App path is disabled in this plugin. Use the GitHub Actions workflow for /megalens:review.',
-  appNoToken: `MEGALENS_TOKEN is not set. Sign in to MegaLens, set MEGALENS_TOKEN, and restart Claude Code to use the GitHub App review path (or set it up at ${APP_INSTALL_URL}).`,
-  appUnauthorized: 'Your MegaLens sign-in token was rejected. Update MEGALENS_TOKEN and restart Claude Code, then run this again.',
+  appNoToken: `Not signed in to MegaLens. Run \`npx @megalens/mcp setup\` (browser sign-in) or set MEGALENS_TOKEN and restart Claude Code to use the GitHub App review path (or set it up at ${APP_INSTALL_URL}).`,
+  appUnauthorized: 'Your MegaLens sign-in token was rejected. Sign in again (`npx @megalens/mcp setup`) or update MEGALENS_TOKEN and restart Claude Code, then run this again.',
   appSuspended: `The MegaLens GitHub App installation for this repository is suspended on GitHub. Unsuspend it in GitHub settings, then run this again (or check ${APP_INSTALL_URL}).`,
   appNoticeRequired: `Finish MegaLens GitHub App setup to accept the review notice: ${APP_INSTALL_URL}`,
   appRangeUnsupported: `The MegaLens GitHub App reviews your open pull request or pushed commit rather than custom --base/--head ranges. Add ${WORKFLOW_PATH} (or pass --runner github / --runner local) to review an explicit range, or run /megalens:review without --base/--head.`,
+  appEnterpriseUnsupported: (host) => `The MegaLens GitHub App only supports github.com repositories${host ? ` (this repository is on ${host})` : ''}. Add ${WORKFLOW_PATH} to run on your GitHub Actions runner (--runner github) or use --runner local.`,
+  appBookmarkUnwritable: 'Cannot save the local review bookmark (the MegaLens state directory is unwritable or a symlink). Nothing was started and no credit was used. Fix permissions or MEGALENS_STATE_DIR, then run this again.',
 };
 
 export function workflowMissingMessage(branch) {
@@ -390,7 +432,7 @@ export function notPushedMessage(sha, branch) {
   return `NEEDS THE USER'S OK: your latest commit (${short(sha)}) is not on GitHub yet, and GitHub can only review what is on GitHub. Nothing was pushed. Ask the user: "Push ${branch || 'this branch'} to GitHub so it can be reviewed?" Only if the user says yes, run \`git push\` (if the branch has no upstream: \`git push -u origin HEAD\`), then run /megalens:review again. If the user says no, stop.\n`;
 }
 
-/** Verify gh is installed, logged in, and this folder has a GitHub repo. Returns {nwo, defaultBranch, hasGh: true} or throws SetupError. */
+/** Verify gh is installed, logged in, and this folder has a GitHub repo. Retains host so GitHub Enterprise repos are never sent to github.com's App. */
 async function ghRepoPreflight({ exec, cwd, env, signal = null }) {
   const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
   const v = await run('gh', ['--version']);
@@ -403,15 +445,35 @@ async function ghRepoPreflight({ exec, cwd, env, signal = null }) {
   if (!repo || typeof repo.nameWithOwner !== 'string' || !NWO_RE.test(repo.nameWithOwner) || typeof repo.defaultBranchRef?.name !== 'string') throw new SetupError(MSG.noRemote);
   const nwo = repo.nameWithOwner; const defaultBranch = repo.defaultBranchRef.name;
   if (!/^[\w./-]{1,100}$/.test(defaultBranch)) throw new SetupError(MSG.noRemote);
-  return { nwo, defaultBranch, hasGh: true };
+  const envHost = typeof env?.GH_HOST === 'string' && env.GH_HOST.trim() ? env.GH_HOST.trim().toLowerCase() : '';
+  let host = null;
+  let isGithubCom = false;
+  if (typeof repo.url === 'string' && repo.url.trim()) {
+    try {
+      const u = new URL(repo.url.trim());
+      host = u.hostname.toLowerCase();
+      const cleanPath = u.pathname.replace(/^\/+|\/+$/g, '').replace(/\.git$/i, '');
+      isGithubCom = u.protocol === 'https:'
+        && host === 'github.com'
+        && cleanPath.toLowerCase() === nwo.toLowerCase()
+        && (!envHost || envHost === 'github.com');
+    } catch {
+      host = null;
+      isGithubCom = false;
+    }
+  } else if (envHost) {
+    host = envHost;
+    isGithubCom = false;
+  }
+  return { nwo, defaultBranch, host, isGithubCom, hasGh: true };
 }
 
-/** Resolve owner/repo from `git remote get-url origin` when `gh` is unavailable (for App-only setups). */
+/** Resolve owner/repo from `git remote get-url origin` when `gh` is unavailable (for App-only setups on github.com). */
 async function gitRepoFallback({ exec, cwd, env, signal = null }) {
   const r = await exec('git', ['remote', 'get-url', 'origin'], { cwd, env: ghEnv(env), signal });
   if (r.code !== 0) return null;
   const nwo = parseGitHubRemote(r.stdout.trim());
-  return nwo ? { nwo, defaultBranch: null, hasGh: false } : null;
+  return nwo ? { nwo, defaultBranch: null, host: 'github.com', isGithubCom: true, hasGh: false } : null;
 }
 
 /** True when the dispatch workflow file is present on the default branch. */
@@ -491,6 +553,9 @@ export async function detectRemoteRunner({ exec, cwd, env, fetch = globalThis.fe
         if (appSt.state === 'ok' && appSt.installed && appSt.linked) {
           return { runner: 'none', message: appSt.suspended ? MSG.appSuspended : MSG.appNoticeRequired };
         }
+        if (appSt.state === 'ok') {
+          return { runner: 'none', message: MSG.notSetup };
+        }
         if (appSt.state === 'bad_url' || appSt.state === 'unauthorized' || appSt.state === 'error') {
           return { runner: 'none', message: appSt.error };
         }
@@ -499,9 +564,9 @@ export async function detectRemoteRunner({ exec, cwd, env, fetch = globalThis.fe
     return { runner: 'none', message: ghErr.message };
   }
 
-  const { nwo, defaultBranch } = repo;
+  const { nwo, defaultBranch, host, isGithubCom } = repo;
   let appSt = null;
-  if (APP_PATH_ENABLED && extractAppToken(env)) {
+  if (APP_PATH_ENABLED && isGithubCom && extractAppToken(env)) {
     appSt = await checkAppStatus({ env, nwo, fetch, signal });
     if (signal?.aborted || appSt.state === 'aborted') {
       return { runner: 'none', message: 'Interrupted before starting a review. Nothing was started by this command.' };
@@ -510,18 +575,25 @@ export async function detectRemoteRunner({ exec, cwd, env, fetch = globalThis.fe
       const hasWorkflow = needWorkflow
         ? await hasDispatchWorkflow({ exec, cwd, env, nwo, defaultBranch, signal })
         : false;
-      return { runner: 'app', nwo, defaultBranch, hasGh: true, hasWorkflow };
+      return { runner: 'app', nwo, defaultBranch, host, isGithubCom, hasGh: true, hasWorkflow };
+    }
+    // Require a definitive fallback signal (App uninstalled/unlinked or feature flag off/404) before checking Actions.
+    // A transient 503/429/network outage or auth/setup block on a linked repo must NEVER fall through to dispatch Actions.
+    const definitiveFallback = appSt.state === 'unavailable_flag'
+      || (appSt.state === 'ok' && (!appSt.installed || !appSt.linked));
+    if (!definitiveFallback) {
+      if (appSt.state === 'ok' && appSt.installed && appSt.linked) {
+        return { runner: 'none', message: appSt.suspended ? MSG.appSuspended : MSG.appNoticeRequired };
+      }
+      return { runner: 'none', message: appSt.error || MSG.notSetup };
     }
   }
 
   const hasWorkflow = await hasDispatchWorkflow({ exec, cwd, env, nwo, defaultBranch, signal });
-  if (hasWorkflow) return { runner: 'github', nwo, defaultBranch, hasGh: true, hasWorkflow: true };
+  if (hasWorkflow) return { runner: 'github', nwo, defaultBranch, host, isGithubCom, hasGh: true, hasWorkflow: true };
 
-  if (appSt?.state === 'ok' && appSt.installed && appSt.linked) {
-    return { runner: 'none', message: appSt.suspended ? MSG.appSuspended : MSG.appNoticeRequired };
-  }
-  if (appSt?.state === 'bad_url' || appSt?.state === 'unauthorized' || appSt?.state === 'error') {
-    return { runner: 'none', message: appSt.error };
+  if (!isGithubCom && host && host !== 'github.com') {
+    return { runner: 'none', message: MSG.appEnterpriseUnsupported(host) };
   }
   return { runner: 'none', message: MSG.notSetup };
 }
@@ -936,7 +1008,7 @@ export function mapAppJobState(job) {
   return 'failed';
 }
 
-function describeAppSubmitError(res, { repo }) {
+function describeAppSubmitError(res, { repo, prNumber = null, headSha = null }) {
   const code = res.errorCode;
   if (res.status === 401 || code === 'unauthorized') return MSG.appUnauthorized;
   if (res.status === 404 && code === 'target_not_found') {
@@ -948,7 +1020,10 @@ function describeAppSubmitError(res, { repo }) {
   if (res.status === 409 && code === 'installation_suspended') return MSG.appSuspended;
   if (res.status === 409 && code === 'notice_required') return MSG.appNoticeRequired;
   if (res.status === 409 && code === 'review_finishing') {
-    return 'A MegaLens review for this change is finishing on GitHub right now. Check the pull request or commit checks on GitHub, or run /megalens:review again in a moment.';
+    const targetUrl = prNumber
+      ? `https://github.com/${repo}/pull/${prNumber}`
+      : (headSha ? `https://github.com/${repo}/commit/${headSha}` : `https://github.com/${repo}`);
+    return `A MegaLens review for this change is already finishing on GitHub. Check the result directly on GitHub (${targetUrl}); do not run /megalens:review again for the same commit or it may start a second review.`;
   }
   if (res.status === 422 || code === 'target_unavailable') {
     return 'MegaLens cannot review this target on the GitHub App (commits must be pushed to a branch tip or default branch history with a parent commit, and pull requests must be open, non-draft, and in this repository).';
@@ -1092,8 +1167,8 @@ function renderAppJob(job, rawId, { env = {}, showId = false } = {}) {
         const passes = Array.isArray(doc.passes) ? doc.passes : [];
         const eff = effectiveStatus(doc, passes, passes.filter((p) => p && p.status === 'failed'), exit);
         const somethingWrong = eff !== 'complete';
-        const text = scrub(renderResult(doc, { exit, showId: showId || somethingWrong }), env);
-        const trailer = (showId || somethingWrong) ? trailerOf(showId || eff === 'failed') : '';
+        const text = scrub(renderResult(doc, { exit, showId, hideId: !showId && eff === 'failed' }), env);
+        const trailer = (showId || somethingWrong) ? trailerOf(showId) : '';
         const code = eff === 'complete' ? 0 : (eff === 'partial' ? 2 : 4);
         return { text: `${text}${trailer}`, code, doc };
       }
@@ -1103,7 +1178,7 @@ function renderAppJob(job, rawId, { env = {}, showId = false } = {}) {
           '',
           '**This review is partial**, and its findings are no longer stored on MegaLens (results are kept for 24 hours). This is not a clean review. Run /megalens:review to start a new review.',
         ].join('\n') + '\n';
-        return { text: out + trailerOf(true), code: 4 };
+        return { text: out + trailerOf(showId), code: 4 };
       }
       const out = [
         `## MegaLens ${tierPrefix}review: RESULT EXPIRED`,
@@ -1116,18 +1191,18 @@ function renderAppJob(job, rawId, { env = {}, showId = false } = {}) {
 
   // status === 'failed', done with failed/unknown result_status, or unknown status: fail closed.
   if (doc) {
-    const text = scrub(renderResult(doc, { exit: 4, showId: true }), env);
-    return { text: `${text}${trailerOf(true)}`, code: 4, doc };
+    const text = scrub(renderResult(doc, { exit: 4, showId, hideId: !showId }), env);
+    return { text: `${text}${trailerOf(showId)}`, code: 4, doc };
   }
   const out = [
     `## MegaLens ${tierPrefix}review: FAILED`,
     '',
     `${describeFailedReason(job?.reason, env)} This is not a clean review.`,
   ].join('\n') + '\n';
-  return { text: out + trailerOf(true), code: 4 };
+  return { text: out + trailerOf(showId), code: 4 };
 }
 
-async function fetchAppJob({ env, fetch = globalThis.fetch, signal = null }, jobId) {
+async function fetchAppJob({ env, fetch = globalThis.fetch, signal = null }, jobId, { showId = true } = {}) {
   const token = extractAppToken(env);
   if (!token) return { error: `${MSG.appNoToken}\n`, retryable: false };
   const base = resolveAppApiBase(env);
@@ -1142,19 +1217,21 @@ async function fetchAppJob({ env, fetch = globalThis.fetch, signal = null }, job
     signal,
   });
   if (res.aborted) return { aborted: true };
+  const label = showId ? `MegaLens review app:${jobId}` : 'the MegaLens review';
   if (res.ok) {
     if (typeof res.data.status !== 'string') {
-      return { error: `Could not read MegaLens review app:${jobId}: unreadable status response. This is not a finished review.\n`, retryable: true };
+      return { error: `Could not read ${label}: unreadable status response. This is not a finished review.\n`, retryable: true };
     }
     return { job: res.data };
   }
   if (res.status === 401) return { error: `${MSG.appUnauthorized}\n`, retryable: false };
   if (res.status === 404) {
-    return { error: `MegaLens could not find review app:${jobId} (it may belong to another account, the App installation may have changed, or the id is wrong). This is not a finished review.\n`, retryable: false };
+    const target = showId ? `review app:${jobId}` : 'that review';
+    return { error: `MegaLens could not find ${target} (it may belong to another account, the App installation may have changed, or the id is wrong). This is not a finished review.\n`, retryable: false, notFound: true };
   }
   const detail = res.networkError || res.errorCode || `HTTP ${res.status || 'error'}`;
   return {
-    error: `Could not read MegaLens review app:${jobId} (${detail}). This is not a finished review.\n`,
+    error: `Could not read ${label} (${detail}). This is not a finished review.\n`,
     retryable: res.retryable,
     retryAfterSec: res.retryAfterSec,
   };
@@ -1163,9 +1240,9 @@ async function fetchAppJob({ env, fetch = globalThis.fetch, signal = null }, job
 export async function appStatus(ctx, rawId, { showId = true } = {}) {
   const id = appJobIdOf(rawId);
   if (ctx.signal?.aborted) return { text: '', code: 4, state: 'aborted' };
-  const v = await fetchAppJob(ctx, id);
+  const v = await fetchAppJob(ctx, id, { showId });
   if (v.aborted) return { text: '', code: 4, state: 'aborted' };
-  if (v.error) return { text: v.error, code: 4, state: 'error', retryable: v.retryable, retryAfterSec: v.retryAfterSec };
+  if (v.error) return { text: v.error, code: 4, state: 'error', retryable: v.retryable, retryAfterSec: v.retryAfterSec, notFound: v.notFound };
   const state = mapAppJobState(v.job);
   const prUrl = validGithubUrl(v.job.pr_url, 'pull') ? scrubExact(v.job.pr_url, ctx.env) : '';
   const checkUrl = validGithubUrl(v.job.check_url, 'runs') ? scrubExact(v.job.check_url, ctx.env) : '';
@@ -1204,14 +1281,17 @@ export async function appStatus(ctx, rawId, { showId = true } = {}) {
 export async function appResult(ctx, rawId, { showId = true } = {}) {
   const id = appJobIdOf(rawId);
   if (ctx.signal?.aborted) return { text: '', code: 4, aborted: true };
-  const v = await fetchAppJob(ctx, id);
+  const v = await fetchAppJob(ctx, id, { showId });
   if (v.aborted) return { text: '', code: 4, aborted: true };
   if (v.error) return { text: v.error, code: 4 };
   return renderAppJob(v.job, `app:${id}`, { env: ctx.env, showId });
 }
 
-async function detectOpenPr({ run, headSha }) {
-  const prRes = await run('gh', ['pr', 'view', '--json', 'number,state,isDraft,headRefOid,isCrossRepository']);
+async function detectOpenPr({ run, nwo, headSha }) {
+  const br = await run('git', ['branch', '--show-current']);
+  const branch = br.code === 0 ? br.stdout.trim() : '';
+  if (!branch || branch.startsWith('-') || !/^[\w./-]{1,100}$/.test(branch)) return null;
+  const prRes = await run('gh', ['pr', 'view', branch, '-R', `github.com/${nwo}`, '--json', 'number,state,isDraft,headRefOid,isCrossRepository,url']);
   if (prRes.code !== 0) return null;
   const pr = jsonOf(prRes.stdout);
   if (!pr || typeof pr !== 'object') return null;
@@ -1220,6 +1300,7 @@ async function detectOpenPr({ run, headSha }) {
   if (String(pr.state ?? '').toUpperCase() !== 'OPEN') return null;
   if (pr.isDraft === true || pr.isCrossRepository === true) return null;
   if (typeof pr.headRefOid !== 'string' || pr.headRefOid.toLowerCase() !== headSha) return null;
+  if (typeof pr.url !== 'string' || pr.url.trim().toLowerCase() !== `https://github.com/${nwo.toLowerCase()}/pull/${num}`) return null;
   return num;
 }
 
@@ -1231,7 +1312,15 @@ export async function appPreflight({ exec, cwd, env, preRepo = null, base = null
   if (apiBase.error) throw new SetupError(apiBase.error);
 
   const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
-  let repo = preRepo?.nwo ? { nwo: preRepo.nwo, defaultBranch: preRepo.defaultBranch ?? null, hasGh: preRepo.hasGh !== false } : null;
+  let repo = preRepo?.nwo
+    ? {
+        nwo: preRepo.nwo,
+        defaultBranch: preRepo.defaultBranch ?? null,
+        host: preRepo.host ?? 'github.com',
+        isGithubCom: preRepo.isGithubCom !== false && (!preRepo.host || preRepo.host === 'github.com'),
+        hasGh: preRepo.hasGh !== false,
+      }
+    : null;
   if (!repo) {
     try {
       repo = await ghRepoPreflight({ exec, cwd, env, signal });
@@ -1244,6 +1333,9 @@ export async function appPreflight({ exec, cwd, env, preRepo = null, base = null
         throw e;
       }
     }
+  }
+  if (!repo.isGithubCom) {
+    throw new SetupError(MSG.appEnterpriseUnsupported(repo.host));
   }
 
   const headRef = head ?? 'HEAD';
@@ -1259,23 +1351,24 @@ export async function appPreflight({ exec, cwd, env, preRepo = null, base = null
 
   let prNumber = null;
   if (repo.hasGh) {
-    const onGh = await run('gh', ['api', `repos/${repo.nwo}/commits/${headSha}`, '--jq', '.sha']);
+    const onGh = await run('gh', ['api', '--hostname', 'github.com', `repos/${repo.nwo}/commits/${headSha}`, '--jq', '.sha']);
     if (onGh.code !== 0 || onGh.stdout.trim().toLowerCase() !== headSha) {
       const br = await run('git', ['branch', '--show-current']);
       const bn = br.stdout.trim();
       throw new SetupError(notPushedMessage(headSha, /^[\w./-]{1,100}$/.test(bn) ? bn : ''), { needsUser: true });
     }
-    prNumber = await detectOpenPr({ run, headSha });
+    prNumber = await detectOpenPr({ run, nwo: repo.nwo, headSha });
   }
 
-  return { nwo: repo.nwo, defaultBranch: repo.defaultBranch, hasGh: repo.hasGh, headSha, prNumber, note, origin: apiBase.origin, token };
+  return { nwo: repo.nwo, defaultBranch: repo.defaultBranch, host: repo.host, isGithubCom: true, hasGh: repo.hasGh, headSha, prNumber, note, origin: apiBase.origin, token };
 }
 
 /**
  * Submit a review to POST /api/github-app/review-now.
- * The server deduplicates identical in-flight and 24h retained jobs per tier, so on a lost reply
- * (network error / 5xx) we make at most one bounded retry with the exact same payload to recover the job id
- * without starting a second paid review.
+ * For immutable commit-SHA requests (`ref`), the server deduplicates identical in-flight and 24h retained
+ * jobs per tier, so on a lost reply (network error / 5xx) we make at most one bounded retry.
+ * For mutable PR requests (`pr`), the server resolves the PR's live head on every POST, so a lost reply
+ * is NEVER auto-retried (which could start a second billable review if a teammate pushed in between).
  */
 export async function startAppReview({
   pre,
@@ -1291,9 +1384,14 @@ export async function startAppReview({
   cwd = null,
 }) {
   const remaining = () => (Number.isFinite(waitMs) ? Math.max(0, waitMs - Math.max(0, now() - t0)) : Infinity);
-  const payload = pre.prNumber !== null
+  const isPrSubmit = pre.prNumber !== null;
+  const payload = isPrSubmit
     ? { repo: pre.nwo, tier, pr: pre.prNumber }
     : { repo: pre.nwo, tier, ref: pre.headSha };
+  const prUrl = isPrSubmit ? `https://github.com/${pre.nwo}/pull/${pre.prNumber}` : null;
+  const unknownOutcomeHint = isPrSubmit
+    ? `A review may already have been started on GitHub: do NOT start another one. Check ${prUrl} for the MegaLens review.`
+    : 'A review may already be in flight: wait a moment and run /megalens:review again (MegaLens reuses an in-flight review for the same commit and tier instead of charging twice).';
 
   const submitOnce = () => raceWithDeadline(
     (callSignal) => appApiRequest({
@@ -1316,13 +1414,15 @@ export async function startAppReview({
       ok: false,
       aborted: attempt.interrupted === 'aborted',
       timedOut: attempt.interrupted === 'timeout',
-      text: `${label} while starting the review on MegaLens. A review may already be in flight: wait a moment and run /megalens:review again (MegaLens reuses an in-flight review for the same commit and tier instead of charging twice).\n`,
+      text: `${label} while starting the review on MegaLens. ${unknownOutcomeHint}\n`,
     };
   }
 
   let res = attempt.value;
-  // Lost reply (network drop / 5xx / unreadable body): one idempotent retry to recover the same job_id.
-  if (!res.ok && !res.aborted && res.retryable && remaining() > 0 && !signal?.aborted) {
+  // Lost reply (network drop / 5xx / unreadable body — NOT 429 rate-limited, and NEVER for mutable PR targets):
+  // make at most one idempotent retry for an immutable commit SHA to recover the same job_id.
+  const canRetryLostReply = !isPrSubmit && !res.ok && !res.aborted && res.retryable && res.status !== 429;
+  if (canRetryLostReply && remaining() > 0 && !signal?.aborted) {
     const delayMs = Math.min(
       res.retryAfterSec ? Math.min(res.retryAfterSec * 1000, 10_000) : APP_LOST_REPLY_RETRY_MS,
       remaining(),
@@ -1337,7 +1437,7 @@ export async function startAppReview({
           ok: false,
           aborted: slept.interrupted === 'aborted',
           timedOut: slept.interrupted === 'timeout',
-          text: `${label} while confirming whether MegaLens started the review. A review may already be in flight: run /megalens:review again in a moment (MegaLens reuses an in-flight review instead of charging twice).\n`,
+          text: `${label} while confirming whether MegaLens started the review. ${unknownOutcomeHint}\n`,
         };
       }
     }
@@ -1349,7 +1449,7 @@ export async function startAppReview({
           ok: false,
           aborted: attempt.interrupted === 'aborted',
           timedOut: attempt.interrupted === 'timeout',
-          text: `${label} while confirming whether MegaLens started the review. A review may already be in flight: run /megalens:review again in a moment (MegaLens reuses an in-flight review instead of charging twice).\n`,
+          text: `${label} while confirming whether MegaLens started the review. ${unknownOutcomeHint}\n`,
         };
       }
       res = attempt.value;
@@ -1361,7 +1461,7 @@ export async function startAppReview({
       ok: false,
       aborted: true,
       timedOut: false,
-      text: 'Interrupted while starting the review on MegaLens. A review may already be in flight: run /megalens:review again in a moment (MegaLens reuses an in-flight review instead of charging twice).\n',
+      text: `Interrupted while starting the review on MegaLens. ${unknownOutcomeHint}\n`,
     };
   }
 
@@ -1372,7 +1472,7 @@ export async function startAppReview({
     if (!jobId) {
       return {
         ok: false,
-        text: 'MegaLens accepted the request but returned an invalid job id. A review may already be in flight: run /megalens:review again in a moment (MegaLens reuses an in-flight review instead of charging twice).\n',
+        text: `MegaLens accepted the request but returned an invalid job id. ${unknownOutcomeHint}\n`,
       };
     }
     return { ok: true, id: `app:${jobId}`, jobId };
@@ -1388,22 +1488,105 @@ export async function startAppReview({
     }
   }
 
-  if (res.retryable) {
+  if (res.retryable && res.status !== 429) {
     const detail = res.networkError || res.errorCode || `HTTP ${res.status || 'error'}`;
     return {
       ok: false,
-      text: `Could not confirm whether MegaLens started the review (${detail}). A review may already be in flight: wait a moment and run /megalens:review again (MegaLens reuses an in-flight review for the same commit and tier instead of charging twice).\n`,
+      text: `Could not confirm whether MegaLens started the review (${detail}). ${unknownOutcomeHint}\n`,
     };
   }
 
-  return { ok: false, text: `${describeAppSubmitError(res, { repo: pre.nwo })}\n` };
+  return { ok: false, text: `${describeAppSubmitError(res, { repo: pre.nwo, prNumber: pre.prNumber, headSha: pre.headSha })}\n` };
+}
+
+function normalizedJobHeadSha(job) {
+  return typeof job?.head_sha === 'string' && SHA_RE.test(job.head_sha.trim())
+    ? job.head_sha.trim().toLowerCase()
+    : null;
+}
+
+function describeHeadMismatch({ tier, expectedSha, actualSha, nwo, prNumber }) {
+  const tierPrefix = (tier === 'standard' || tier === 'deep') ? `${tier} ` : '';
+  const where = prNumber && nwo
+    ? `Pull request #${prNumber} on GitHub moved to commit ${short(actualSha)} while your local checkout is at ${short(expectedSha)}. MegaLens reviewed commit ${short(actualSha)}, not your local commit, so those findings are not shown for ${short(expectedSha)}. Pull the latest changes (\`git pull\`) and run /megalens:result to view it, or check https://github.com/${nwo}/pull/${prNumber}.`
+    : `MegaLens returned a review for commit ${short(actualSha)} instead of your local commit ${short(expectedSha)}, so those findings are not shown for ${short(expectedSha)}.`;
+  return [
+    `## MegaLens ${tierPrefix}review: NOT COMPLETED`,
+    '',
+    `${where} This is not a clean review.`,
+  ].join('\n') + '\n';
+}
+
+/**
+ * Resolve a saved App bookmark matching this repo, commit, and tier BEFORE runner selection
+ * so a transient `/api/github-app/status` outage can never fall through and start a second review on Actions.
+ */
+export async function resolveMatchingAppBookmark({
+  exec = realExec,
+  fetch = globalThis.fetch,
+  cwd,
+  env,
+  saved,
+  tier = 'standard',
+  head = null,
+  signal = null,
+  saveLatest = null,
+}) {
+  if (!APP_PATH_ENABLED || !saved || saved.runner !== 'app' || !isAppId(saved.id) || saved.tier !== tier || !saved.headSha) {
+    return { action: 'continue' };
+  }
+  if (!extractAppToken(env)) return { action: 'continue' };
+  const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
+  const headRef = head ?? 'HEAD';
+  const hs = await run('git', ['rev-parse', '--verify', `${headRef}^{commit}`]);
+  const headSha = hs.stdout.trim().toLowerCase();
+  if (hs.code !== 0 || !SHA_RE.test(headSha) || headSha !== saved.headSha) {
+    return { action: 'continue' };
+  }
+  let dirty;
+  try {
+    dirty = await worktreeDirty(run);
+  } catch (e) {
+    if (e instanceof SetupError) return { action: 'stop', code: 4, text: `${e.message}\n` };
+    throw e;
+  }
+  if (dirty && head === null) {
+    return { action: 'stop', code: 4, text: `${MSG.dirtyStop}\n` };
+  }
+  const note = dirty ? `${MSG.uncommitted}\n` : '';
+  const v = await fetchAppJob({ env, fetch, signal }, appJobIdOf(saved.id), { showId: false });
+  if (v.aborted) return { action: 'aborted' };
+  if (v.error) {
+    if (v.notFound) return { action: 'continue' };
+    // Non-404 error (503/502/429/network/401) while a matching App job exists: stop instead of dispatching Actions.
+    return { action: 'stop', code: 4, text: v.error };
+  }
+  const job = v.job;
+  const actualSha = normalizedJobHeadSha(job);
+  if (actualSha && actualSha !== headSha) {
+    saveLatest?.({ id: saved.id, runner: 'app', nwo: saved.nwo, tier, headSha: actualSha, prNumber: saved.prNumber });
+    return { action: 'continue' };
+  }
+  const st = String(job.status ?? '');
+  if (st === 'queued' || st === 'running') {
+    return {
+      action: 'resume',
+      resumeAttempt: { id: saved.id, job, headSha, nwo: saved.nwo, prNumber: saved.prNumber, note },
+    };
+  }
+  if (st === 'done' && job.findings && ['complete', 'partial', 'too_large'].includes(String(job.result_status ?? ''))) {
+    const rendered = renderAppJob(job, saved.id, { env, showId: false });
+    return { action: 'rendered', code: rendered.code, text: `${note}${rendered.text}`, id: saved.id };
+  }
+  return { action: 'continue' };
 }
 
 /**
  * /megalens:review through the MegaLens GitHub App on-demand API:
  * Preflights repo/token/commit, reuses an existing in-flight or retained job for the same commit & tier when present,
- * otherwise starts one via POST /api/github-app/review-now, bookmarks it, waits up to 20 minutes with short progress
- * lines, and prints the findings inline in the same answer.
+ * otherwise verifies the bookmark can be written, submits via POST /api/github-app/review-now, bookmarks it,
+ * waits up to 20 minutes with short progress lines (continuing across retryable poll errors with Retry-After backoff),
+ * verifies the returned job's head_sha matches the local checkout, and prints findings inline in the same answer.
  */
 export async function appReview({
   exec = realExec,
@@ -1424,7 +1607,9 @@ export async function appReview({
   onLine = null,
   saveLatest = null,
   loadLatest = null,
+  canSaveLatest = null,
   preRepo = null,
+  resumeAttempt = null,
 }) {
   if (tier !== 'standard' && tier !== 'deep') return { text: 'The MegaLens GitHub App runs the standard or deep tier.\n', code: 4 };
   if (base !== null) return { text: `${MSG.appRangeUnsupported}\n`, code: 4 };
@@ -1434,93 +1619,136 @@ export async function appReview({
   let acc = '';
   const emit = (s) => { acc += s; onLine?.(s); };
 
-  let pre;
-  try {
-    const preRes = await bounded((callSignal) => appPreflight({ exec, cwd, env, preRepo, base, head, signal: callSignal }));
-    if (preRes.interrupted === 'aborted') {
-      return { text: 'Interrupted before starting the review. Nothing was started and no credit was used.\n', code: 4, aborted: true };
-    }
-    if (preRes.interrupted === 'timeout') {
-      return { text: 'Timed out before starting the review. Nothing was started and no credit was used.\n', code: 4, timedOut: true };
-    }
-    pre = preRes.value;
-  } catch (e) {
-    if (e instanceof SetupError) return { text: e.message.endsWith('\n') ? e.message : `${e.message}\n`, code: 4, setup: true, needsUser: e.needsUser };
-    throw e;
-  }
-
-  if (pre.note) emit(pre.note);
-
-  // Layer 1 dedupe: if we already bookmarked an App job for this exact repo + commit + PR + tier, check it first
-  // so re-running /megalens:review after a timeout or lost reply reuses the in-flight or retained job with no POST.
   let id = null;
   let reused = false;
-  const prev = loadLatest?.();
-  if (
-    prev
-    && prev.runner === 'app'
-    && isAppId(prev.id)
-    && prev.nwo
-    && prev.nwo.toLowerCase() === pre.nwo.toLowerCase()
-    && prev.tier === tier
-    && prev.headSha === pre.headSha
-    && (prev.prNumber ?? null) === (pre.prNumber ?? null)
-  ) {
-    const existing = await bounded((callSignal) => fetchAppJob({ env, fetch, signal: callSignal }, appJobIdOf(prev.id)));
-    if (existing.interrupted) {
-      emit(`${STILL_RUNNING_LINE}\n`);
-      return { text: acc, code: 0, id: prev.id, timedOut: existing.interrupted === 'timeout', aborted: existing.interrupted === 'aborted' };
+  let bookmarkSaved = true;
+  let targetMeta = null;
+
+  if (resumeAttempt && isAppId(resumeAttempt.id)) {
+    id = resumeAttempt.id;
+    reused = true;
+    targetMeta = { nwo: resumeAttempt.nwo ?? null, headSha: resumeAttempt.headSha, prNumber: resumeAttempt.prNumber ?? null };
+    if (resumeAttempt.note) emit(resumeAttempt.note);
+  } else {
+    let pre;
+    try {
+      const preRes = await bounded((callSignal) => appPreflight({ exec, cwd, env, preRepo, base, head, signal: callSignal }));
+      if (preRes.interrupted === 'aborted') {
+        return { text: 'Interrupted before starting the review. Nothing was started and no credit was used.\n', code: 4, aborted: true };
+      }
+      if (preRes.interrupted === 'timeout') {
+        return { text: 'Timed out before starting the review. Nothing was started and no credit was used.\n', code: 4, timedOut: true };
+      }
+      pre = preRes.value;
+    } catch (e) {
+      if (e instanceof SetupError) return { text: e.message.endsWith('\n') ? e.message : `${e.message}\n`, code: 4, setup: true, needsUser: e.needsUser };
+      throw e;
     }
-    const job = existing.value?.job;
-    if (job) {
-      const st = String(job.status ?? '');
-      if (st === 'queued' || st === 'running') {
-        id = prev.id;
-        reused = true;
-      } else if (st === 'done' && job.findings && ['complete', 'partial', 'too_large'].includes(String(job.result_status ?? ''))) {
-        const rendered = renderAppJob(job, prev.id, { env, showId: false });
-        emit(rendered.text);
-        return { text: acc, code: rendered.code, id: prev.id, reused: true };
+
+    targetMeta = { nwo: pre.nwo, headSha: pre.headSha, prNumber: pre.prNumber };
+    if (pre.note) emit(pre.note);
+
+    // Layer 1 dedupe: if we already bookmarked an App job for this exact repo + commit + PR + tier, check it first
+    // so re-running /megalens:review after a timeout or lost reply reuses the in-flight or retained job with no POST.
+    const prev = loadLatest?.();
+    if (
+      prev
+      && prev.runner === 'app'
+      && isAppId(prev.id)
+      && prev.nwo
+      && prev.nwo.toLowerCase() === pre.nwo.toLowerCase()
+      && prev.tier === tier
+      && prev.headSha === pre.headSha
+      && (prev.prNumber ?? null) === (pre.prNumber ?? null)
+    ) {
+      const existing = await bounded((callSignal) => fetchAppJob({ env, fetch, signal: callSignal }, appJobIdOf(prev.id), { showId: false }));
+      if (existing.interrupted) {
+        emit(`${STILL_RUNNING_LINE}\n`);
+        return { text: acc, code: 0, id: prev.id, timedOut: existing.interrupted === 'timeout', aborted: existing.interrupted === 'aborted' };
+      }
+      if (existing.value?.error && !existing.value.notFound) {
+        emit(existing.value.error);
+        return { text: acc, code: 4, id: prev.id };
+      }
+      const job = existing.value?.job;
+      if (job) {
+        const actualSha = normalizedJobHeadSha(job);
+        if (actualSha && actualSha !== pre.headSha) {
+          saveLatest?.({ id: prev.id, runner: 'app', nwo: pre.nwo, tier, headSha: actualSha, prNumber: pre.prNumber });
+        } else {
+          const st = String(job.status ?? '');
+          if (st === 'queued' || st === 'running') {
+            id = prev.id;
+            reused = true;
+          } else if (st === 'done' && job.findings && ['complete', 'partial', 'too_large'].includes(String(job.result_status ?? ''))) {
+            const rendered = renderAppJob(job, prev.id, { env, showId: false });
+            emit(rendered.text);
+            return { text: acc, code: rendered.code, id: prev.id, reused: true };
+          }
+        }
+      }
+    }
+
+    if (!id) {
+      if (canSaveLatest && !canSaveLatest()) {
+        return { text: `${MSG.appBookmarkUnwritable}\n`, code: 4, setup: true };
+      }
+      const started = await startAppReview({ pre, tier, env, fetch, sleep, now, t0, waitMs: capMs, signal, exec, cwd });
+      if (!started.ok) {
+        emit(started.text);
+        return {
+          text: acc,
+          code: 4,
+          aborted: Boolean(started.aborted),
+          timedOut: Boolean(started.timedOut),
+          needsUser: Boolean(started.needsUser),
+        };
+      }
+      id = started.id;
+      if (saveLatest) {
+        bookmarkSaved = saveLatest({ id, runner: 'app', nwo: pre.nwo, tier, headSha: pre.headSha, prNumber: pre.prNumber }) !== false;
       }
     }
   }
 
-  if (!id) {
-    const started = await startAppReview({ pre, tier, env, fetch, sleep, now, t0, waitMs: capMs, signal, exec, cwd });
-    if (!started.ok) {
-      emit(started.text);
-      return {
-        text: acc,
-        code: 4,
-        aborted: Boolean(started.aborted),
-        timedOut: Boolean(started.timedOut),
-        needsUser: Boolean(started.needsUser),
-      };
-    }
-    id = started.id;
-    saveLatest?.({ id, runner: 'app', nwo: pre.nwo, tier, headSha: pre.headSha, prNumber: pre.prNumber });
-  }
+  const stillRunningLine = bookmarkSaved
+    ? STILL_RUNNING_LINE
+    : `Still running. Could not save the local bookmark; run /megalens:result ${id} to see it.`;
 
   if (!wait) {
-    emit(`${reused ? 'Review already in progress' : 'Review started'}\n${STILL_RUNNING_LINE}\n`);
+    emit(`${reused ? 'Review already in progress' : 'Review started'}\n${stillRunningLine}\n`);
     return { text: acc, code: 0, id, reused };
   }
 
   const baseCtx = { env, fetch };
+  let transientErrors = 0;
   const w = await waitForReview({
     poll: async (callSignal) => {
       const ctx = { ...baseCtx, signal: callSignal };
-      const first = await appStatus(ctx, id, { showId: false });
-      if (!first.retryable || callSignal.aborted) return first;
-      const delayMs = first.retryAfterSec ? Math.min(first.retryAfterSec * 1000, 5000) : 0;
-      if (delayMs > 0) await sleep(Math.min(delayMs, remaining()), callSignal);
-      if (callSignal.aborted) return { state: 'aborted' };
-      return appStatus(ctx, id, { showId: false });
+      const st = await appStatus(ctx, id, { showId: false });
+      if (st.state === 'aborted' || callSignal.aborted) return { state: 'aborted' };
+      if (st.state === 'error') {
+        if (st.retryable) {
+          transientErrors += 1;
+          const retryAfterMs = (Number.isFinite(st.retryAfterSec) && st.retryAfterSec > 0)
+            ? st.retryAfterSec * 1000
+            : Math.min(pollMs * (2 ** Math.min(transientErrors - 1, 3)), Math.max(pollMs, 60_000));
+          return { state: 'retry', retryAfterMs };
+        }
+        return st;
+      }
+      transientErrors = 0;
+      const actualSha = normalizedJobHeadSha(st.job);
+      if (actualSha && targetMeta?.headSha && actualSha !== targetMeta.headSha) {
+        return { state: 'error', headMismatch: true, actualSha, job: st.job };
+      }
+      return st;
     },
     onLine: emit,
     startedLine: reused ? 'Resuming in-flight review' : 'Review started',
     queuedLine: 'Waiting for MegaLens review machine...',
     runningLine: 'Running on MegaLens...',
+    stillRunningLine,
     waitMs,
     pollMs,
     progressMs,
@@ -1530,13 +1758,32 @@ export async function appReview({
     signal,
   });
 
+  if (w.finished && w.last?.headMismatch) {
+    if (saveLatest && targetMeta) {
+      saveLatest({ id, runner: 'app', nwo: targetMeta.nwo, tier, headSha: w.last.actualSha, prNumber: targetMeta.prNumber });
+    }
+    emit(describeHeadMismatch({
+      tier,
+      expectedSha: targetMeta.headSha,
+      actualSha: w.last.actualSha,
+      nwo: targetMeta.nwo,
+      prNumber: targetMeta.prNumber,
+    }));
+    return { text: acc, code: 4, id, reused };
+  }
   if (w.finished && w.last?.job) {
     const rendered = renderAppJob(w.last.job, id, { env, showId: false });
     emit(rendered.text);
     return { text: acc, code: rendered.code, id, reused };
   }
   if (w.finished && w.last?.state === 'error') {
-    emit(w.last.text || `Could not read MegaLens review ${id}.\n`);
+    const fallbackErr = bookmarkSaved
+      ? 'Could not read the MegaLens review.\n'
+      : `Could not read the MegaLens review. Try /megalens:result ${id} to recover it.\n`;
+    const msg = w.last.text
+      ? (bookmarkSaved ? w.last.text : `${w.last.text.trimEnd()} Try /megalens:result ${id} to recover it.\n`)
+      : fallbackErr;
+    emit(msg);
     return { text: acc, code: 4, id, reused };
   }
   return { text: acc, code: 0, id, reused, timedOut: w.timedOut, aborted: w.aborted };
