@@ -292,3 +292,13 @@ The plugin confirmation count is zero. Both entries below are assigned to `ondem
 ### Verification
 
 `npm test` passed all 207 tests with disposable fixtures under `/tmp`. `git diff --check` passed. The suite required no Postgres instance.
+
+## Fix round (Fable final)
+
+The plugin now names the commit before submitting a GitHub App review by SHA. It explains that the review covers only the changes since the commit’s first parent and how to review the full branch through a pull request. The scope appears again with fresh and saved results. The README explains the same behavior in Quick start and the App details. [Fable finding](/root/review-input/rv-plugin-app-path/FABLE-FINAL.md) · [App runner](scripts/lib/gh-runner.mjs#L1138) · [README](README.md#L12)
+
+The regression checks that the scope reaches the output before submission when `gh` is missing or the branch has no pull request. It checks that fresh, resumed, and saved results show the scope, that reopening a saved result makes no second submission, and that a pull request review omits the commit scope message. [App tests](tests/app-path.test.mjs#L299)
+
+### Verification
+
+The new regression failed before the fix and passed afterward. `npm test` passed all 210 tests. `git diff --check` passed.

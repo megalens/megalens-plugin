@@ -1135,7 +1135,21 @@ function describeFailedReason(reason, env) {
   }
 }
 
-function renderAppJob(job, rawId, { env = {}, showId = false } = {}) {
+function appCommitScopeLine(headSha) {
+  return `This review is limited to commit \`${short(headSha)}\` (the changes since its first parent). To review the whole branch, sign in to \`gh\` and use an open pull request from the same repository that is ready for review.\n`;
+}
+
+function renderAppJob(job, rawId, { env = {}, showId = false, target = null } = {}) {
+  const result = renderAppJobOutcome(job, rawId, { env, showId });
+  if (job.status === 'queued' || job.status === 'running') return result;
+
+  const commitSha = target
+    ? (target.prNumber === null ? target.headSha : null)
+    : (job.pr_url === null ? normalizedJobHeadSha(job) : null);
+  return commitSha ? { ...result, text: `${appCommitScopeLine(commitSha)}\n${result.text}` } : result;
+}
+
+function renderAppJobOutcome(job, rawId, { env, showId }) {
   const status = String(job?.status ?? '');
   const tier = (job?.tier === 'standard' || job?.tier === 'deep') ? job.tier : '';
   const tierPrefix = tier ? `${tier} ` : '';
@@ -2026,7 +2040,7 @@ export async function resolveMatchingAppBookmark({
     };
   }
   if (st === 'done' && job.findings && ['complete', 'partial', 'too_large'].includes(String(job.result_status ?? ''))) {
-    const rendered = renderAppJob(job, saved.id, { env, showId: false });
+    const rendered = renderAppJob(job, saved.id, { env, target: { headSha, prNumber: currentPrNumber } });
     return { action: 'rendered', code: rendered.code, text: `${note}${rendered.text}`, id: saved.id };
   }
   return { action: 'continue', preRepo: reusablePreRepo };
@@ -2173,7 +2187,7 @@ export async function appReview({
           id = prev.id;
           reused = true;
         } else if (st === 'done' && job.findings && ['complete', 'partial', 'too_large'].includes(String(job.result_status ?? ''))) {
-          const rendered = renderAppJob(job, prev.id, { env, showId: false });
+          const rendered = renderAppJob(job, prev.id, { env, target: targetMeta });
           emit(rendered.text);
           return { text: acc, code: rendered.code, id: prev.id, reused: true };
         }
@@ -2184,6 +2198,7 @@ export async function appReview({
       if (canSaveLatest && !canSaveLatest()) {
         return { text: `${MSG.appBookmarkUnwritable}\n`, code: 4, setup: true };
       }
+      if (pre.prNumber === null) emit(appCommitScopeLine(pre.headSha));
       const started = await startAppReview({ pre, tier, env, fetch, sleep, now, t0, waitMs: capMs, signal, exec, cwd });
       if (!started.ok) {
         emit(started.text);
@@ -2210,6 +2225,8 @@ export async function appReview({
       }
     }
   }
+
+  if (reused && targetMeta.prNumber === null) emit(appCommitScopeLine(targetMeta.headSha));
 
   const stillRunningLine = bookmarkSaved
     ? STILL_RUNNING_LINE
@@ -2283,7 +2300,7 @@ export async function appReview({
     return { text: acc, code: 4, id, reused };
   }
   if (w.finished && w.last?.job) {
-    const rendered = renderAppJob(w.last.job, id, { env, showId: false });
+    const rendered = renderAppJob(w.last.job, id, { env, target: targetMeta });
     emit(rendered.text);
     return { text: acc, code: rendered.code, id, reused };
   }

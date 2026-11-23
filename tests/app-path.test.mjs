@@ -19,6 +19,7 @@ const TOKEN = 'ml_tok_' + '9'.repeat(32);
 const JOB1 = '11111111-1111-4111-8111-111111111111';
 const JOB2 = '22222222-2222-4222-8222-222222222222';
 const SETUP_LINE = `Install the MegaLens GitHub App or add the workflow: ${APP_INSTALL_URL}`;
+const COMMIT_SCOPE = `This review is limited to commit \`${H.slice(0, 7)}\` (the changes since its first parent). To review the whole branch, sign in to \`gh\` and use an open pull request from the same repository that is ready for review.`;
 const ok = (stdout = '') => ({ code: 0, stdout, stderr: '' });
 const bad = (stderr = 'err', code = 1) => ({ code, stdout: '', stderr });
 
@@ -178,7 +179,7 @@ function makeAppServer({
   return { fetch, requests };
 }
 
-async function runCli(argv, { exec, fetch, stateDir, cwd = '/repo-app', env = {}, timing = {}, signal = null } = {}) {
+async function runCli(argv, { exec, fetch, stateDir, cwd = '/repo-app', env = {}, timing = {}, signal = null, onOutput = null } = {}) {
   const dir = stateDir ?? mkdtempSync(path.join(tmpdir(), 'mlapp-'));
   let text = '';
   let errText = '';
@@ -187,7 +188,7 @@ async function runCli(argv, { exec, fetch, stateDir, cwd = '/repo-app', env = {}
     fetch,
     cwd,
     env: { PATH: process.env.PATH, HOME: dir, MEGALENS_STATE_DIR: dir, MEGALENS_TOKEN: TOKEN, GH_TOKEN: 'ghp_test1234567890', ...env },
-    out: (s) => { text += s; },
+    out: (s) => { text += s; onOutput?.(s); },
     err: (s) => { errText += s; },
     flags: { runnerTiming: { sleepMs: 1, tries: 2, ...timing } },
     signal,
@@ -271,6 +272,7 @@ test('App installed (deep + open PR): sends {repo, tier: "deep", pr} and renders
   const r = await runCli(['review', 'deep'], { exec: gh.exec, fetch: srv.fetch, stateDir });
   assert.equal(r.code, 0, r.text);
   assert.match(r.text, /## MegaLens deep review: complete/);
+  assert.doesNotMatch(r.text, /This review is limited to commit/);
   const post = srv.requests.find((x) => x.method === 'POST');
   assert.deepEqual(post.body, { repo: 'acme/widget', tier: 'deep', pr: 42 });
   assert.equal(r.text.includes(JOB1), false);
@@ -292,6 +294,41 @@ test('App installed without gh CLI installed: resolves owner/repo from git origi
   assert.equal(parseGitHubRemote('git@github.com:acme/widget.git'), 'acme/widget');
   assert.equal(parseGitHubRemote('https://github.com/acme/widget.git'), 'acme/widget');
   assert.equal(parseGitHubRemote('https://gitlab.com/acme/widget.git'), null);
+});
+
+test('App discloses commit scope before submitting a ref and with fresh or saved results', async (t) => {
+  for (const [name, ghOptions] of [['without gh', { hasGh: false }], ['without a pull request', {}]]) {
+    await t.test(name, async (t) => {
+      const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-commit-scope-'));
+      t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+      const gh = makeGitGhExec(ghOptions);
+      let streamed = '';
+      let outputBeforePost = '';
+      const srv = makeAppServer({
+        submitHandler: () => {
+          outputBeforePost = streamed;
+          return jsonResp(202, { job_id: JOB1 });
+        },
+        pollSequence: [makeJob({ findings: makeDoc({ findings: [] }) })],
+      });
+      const ctx = { exec: gh.exec, fetch: srv.fetch, stateDir };
+
+      const fresh = await runCli(['review'], { ...ctx, onOutput: (line) => { streamed += line; } });
+      assert.equal(fresh.code, 0, fresh.text);
+      assert.ok(outputBeforePost.includes(`${COMMIT_SCOPE}\n`), 'scope must reach output before the POST');
+      assert.ok(fresh.text.includes(`${COMMIT_SCOPE}\n\n## MegaLens standard review: complete`), fresh.text);
+      assert.match(fresh.text, /No findings were reported by a complete review/);
+
+      for (const args of [['review'], ['review', '--runner', 'app'], ['result'], ['result', `app:${JOB1}`]]) {
+        const saved = await runCli(args, ctx);
+        assert.equal(saved.code, 0, saved.text);
+        assert.ok(saved.text.includes(`${COMMIT_SCOPE}\n\n## MegaLens standard review: complete`), saved.text);
+      }
+      assert.deepEqual(srv.requests.filter((r) => r.method === 'POST').map((r) => r.body), [
+        { repo: 'acme/widget', tier: 'standard', ref: H },
+      ]);
+    });
+  }
 });
 
 test('App reviews pushed commits when gh is installed without a GitHub login', async (t) => {
@@ -683,6 +720,7 @@ test('Timeout (20-min cap) + resume via /megalens:status, /megalens:result, and 
   assert.equal(rResume.code, 0, rResume.text);
   assert.equal(srvResume.requests.filter((x) => x.method === 'POST').length, 0, 'must reuse in-flight bookmarked job without POST');
   assert.match(rResume.text, /Resuming in-flight review/);
+  assert.ok(rResume.text.includes(`${COMMIT_SCOPE}\n\n## MegaLens standard review: complete`), rResume.text);
   assert.match(rResume.text, /## MegaLens standard review: complete/);
   assert.match(rResume.text, /Off-by-one in discount calculation/);
   assert.equal(rResume.text.includes(JOB1), false);

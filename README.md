@@ -9,6 +9,8 @@ You need Node 18+ and `git`, plus either:
 * **MegaLens GitHub App (easiest):** install the App on your repository at https://megalens.ai/app/start and sign in to MegaLens (browser sign-in via `npx @megalens/mcp setup` saves your credential in Claude Code's user config, or set `MEGALENS_TOKEN` in your environment). (`gh auth login` is optional; when installed, it also lets MegaLens detect your open pull request automatically.)
 * **Or your own GitHub Actions runner:** set up the MegaLens workflow on your default branch with the GitHub CLI (`gh auth login`). [Workflow setup](#running-on-your-own-github-actions-runner)
 
+The App reviews only one commit unless `gh` detects an open pull request from the same repository that is ready for review.
+
 1. **Install the plugin.**
 
    ```sh
@@ -74,6 +76,8 @@ The tests cover GitHub App on-demand reviews, runner selection, out-of-credits a
 ### MegaLens GitHub App details
 
 When signed in to MegaLens (via browser sign-in in Claude Code's user `~/.claude.json` / `$CLAUDE_CONFIG_DIR/.claude.json`, or `MEGALENS_TOKEN` in your environment), `/megalens:review` checks `GET /api/github-app/status?repo=<owner/name>` on `https://megalens.ai`. If the App is installed on that `github.com` repository, linked to your account, active, and its setup notice is accepted, MegaLens submits the review to `POST /api/github-app/review-now` (with your open non-draft pull request number when `gh` detects one on `HEAD`, or your pushed commit SHA otherwise) and polls `GET /api/github-app/review-now/<id>` until completion.
+
+When the App submits a commit SHA, it reviews only the changes between that commit and its first parent.
 
 * Only pushed commits are reviewed; uncommitted changes stop before anything starts.
 * One charge per review: re-running `/megalens:review` for the same commit and tier reuses the in-flight or retained job, and lost PR replies never auto-resubmit.
