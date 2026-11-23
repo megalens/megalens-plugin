@@ -32,6 +32,7 @@ export const templatePath = () => path.join(path.dirname(fileURLToPath(import.me
 export const workflowText = () => readFileSync(templatePath(), 'utf8');
 
 export class SetupError extends Error { constructor(msg, { needsUser = false } = {}) { super(msg); this.needsUser = needsUser; } }
+class RepoLookupError extends SetupError {}
 
 /** Remove exact secret values and token shapes from text while preserving repo names like megalens/ml-e2e-review-test. */
 export function scrubExact(text, env = {}) {
@@ -442,9 +443,9 @@ async function ghRepoPreflight({ exec, cwd, env, signal = null }) {
   if (au.code !== 0) throw new SetupError(MSG.noLogin);
   const rv = await run('gh', ['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef,url']);
   const repo = rv.code === 0 ? jsonOf(rv.stdout) : null;
-  if (!repo || typeof repo.nameWithOwner !== 'string' || !NWO_RE.test(repo.nameWithOwner) || typeof repo.defaultBranchRef?.name !== 'string') throw new SetupError(MSG.noRemote);
+  if (!repo || typeof repo.nameWithOwner !== 'string' || !NWO_RE.test(repo.nameWithOwner) || typeof repo.defaultBranchRef?.name !== 'string') throw new RepoLookupError(MSG.noRemote);
   const nwo = repo.nameWithOwner; const defaultBranch = repo.defaultBranchRef.name;
-  if (!/^[\w./-]{1,100}$/.test(defaultBranch)) throw new SetupError(MSG.noRemote);
+  if (!/^[\w./-]{1,100}$/.test(defaultBranch)) throw new RepoLookupError(MSG.noRemote);
   const envHost = typeof env?.GH_HOST === 'string' && env.GH_HOST.trim() ? env.GH_HOST.trim().toLowerCase() : '';
   let host = null;
   let isGithubCom = false;
@@ -468,14 +469,14 @@ async function ghRepoPreflight({ exec, cwd, env, signal = null }) {
   return { nwo, defaultBranch, host, isGithubCom, hasGh: true };
 }
 
-/** Resolve owner/repo from `git remote get-url origin` when `gh` is unavailable (for App-only setups on github.com). */
-async function gitRepoFallback({ exec, cwd, env, signal = null }) {
+/** Resolve the App repository from origin, keeping authenticated gh available if only `gh repo view` failed. */
+async function gitRepoFallback({ exec, cwd, env, signal = null, ghError }) {
   const envHost = typeof env?.GH_HOST === 'string' && env.GH_HOST.trim() ? env.GH_HOST.trim().toLowerCase() : '';
   if (envHost && envHost !== 'github.com') return null;
   const r = await exec('git', ['remote', 'get-url', 'origin'], { cwd, env: ghEnv(env), signal });
   if (r.code !== 0) return null;
   const nwo = parseGitHubRemote(r.stdout.trim());
-  return nwo ? { nwo, defaultBranch: null, host: 'github.com', isGithubCom: true, hasGh: false } : null;
+  return nwo ? { nwo, defaultBranch: null, host: 'github.com', isGithubCom: true, hasGh: ghError instanceof RepoLookupError } : null;
 }
 
 /**
@@ -490,7 +491,7 @@ export async function verifyAppBookmarkRepo({ exec = realExec, cwd, env, saved, 
     repo = await ghRepoPreflight({ exec, cwd, env, signal });
   } catch (e) {
     if (e instanceof SetupError) {
-      repo = await gitRepoFallback({ exec, cwd, env, signal });
+      repo = await gitRepoFallback({ exec, cwd, env, signal, ghError: e });
     } else {
       throw e;
     }
@@ -567,10 +568,10 @@ export async function detectRemoteRunner({ exec, cwd, env, fetch = globalThis.fe
     }
   }
 
-  // If `gh` is unavailable or not logged in, still let App-only setups work using the git origin remote.
+  // App-only setups can use the git origin when gh cannot identify the repository.
   if (!repo) {
     if (APP_PATH_ENABLED && extractAppToken(env)) {
-      const gitRepo = await gitRepoFallback({ exec, cwd, env, signal });
+      const gitRepo = await gitRepoFallback({ exec, cwd, env, signal, ghError: ghErr });
       if (gitRepo) {
         const appSt = await checkAppStatus({ env, nwo: gitRepo.nwo, fetch, signal });
         if (signal?.aborted || appSt.state === 'aborted') {
@@ -1395,17 +1396,10 @@ export async function appResult(ctx, rawId, { showId = true, savedBookmark = nul
   return renderAppJob(v.job, `app:${id}`, { env: ctx.env, showId });
 }
 
-const NO_PR_FOUND_RE = /no pull requests? found|could not resolve to a pullrequest/i;
+const NO_PR_FOUND_RE = /^no pull requests? found(?: for branch(?: .+)?)?$/i;
 
 function bookmarkMatchesPrBase(saved, pr) {
-  if (!pr) return true;
-  if (pr.baseSha || saved?.prBaseSha) {
-    if (!pr.baseSha || !saved?.prBaseSha || saved.prBaseSha !== pr.baseSha) return false;
-  }
-  if (pr.baseRef || saved?.prBaseRef) {
-    if (!pr.baseRef || !saved?.prBaseRef || saved.prBaseRef !== pr.baseRef) return false;
-  }
-  return true;
+  return !pr || (Boolean(pr.baseSha) && saved.prBaseSha === pr.baseSha && (saved.prBaseRef ?? null) === pr.baseRef);
 }
 
 function describePrHeadBehind({ tier, expectedSha, prHeadSha, nwo, prNumber }) {
@@ -1434,22 +1428,35 @@ async function detectOpenPr({ run, nwo, headSha, env = {} }) {
       error: `Could not read the current git branch (${detail}). Nothing was started and no credit was used. Resolve any Git errors and try again.`,
     };
   }
-  const branch = br.stdout.trim();
-  if (!branch) return { state: 'none' }; // detached HEAD
+  const localBranch = br.stdout.trim();
+  if (!localBranch) return { state: 'none' }; // detached HEAD
+  const upstream = await run('git', ['for-each-ref', '--format=%(upstream:remoteref)', `refs/heads/${localBranch}`]);
+  if (upstream.aborted) return { state: 'aborted' };
+  if (upstream.code !== 0) {
+    const detail = scrubExact(firstLine(upstream.stderr), env) || 'git for-each-ref failed';
+    return {
+      state: 'error',
+      error: `Could not read the upstream git branch (${detail}). Nothing was started and no credit was used. Resolve any Git errors and try again.`,
+    };
+  }
+  const upstreamRef = upstream.stdout.trim();
+  const branch = upstreamRef.startsWith('refs/heads/') ? upstreamRef.slice('refs/heads/'.length) : localBranch;
   if (branch.startsWith('-') || !/^[\w./@+-]{1,100}$/.test(branch)) {
     return {
       state: 'error',
       error: 'Could not look up an open pull request for this branch name. Nothing was started and no credit was used.',
     };
   }
+  // gh treats a bare numeric selector as a PR number. An owner prefix makes it a branch selector.
+  const selector = /^\+?\d+$/.test(branch) ? `${nwo.split('/')[0]}:${branch}` : branch;
   const prRes = await run('gh', [
-    'pr', 'view', branch,
+    'pr', 'view', selector,
     '-R', `github.com/${nwo}`,
     '--json', 'number,state,isDraft,headRefOid,baseRefOid,baseRefName,isCrossRepository,url',
   ]);
   if (prRes.aborted) return { state: 'aborted' };
   if (prRes.code !== 0) {
-    if (NO_PR_FOUND_RE.test(`${prRes.stderr}\n${prRes.stdout}`)) return { state: 'none' };
+    if (prRes.code === 1 && NO_PR_FOUND_RE.test((prRes.stderr || prRes.stdout).trim())) return { state: 'none' };
     const detail = scrubExact(firstLine(prRes.stderr || prRes.stdout), env) || 'gh pr view failed';
     return {
       state: 'error',
@@ -1457,7 +1464,7 @@ async function detectOpenPr({ run, nwo, headSha, env = {} }) {
     };
   }
   const pr = jsonOf(prRes.stdout);
-  if (!pr || typeof pr !== 'object' || Array.isArray(pr)) {
+  if (!['OPEN', 'CLOSED', 'MERGED'].includes(pr?.state) || typeof pr.isDraft !== 'boolean' || typeof pr.isCrossRepository !== 'boolean' || typeof pr.url !== 'string' || !pr.url.trim()) {
     return {
       state: 'error',
       error: `Could not read the pull request details from GitHub for branch ${branch}. Nothing was started and no credit was used. Try again in a moment.`,
@@ -1470,9 +1477,9 @@ async function detectOpenPr({ run, nwo, headSha, env = {} }) {
       error: `GitHub returned an invalid pull request number for branch ${branch}. Nothing was started and no credit was used. Try again in a moment.`,
     };
   }
-  if (String(pr.state ?? '').toUpperCase() !== 'OPEN') return { state: 'none' };
+  if (pr.state !== 'OPEN') return { state: 'none' };
   if (pr.isDraft === true || pr.isCrossRepository === true) return { state: 'none' };
-  if (typeof pr.url !== 'string' || pr.url.trim().toLowerCase() !== `https://github.com/${nwo.toLowerCase()}/pull/${num}`) {
+  if (pr.url.trim().toLowerCase() !== `https://github.com/${nwo.toLowerCase()}/pull/${num}`) {
     return { state: 'none' };
   }
   const prHeadSha = typeof pr.headRefOid === 'string' && SHA_RE.test(pr.headRefOid.trim())
@@ -1487,6 +1494,12 @@ async function detectOpenPr({ run, nwo, headSha, env = {} }) {
   const baseSha = typeof pr.baseRefOid === 'string' && SHA_RE.test(pr.baseRefOid.trim())
     ? pr.baseRefOid.trim().toLowerCase()
     : null;
+  if (!baseSha) {
+    return {
+      state: 'error',
+      error: `GitHub returned an invalid base commit for pull request #${num}. Nothing was started and no credit was used. Try again in a moment.`,
+    };
+  }
   const baseRef = typeof pr.baseRefName === 'string' && /^[\w./@+-]{1,100}$/.test(pr.baseRefName.trim())
     ? pr.baseRefName.trim()
     : null;
@@ -1517,7 +1530,7 @@ export async function appPreflight({ exec, cwd, env, tier = 'standard', preRepo 
       repo = await ghRepoPreflight({ exec, cwd, env, signal });
     } catch (e) {
       if (e instanceof SetupError) {
-        const gitRepo = await gitRepoFallback({ exec, cwd, env, signal });
+        const gitRepo = await gitRepoFallback({ exec, cwd, env, signal, ghError: e });
         if (!gitRepo) throw e;
         repo = gitRepo;
       } else {
@@ -1807,12 +1820,12 @@ export async function resolveMatchingAppBookmark({
     repo = await ghRepoPreflight({ exec, cwd, env, signal });
   } catch (e) {
     if (e instanceof SetupError) {
-      repo = await gitRepoFallback({ exec, cwd, env, signal });
+      repo = await gitRepoFallback({ exec, cwd, env, signal, ghError: e });
     } else {
       throw e;
     }
   }
-  const reusablePreRepo = repo?.hasGh ? repo : null;
+  const reusablePreRepo = repo?.defaultBranch ? repo : null;
   if (!repo || !repo.isGithubCom) {
     return { action: 'continue', preRepo: reusablePreRepo };
   }

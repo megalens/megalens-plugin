@@ -132,6 +132,7 @@ function makeScenario({
     if (k.startsWith('git merge-base')) return ok(`${B}\n`);
     if (k.startsWith('git status')) return ok('');
     if (k.startsWith('git branch')) return ok('feature\n');
+    if (cmd === 'git' && args[0] === 'for-each-ref') return ok('');
     if (k.startsWith('gh secret')) return ok(JSON.stringify([{ name: 'MEGALENS_TOKEN' }]));
     if (k.startsWith('gh api') && args.some((a) => /^orgs\/[^/]+\/installations$/.test(a))) {
       return orgInstallations === null ? bad('HTTP 403: Must have admin rights') : ok(JSON.stringify(orgInstallations));
@@ -1125,6 +1126,7 @@ test('LC2-SOL4: appReview bounds submit request by waitMs and never accepts an o
       if (cmd === 'git' && args[0] === 'rev-parse') return ok(`${H}\n`);
       if (cmd === 'git' && args[0] === 'status') return ok('');
       if (cmd === 'git' && args[0] === 'branch') return ok('feature\n');
+      if (cmd === 'git' && args[0] === 'for-each-ref') return ok('');
       if (cmd === 'gh' && args[0] === 'pr') return bad('no pull requests found for branch');
       if (args.some((a) => a === `repos/acme/widget/commits/${H}`)) return ok(`${H}\n`);
       return bad(`unexpected ${cmd} ${args.join(' ')}`);

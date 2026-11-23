@@ -92,7 +92,10 @@ function makeGitGhExec({
   workflowPresent = false,
   dirty = false,
   pushed = true,
-  openPr = null, // { number, state: 'OPEN', isDraft: false, headRefOid: H, isCrossRepository: false, url }
+  openPr = null,
+  upstreamRef = '',
+  repoLookupError = null,
+  prLookupError = null,
   existingRuns = [],
   runsAfterDispatch = null,
 } = {}) {
@@ -104,7 +107,8 @@ function makeGitGhExec({
     if (cmd === 'gh' && !hasGh) return bad('gh: command not found', 127);
     if (k.startsWith('gh --version')) return ok('gh version 2.60.0');
     if (k.startsWith('gh auth')) return ok('Logged in');
-    if (k.startsWith('gh repo')) return ok(JSON.stringify({ nameWithOwner: nwo, defaultBranchRef: { name: defaultBranch }, url: repoUrl }));
+    if (k.startsWith('gh repo')) return repoLookupError ? bad(repoLookupError) : ok(JSON.stringify({ nameWithOwner: nwo, defaultBranchRef: { name: defaultBranch }, url: repoUrl }));
+    if (k.startsWith('gh pr') && prLookupError) return bad(prLookupError);
     if (k.startsWith('gh pr')) return openPr ? ok(JSON.stringify(openPr)) : bad('no pull requests found for branch');
     if (k.startsWith('gh secret')) return ok(JSON.stringify([{ name: 'MEGALENS_TOKEN' }]));
     if (k.startsWith('gh api') && args.some((a) => a.includes('/contents/'))) return workflowPresent ? ok('file\n') : bad('HTTP 404');
@@ -123,6 +127,10 @@ function makeGitGhExec({
     if (k.startsWith('git status')) return ok(dirty ? ' M src/a.js\n' : '');
     if (k.startsWith('git branch') && args.includes('--show-current')) return ok('feat/payments\n');
     if (k.startsWith('git branch') && args.includes('--contains')) return ok(pushed ? '  origin/feat/payments\n' : '');
+    if (cmd === 'git' && args[0] === 'for-each-ref') {
+      assert.deepEqual(args, ['for-each-ref', '--format=%(upstream:remoteref)', 'refs/heads/feat/payments']);
+      return ok(`${upstreamRef}\n`);
+    }
     if (k.startsWith('git remote')) return remoteUrl ? ok(`${remoteUrl}\n`) : bad('no such remote');
     return bad(`unexpected: ${k} ${args.join(' ')}`, 99);
   };
@@ -245,6 +253,7 @@ test('App installed (deep + open PR): sends {repo, tier: "deep", pr} and renders
       state: 'OPEN',
       isDraft: false,
       headRefOid: H,
+      baseRefOid: B,
       isCrossRepository: false,
       url: 'https://github.com/acme/widget/pull/42',
     },
@@ -277,6 +286,122 @@ test('App installed without gh CLI installed: resolves owner/repo from git origi
   assert.equal(parseGitHubRemote('git@github.com:acme/widget.git'), 'acme/widget');
   assert.equal(parseGitHubRemote('https://github.com/acme/widget.git'), 'acme/widget');
   assert.equal(parseGitHubRemote('https://gitlab.com/acme/widget.git'), null);
+});
+
+const openPaymentPr = {
+  number: 42,
+  state: 'OPEN',
+  isDraft: false,
+  isCrossRepository: false,
+  headRefOid: H,
+  baseRefOid: B,
+  baseRefName: 'main',
+  url: 'https://github.com/acme/widget/pull/42',
+};
+
+test('App finds the PR by the upstream branch name when the local branch has a different name', async (t) => {
+  for (const [remoteBranch, selector] of [['release/payments', 'release/payments'], ['42', 'acme:42']]) {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-upstream-'));
+    t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+    const gh = makeGitGhExec({ upstreamRef: `refs/heads/${remoteBranch}`, openPr: openPaymentPr });
+    const exec = (cmd, args, opts) => {
+      if (cmd === 'gh' && args[0] === 'pr' && args[2] !== selector) {
+        return bad(`no pull requests found for branch "${args[2]}"`);
+      }
+      return gh.exec(cmd, args, opts);
+    };
+    const srv = makeAppServer({ pollSequence: [makeJob({ pr_url: openPaymentPr.url })] });
+
+    const result = await runCli(['review'], { exec, fetch: srv.fetch, stateDir });
+    assert.equal(result.code, 0, result.text);
+    assert.deepEqual(srv.requests.filter((r) => r.method === 'POST').map((r) => r.body), [
+      { repo: 'acme/widget', tier: 'standard', pr: 42 },
+    ]);
+    assert.match(result.text, /Off-by-one in discount calculation/);
+  }
+});
+
+test('App repository lookup falls back to origin while keeping PR lookup and bookmark reuse', async (t) => {
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-repo-fallback-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const gh = makeGitGhExec({ repoLookupError: 'GraphQL: HTTP 502', openPr: openPaymentPr });
+  const srv = makeAppServer({ pollSequence: [makeJob({ pr_url: openPaymentPr.url })] });
+
+  for (const args of [['review'], ['review', '--runner', 'app'], ['review']]) {
+    const result = await runCli(args, { exec: gh.exec, fetch: srv.fetch, stateDir });
+    assert.equal(result.code, 0, result.text);
+    assert.match(result.text, /Off-by-one in discount calculation/);
+  }
+  assert.equal(gh.calls.filter((c) => c.cmd === 'git' && c.args.join(' ') === 'remote get-url origin').length, 3);
+  assert.equal(gh.calls.filter((c) => c.cmd === 'gh' && c.args[0] === 'pr' && c.args.includes('github.com/acme/widget')).length, 3);
+  assert.deepEqual(srv.requests.filter((r) => r.method === 'POST').map((r) => r.body), [
+    { repo: 'acme/widget', tier: 'standard', pr: 42 },
+  ]);
+
+  const ghe = makeGitGhExec({ repoLookupError: 'GraphQL: HTTP 502', remoteUrl: 'git@ghe.example:acme/widget.git' });
+  const enterpriseSrv = makeAppServer();
+  const enterpriseResult = await runCli(['review'], { exec: ghe.exec, fetch: enterpriseSrv.fetch, stateDir });
+  assert.equal(enterpriseResult.code, 4, enterpriseResult.text);
+  assert.deepEqual(enterpriseSrv.requests, []);
+});
+
+test('an unsuccessful PR lookup on the origin fallback stops before a submission or saved result read', async (t) => {
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-fallback-pr-error-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const gh = makeGitGhExec({ repoLookupError: 'GraphQL: HTTP 502', prLookupError: 'GraphQL: HTTP 502', upstreamRef: 'refs/heads/release/payments' });
+  const srv = makeAppServer();
+
+  const review = (argv) => runCli(argv, { exec: gh.exec, fetch: srv.fetch, stateDir });
+  const assertLookupError = (result) => {
+    assert.equal(result.code, 4, result.text);
+    assert.match(result.text, /Could not check whether branch release\/payments has an open pull request on GitHub \(GraphQL: HTTP 502\)/);
+    assert.match(result.text, /Nothing was started and no credit was used/);
+  };
+  assertLookupError(await review(['review']));
+  assertLookupError(await review(['review', '--runner', 'app']));
+
+  assert.equal(saveLatestReview({
+    env: { MEGALENS_STATE_DIR: stateDir }, repoKey: '/repo-app', id: `app:${JOB1}`,
+    runner: 'app', nwo: 'acme/widget', headSha: H, prNumber: 42, prBaseSha: B, prBaseRef: 'main',
+  }), true);
+  assertLookupError(await review(['review']));
+  assert.equal(gh.calls.filter((c) => c.cmd === 'gh' && c.args[0] === 'pr').length, 3);
+  assert.equal(srv.requests.some((r) => r.pathname.startsWith('/api/github-app/review-now')), false);
+});
+
+test('App requires a valid base SHA and refreshes a PR bookmark from an older plugin that omitted it', async (t) => {
+  for (const runner of [[], ['--runner', 'app']]) {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-base-bookmark-'));
+    t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+    const env = { MEGALENS_STATE_DIR: stateDir };
+    assert.equal(saveLatestReview({
+      env, repoKey: '/repo-app', id: `app:${JOB2}`, runner: 'app', nwo: 'acme/widget',
+      headSha: H, prNumber: 42, prBaseRef: 'main',
+    }), true);
+    const srv = makeAppServer({ pollSequence: [makeJob({ pr_url: openPaymentPr.url })] });
+
+    for (const baseRefOid of [undefined, 'invalid']) {
+      const gh = makeGitGhExec({ openPr: { ...openPaymentPr, baseRefOid } });
+      const result = await runCli(['review', ...runner], { exec: gh.exec, fetch: srv.fetch, stateDir });
+      assert.equal(result.code, 4, result.text);
+      assert.match(result.text, /GitHub returned an invalid base commit for pull request #42/);
+      assert.equal(srv.requests.some((r) => r.pathname.startsWith('/api/github-app/review-now')), false);
+    }
+
+    const gh = makeGitGhExec({ openPr: openPaymentPr });
+    const run = () => runCli(['review', ...runner], { exec: gh.exec, fetch: srv.fetch, stateDir });
+    const fresh = await run();
+    assert.equal(fresh.code, 0, fresh.text);
+    const reused = await run();
+    assert.equal(reused.code, 0, reused.text);
+    const bookmark = loadLatestReview({ env, repoKey: '/repo-app' });
+    assert.equal(bookmark.id, `app:${JOB1}`);
+    assert.equal(bookmark.prBaseSha, B);
+    assert.deepEqual(srv.requests.filter((r) => r.method === 'POST').map((r) => r.body), [
+      { repo: 'acme/widget', tier: 'standard', pr: 42 },
+    ]);
+    assert.equal(srv.requests.some((r) => r.pathname.endsWith(JOB2)), false);
+  }
 });
 
 test('App not installed: falls back to dispatch workflow if present, else prints exact one-line setup URL', async (t) => {
@@ -679,6 +804,7 @@ test('Finding 2: lost PR reply never retries into a second billable job, and PR 
     state: 'OPEN',
     isDraft: false,
     headRefOid: H,
+    baseRefOid: B,
     isCrossRepository: false,
     url: 'https://github.com/acme/widget/pull/42',
   };
@@ -1020,6 +1146,7 @@ test('LOOP-CONFIRM1 NEW High + #7 + #9 + #2: PR switch at same SHA, Enterprise c
     if (cmd === 'git' && args[0] === 'rev-parse' && args.includes('--show-toplevel')) return ok('/repo-loop2\n');
     if (cmd === 'git' && args[0] === 'rev-parse') return ok(`${localHead}\n`);
     if (cmd === 'git' && args[0] === 'status') return ok('');
+    if (cmd === 'git' && args[0] === 'for-each-ref') return ok('');
     if (cmd === 'git' && args[0] === 'branch') return ok(`feature-${currentPr ?? 'ref'}\n`);
     if (cmd === 'gh' && ['--version', 'auth'].includes(args[0])) return ok('');
     if (cmd === 'gh' && args[0] === 'repo') {
@@ -1034,6 +1161,7 @@ test('LOOP-CONFIRM1 NEW High + #7 + #9 + #2: PR switch at same SHA, Enterprise c
         state: 'OPEN',
         isDraft: false,
         headRefOid: localHead,
+        baseRefOid: B,
         isCrossRepository: false,
         url: `https://github.com/acme/widget/pull/${currentPr}`,
       }));
@@ -1139,6 +1267,7 @@ test('LOOP-CONFIRM1 NEW High + #7 + #9 + #2: PR switch at same SHA, Enterprise c
     if (cmd === 'git' && args[0] === 'rev-parse' && args.includes('--show-toplevel')) return ok('/repo-moved\n');
     if (cmd === 'git' && args[0] === 'rev-parse') return ok(`${movedHeadLocal}\n`);
     if (cmd === 'git' && args[0] === 'status') return ok('');
+    if (cmd === 'git' && args[0] === 'for-each-ref') return ok('');
     if (cmd === 'git' && args[0] === 'branch') return ok('feature-41\n');
     if (cmd === 'gh' && ['--version', 'auth'].includes(args[0])) return ok('');
     if (cmd === 'gh' && args[0] === 'repo') {
@@ -1147,7 +1276,7 @@ test('LOOP-CONFIRM1 NEW High + #7 + #9 + #2: PR switch at same SHA, Enterprise c
     if (cmd === 'gh' && args[0] === 'api' && args.some((a) => a.includes('/commits/'))) return ok(`${movedHeadLocal}\n`);
     if (cmd === 'gh' && args[0] === 'pr') {
       return ok(JSON.stringify({
-        number: 41, state: 'OPEN', isDraft: false, headRefOid: movedHeadLocal, isCrossRepository: false,
+        number: 41, state: 'OPEN', isDraft: false, headRefOid: movedHeadLocal, baseRefOid: B, isCrossRepository: false,
         url: 'https://github.com/acme/widget/pull/41',
       }));
     }
@@ -1263,6 +1392,7 @@ test('LOOP-CONFIRM2: moved PR rerun after no-ID result (#2), Enterprise no-ID re
       if (cmd === 'gh' && !hasGh) return bad('gh: command not found', 127);
       if (cmd === 'git' && args[0] === 'rev-parse') return ok(args.includes('--show-toplevel') ? '/fixture/widget\n' : `${state.localHead}\n`);
       if (cmd === 'git' && args[0] === 'status') return ok('');
+      if (cmd === 'git' && args[0] === 'for-each-ref') return ok('');
       if (cmd === 'git' && args[0] === 'branch') return ok('feature\n');
       if (cmd === 'git' && args[0] === 'remote') return ok(`${state.remoteUrl}\n`);
       if (cmd === 'gh' && ['--version', 'auth'].includes(args[0])) return ok('');

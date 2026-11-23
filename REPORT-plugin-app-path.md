@@ -219,3 +219,22 @@ Addressed every open/new finding from `/root/review-input/rv-plugin-app-path/LOO
 ### Verification
 
 - Ran `npm test && git diff --check`: **199 / 199 tests passed** (0 failed, 0 skipped), zero whitespace/patch errors.
+
+## Fix round
+
+Fixed both plugin findings in [LOOP-CONFIRM3.md](/root/review-input/rv-plugin-app-path/LOOP-CONFIRM3.md) after reading the four reviews in chronological order.
+
+- **Upstream branch.** `/megalens:review` uses the configured upstream branch name when looking for the PR in the selected GitHub repository. The regression test covers a renamed upstream with a slash in its name and a numeric upstream. Both submit the PR number and display the PR findings. [PR selection](/root/review-input/ws-plugin-app-path/scripts/lib/gh-runner.mjs:1421) · [Test](/root/review-input/ws-plugin-app-path/tests/app-path.test.mjs:302)
+- **Repository lookup fallback.** When authenticated `gh repo view` fails, a GitHub.com `origin` supplies the repository and `gh` still verifies the commit and looks up the PR. The test covers automatic and explicit App selection, bookmark reuse, and an Enterprise origin. [Repository fallback](/root/review-input/ws-plugin-app-path/scripts/lib/gh-runner.mjs:472) · [Test](/root/review-input/ws-plugin-app-path/tests/app-path.test.mjs:324)
+- **PR lookup failures.** An inconclusive lookup exits with code 4, names the branch and reports the lookup error. The test exercises a 502 after repository fallback with and without a saved review and checks for zero review submissions or saved-result reads. [Error handling](/root/review-input/ws-plugin-app-path/scripts/lib/gh-runner.mjs:1457) · [Test](/root/review-input/ws-plugin-app-path/tests/app-path.test.mjs:348)
+- **PR bookmark base SHA.** New PR bookmarks store a validated `prBaseSha`. Missing or malformed base metadata stops the review before submission. A legacy bookmark without a base SHA triggers a fresh PR review once GitHub returns a valid base, and reuse requires a matching SHA. Both App runner modes are covered, along with the existing retargeting regression. [Base validation](/root/review-input/ws-plugin-app-path/scripts/lib/gh-runner.mjs:1494) · [Bookmark matching](/root/review-input/ws-plugin-app-path/scripts/lib/gh-runner.mjs:1401) · [Bookmark save](/root/review-input/ws-plugin-app-path/scripts/lib/gh-runner.mjs:2158) · [Test](/root/review-input/ws-plugin-app-path/tests/app-path.test.mjs:372)
+
+### Server track
+
+- **FIRST #4.** Worker settlement before delivery when `ONE_PATH_V1` is off. [worker-api.ts:599](/root/review-input/ws-ondemand-merge/src/lib/github-setup/worker-api.ts:599)
+- **LOOP-CONFIRM2 new high #1.** Server PR target resolution and queue deduplication after the PR base changes. [on-demand.ts:117](/root/review-input/ws-ondemand-merge/src/lib/github-setup/on-demand.ts:117) · [20261123230000_github_app_on_demand.sql:113](/root/review-input/ws-ondemand-merge/supabase/migrations/20261123230000_github_app_on_demand.sql:113)
+
+### Verification
+
+- `npm test` passed all 203 tests. All four new regression tests failed against the pre-fix runner and passed with the fix.
+- `git diff --check` passed. The plugin tests required no Postgres instance.
