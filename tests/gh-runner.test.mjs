@@ -337,11 +337,11 @@ test('main: engine error text that mentions a missing token does not trigger a r
   assert.equal(f.calls.some((c) => c.args[0] === 'workflow'), false); assert.equal(r.code, 4);
 });
 
-test('main: with gh missing, automatic review prints setup and forced GitHub shows the preflight error', async () => {
+test('main: with gh missing, automatic and forced GitHub reviews both show the preflight error', async () => {
   const f = fakeExec({ 'gh --version': bad('', 127) });
   const r = await viaMain(['review'], { exec: f.exec, bin: fakeBin(4, 'local engine started') });
   assert.equal(r.code, 4);
-  assert.equal(r.text, MSG.notSetup + '\n');
+  assert.equal(r.text, MSG.noGh + '\n');
   const forced = await viaMain(['review', '--runner', 'github'], { exec: f.exec });
   assert.equal(forced.code, 4);
   assert.equal(forced.text, MSG.noGh + '\n');

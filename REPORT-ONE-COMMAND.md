@@ -222,3 +222,11 @@ Check runs and suites no longer select a runner. Automatic status and result loo
 Regression tests cover absent workflows, existing and active App checks, a configured local engine, and saved App entries. GitHub calls use fixtures. Local shutdown and resume fixtures now wait for readiness or hold the worker open until the check has run. [Routing regressions](tests/one-command.test.mjs)
 
 `npm test` passed all 175 tests. `git diff --check` passed.
+
+## Fix round (Fable final)
+
+1. Without an ID, status and result search the five most recent GitHub Actions dispatch runs for a valid MegaLens title whose head matches local `HEAD`. The saved review remains available when there is no matching run. Both commands show `Reviewed <base7>..<head7>` for GitHub Actions reviews with a valid title. For an older title without a valid range, the output identifies the run by ID. Regression tests cover a newer clean run for another commit while saved run `gh:100` is still running, the same lookup without a bookmark, and selection of a newer matching run.
+2. Automatic review reports the specific setup error when `gh` is missing, authentication is missing, or the folder has no GitHub remote. If the workflow is missing, the command prints one line with the template and destination paths. Tests cover each prerequisite and the workflow message on repositories with and without App activity.
+3. The GitHub Actions wait retries a failed run lookup once within the existing wait budget. Tests cover recovery after one failure and the error after two failures. Both cases verify that the workflow dispatches once and the bookmark remains available.
+
+`npm test` passed all 179 tests across eight test files. GitHub responses used fixtures. `git diff --check` passed.

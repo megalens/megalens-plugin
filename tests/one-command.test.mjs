@@ -18,7 +18,9 @@ import { main, pickNewerReview } from '../scripts/engine.mjs';
 const H = 'a'.repeat(40);
 const B = 'b'.repeat(40);
 const TOKEN = 'ml_SECRETTOKEN1234567890';
-const SETUP_LINE = 'Install the MegaLens GitHub App or add the workflow: https://megalens.ai/app/start';
+const WORKFLOW_TITLE = `MegaLens standard ${B}..${H}`;
+const REVIEWED_LINE = 'Reviewed bbbbbbb..aaaaaaa';
+const SETUP_LINE = `Copy the plugin's templates/megalens-dispatch.yml to ${WORKFLOW_PATH} on your repository's default branch and push the change, then run this again.`;
 const ok = (stdout = '') => ({ code: 0, stdout, stderr: '' });
 const bad = (stderr = 'err', code = 1) => ({ code, stdout: '', stderr });
 
@@ -125,15 +127,14 @@ function makeScenario({
     if (k.startsWith('gh api') && args.some((a) => a.includes('/commits/'))) return ok(`${H}\n`);
     if (k.startsWith('gh workflow run')) { dispatched = true; return ok(''); }
     if (k.startsWith('gh run list')) {
-      const title = `MegaLens standard ${B}..${H}`;
-      const rows = runsAfterDispatch ?? [{ databaseId: 9001, displayTitle: title, createdAt: new Date().toISOString(), url: `https://github.com/${nwo}/actions/runs/9001` }];
+      const rows = runsAfterDispatch ?? [{ databaseId: 9001, displayTitle: WORKFLOW_TITLE, createdAt: new Date().toISOString(), url: `https://github.com/${nwo}/actions/runs/9001` }];
       return ok(JSON.stringify(dispatched ? [...rows, ...existingRuns] : existingRuns));
     }
     if (k.startsWith('gh run view')) {
       const seq = ghRunSequence ?? [{ status: 'completed', conclusion: 'success' }];
       const cur = seq[Math.min(runIdx++, seq.length - 1)];
       const runIdArg = args[2] || '9001';
-      return ok(JSON.stringify({ status: cur.status, conclusion: cur.conclusion ?? '', url: `https://github.com/${nwo}/actions/runs/${runIdArg}`, workflowName: 'MegaLens Dispatch', displayTitle: 't' }));
+      return ok(JSON.stringify({ status: cur.status, conclusion: cur.conclusion ?? '', url: `https://github.com/${nwo}/actions/runs/${runIdArg}`, workflowName: 'MegaLens Dispatch', displayTitle: cur.displayTitle ?? WORKFLOW_TITLE }));
     }
     if (k.startsWith('gh run download')) {
       if (onDownload) return await onDownload(args, opts);
@@ -207,6 +208,26 @@ test('auto-pick: prints the exact setup line when the workflow is missing, inclu
     assert.equal(r.text, SETUP_LINE + '\n');
     assert.deepEqual(appRequests(sc), []);
     assert.equal(sc.calls.some(({ args }) => args[0] === 'workflow'), false);
+  }
+});
+
+test('auto-pick: reports missing gh, missing authentication, and missing GitHub remote', async (t) => {
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'mlsetup-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  for (const [step, failure, message] of [
+    ['--version', bad('command not found', 127), /GitHub CLI \(`gh`\) is not installed.*gh auth login/],
+    ['auth', bad('not logged in'), /GitHub CLI \(`gh`\) is not logged in.*gh auth login/],
+    ['repo', bad('no git remotes found'), /This folder has no GitHub remote.*git remote add origin/],
+  ]) {
+    const sc = makeScenario({ workflowPresent: true });
+    const exec = async (cmd, args, opts) => (
+      cmd === 'gh' && args[0] === step ? failure : sc.exec(cmd, args, opts)
+    );
+    const review = await runMain(['review'], { exec, stateDir });
+    assert.equal(review.code, 4);
+    assert.match(review.text, message);
+    assert.equal(review.text.trim().split('\n').length, 1);
+    assert.equal(sc.calls.some(({ args }) => ['api', 'workflow'].includes(args[0])), false);
   }
 });
 
@@ -398,12 +419,14 @@ test('cap -> no-id /megalens:status and /megalens:result use the latest review f
   const st1 = await runMain(['status'], { exec: scStill.exec, stateDir });
   assert.equal(st1.code, 0);
   assert.match(st1.text, /Still running\. Run \/megalens:result to see it\./);
+  assert.ok(st1.text.split('\n').includes(REVIEWED_LINE));
   assert.equal(st1.text.includes('gh:9001'), false);
 
   // Step 3: /megalens:result with NO id while still running
   const resStill = await runMain(['result'], { exec: scStill.exec, stateDir });
   assert.equal(resStill.code, 4);
   assert.match(resStill.text, /Still running\. Run \/megalens:result to see it\./);
+  assert.ok(resStill.text.split('\n').includes(REVIEWED_LINE));
 
   // Step 4: once finished, /megalens:result with NO id prints findings inline with no id
   const scDone = makeScenario({ workflowPresent: true, ghRunSequence: [{ status: 'completed', conclusion: 'success' }] });
@@ -411,12 +434,59 @@ test('cap -> no-id /megalens:status and /megalens:result use the latest review f
   assert.equal(resDone.code, 0);
   assert.match(resDone.text, /## MegaLens standard review: complete/);
   assert.match(resDone.text, /Adds instead of multiplying/);
+  assert.ok(resDone.text.split('\n').includes(REVIEWED_LINE));
   assert.equal(resDone.text.includes('gh:9001'), false);
 
   // Step 5: explicit id still works for advanced users
   const resExplicit = await runMain(['result', 'gh:9001'], { exec: scDone.exec, stateDir });
   assert.equal(resExplicit.code, 0);
   assert.match(resExplicit.text, /actions\/runs\/9001/);
+  assert.equal(resExplicit.text.includes(REVIEWED_LINE), false);
+});
+
+test('no-id status and result keep the saved running review when a newer run targets a different head', async (t) => {
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'ml-other-head-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  saveLatestReview({ env: { MEGALENS_STATE_DIR: stateDir }, repoKey: '/repo-a', id: 'gh:100', runner: 'github', startedAt: Date.parse('2026-11-23T10:00:00Z') });
+  const sc = makeScenario({
+    existingRuns: [{ databaseId: 200, displayTitle: `MegaLens standard ${B}..${'c'.repeat(40)}`, createdAt: '2026-11-23T10:01:00Z' }],
+    downloadDoc: makeDoc({ findings: [] }),
+  });
+  const viewed = [];
+  const exec = async (cmd, args, opts) => {
+    if (cmd === 'gh' && args[0] === 'run' && args[1] === 'view') {
+      viewed.push(args[2]);
+      if (args[2] === '100') return ok(JSON.stringify({ status: 'in_progress', workflowName: 'MegaLens Dispatch', displayTitle: WORKFLOW_TITLE }));
+    }
+    return sc.exec(cmd, args, opts);
+  };
+  for (const [cmd, code] of [['status', 0], ['result', 4]]) {
+    const review = await runMain([cmd], { exec, stateDir });
+    assert.equal(review.code, code);
+    assert.match(review.text, /Still running/);
+    assert.ok(review.text.split('\n').includes(REVIEWED_LINE));
+  }
+  const withoutBookmark = await runMain(['result'], { exec, stateDir: path.join(stateDir, 'empty') });
+  assert.equal(withoutBookmark.code, 4);
+  assert.match(withoutBookmark.text, /No recent MegaLens review found/);
+  assert.deepEqual(viewed, ['100', '100']);
+  assert.equal(sc.calls.some(({ args }) => args[1] === 'download'), false);
+});
+
+test('no-id lookup with no local HEAD uses an older bookmark and identifies an unavailable range', async (t) => {
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'ml-no-head-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  saveLatestReview({ env: { MEGALENS_STATE_DIR: stateDir }, repoKey: '/repo-a', id: 'gh:100', runner: 'github' });
+  const sc = makeScenario({ ghRunSequence: [{ status: 'completed', conclusion: 'success', displayTitle: 'Legacy workflow title' }] });
+  const exec = async (cmd, args, opts) => (
+    cmd === 'git' && args.includes('HEAD^{commit}') ? bad('no commit') : sc.exec(cmd, args, opts)
+  );
+  for (const cmd of ['status', 'result']) {
+    const review = await runMain([cmd], { exec, stateDir });
+    assert.equal(review.code, 0);
+    assert.match(review.text, /^Commit range unavailable for gh:100\.$/m);
+  }
+  assert.equal(sc.calls.some(({ args }) => args[0] === 'run' && args[1] === 'list'), false);
 });
 
 test('latest-review bookmarks isolate different repos and refuse symlinks', () => {
@@ -629,7 +699,12 @@ test('no-id status and result prefer a newer workflow run and skip saved App rev
   t.after(() => rmSync(stateDir, { recursive: true, force: true }));
   const sc = makeScenario({
     appChecks: [makeAppCheckRun({ started_at: '2026-11-23T11:00:00Z' })],
-    existingRuns: [{ databaseId: 9099, createdAt: '2026-11-23T10:30:00Z' }],
+    existingRuns: [
+      { databaseId: 9101, displayTitle: `Unrelated review ${B}..${H}`, createdAt: '2026-11-23T10:32:00Z' },
+      { databaseId: 9100, displayTitle: `MegaLens deep invalid-base..${H}`, createdAt: '2026-11-23T10:31:00Z' },
+      { databaseId: 9099, displayTitle: `MegaLens deep ${B}..${H}`, createdAt: '2026-11-23T10:30:00Z' },
+    ],
+    ghRunSequence: [{ status: 'completed', conclusion: 'success', displayTitle: `MegaLens deep ${B}..${H}` }],
     downloadDoc: makeDoc({ tier: 'deep' }),
   });
   for (const saved of [
@@ -640,9 +715,11 @@ test('no-id status and result prefer a newer workflow run and skip saved App rev
     const status = await runMain(['status'], { exec: sc.exec, stateDir });
     assert.equal(status.code, 0);
     assert.match(status.text, /Finished/);
+    assert.ok(status.text.split('\n').includes(REVIEWED_LINE));
     const result = await runMain(['result'], { exec: sc.exec, stateDir });
     assert.equal(result.code, 0);
     assert.match(result.text, /MegaLens deep review: complete/);
+    assert.ok(result.text.split('\n').includes(REVIEWED_LINE));
   }
   const viewed = sc.calls.filter(({ args }) => args[0] === 'run' && args[1] === 'view');
   assert.deepEqual(viewed.map(({ args }) => args[2]), ['9099', '9099', '9099', '9099']);
@@ -782,10 +859,36 @@ test('LC1-SOL4: SIGTERM-ignoring child is killed by SIGKILL fallback and parent 
 
 test('workflow lookup and bookmarks break same-second timestamp ties by run ID', async () => {
   const createdAt = '2026-11-23T10:00:00Z';
-  const sc = makeScenario({ existingRuns: [{ databaseId: 800, createdAt }, { databaseId: 801, createdAt }] });
+  const sc = makeScenario({ existingRuns: [800, 801].map((databaseId) => ({ databaseId, displayTitle: WORKFLOW_TITLE, createdAt })) });
   const latest = await findLatestRemoteReview({ exec: sc.exec, cwd: '/repo-a', env: {} });
   assert.equal(latest.id, 'gh:801');
   assert.equal(pickNewerReview({ ...latest, id: 'gh:800', startedAt: latest.startedAt + 850 }, latest).id, 'gh:801');
+});
+
+test('GitHub review wait retries a failed run lookup once and keeps the bookmark on repeated failure', async (t) => {
+  for (const failures of [1, 2]) {
+    const stateDir = mkdtempSync(path.join(tmpdir(), 'ml-poll-retry-'));
+    t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+    const sc = makeScenario({ workflowPresent: true });
+    let views = 0;
+    const exec = async (cmd, args, opts) => {
+      if (cmd === 'gh' && args[0] === 'run' && args[1] === 'view' && ++views <= failures) return bad('HTTP 502: Bad Gateway');
+      return sc.exec(cmd, args, opts);
+    };
+    const review = await runMain(['review'], { exec, stateDir });
+    const dispatches = sc.calls.filter(({ args }) => args[0] === 'workflow' && args[1] === 'run');
+    assert.equal(dispatches.length, 1);
+    assert.equal(loadLatestReview({ env: { MEGALENS_STATE_DIR: stateDir }, repoKey: '/repo-a' })?.id, 'gh:9001');
+    if (failures === 1) {
+      assert.equal(review.code, 0);
+      assert.match(review.text, /MegaLens standard review: complete/);
+      assert.equal(views, 3);
+    } else {
+      assert.equal(review.code, 4);
+      assert.match(review.text, /Could not read run gh:9001.*HTTP 502/);
+      assert.equal(views, 2);
+    }
+  }
 });
 
 test('LC1-NEW2: interrupting workflow dispatch reconciles against GitHub and never claims GitHub did not start it', async () => {

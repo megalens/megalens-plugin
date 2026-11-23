@@ -208,7 +208,9 @@ export const MSG = {
   secretCheckFailed: (why) => `Could not check the repository secret ${SECRET_NAME}: ${why || 'gh gave no reason'}. Nothing was started. Check your network and \`gh auth status\`, then run this again.`,
   orgSecretUnknown: `${SECRET_NAME} is not a repository secret, and the organisation secrets could not be read. Going on; if it is missing the run fails at its first job and no review is charged.`,
   notFound: (url) => `The workflow was started, but its run could not be found, so there is no id to give you. A review may have been started and charged: do NOT start another one. Open ${url} to find the run, then use its number as gh:<number> with /megalens:status and /megalens:result. Nothing has been reviewed yet.`,
-  notSetup: `Install the MegaLens GitHub App or add the workflow: ${APP_INSTALL_URL}`,
+  notSetup: APP_PATH_ENABLED
+    ? `Install the MegaLens GitHub App or add the workflow: ${APP_INSTALL_URL}`
+    : `Copy the plugin's templates/${WORKFLOW_FILE} to ${WORKFLOW_PATH} on your repository's default branch and push the change, then run this again.`,
   appDisabled: 'The MegaLens GitHub App path is disabled in this plugin. Use the GitHub Actions workflow for /megalens:review.',
   appDeepUnsupported: `The MegaLens GitHub App runs Standard reviews. Run /megalens:review for Standard, or add ${WORKFLOW_PATH} to run Deep reviews on your own GitHub runner.`,
   appRangeUnsupported: `The MegaLens GitHub App reviews pull requests and pushes using GitHub's base commit, not custom --base/--head ranges. Add ${WORKFLOW_PATH} (or pass --runner github / --runner local) to review an explicit range, or run /megalens:review without --base/--head.`,
@@ -332,7 +334,7 @@ export async function detectRemoteRunner({ exec, cwd, env, signal = null }) {
   let repo;
   try { repo = await ghRepoPreflight({ exec, cwd, env, signal }); }
   catch (e) {
-    if (e instanceof SetupError) return { runner: 'none', message: MSG.notSetup };
+    if (e instanceof SetupError) return { runner: 'none', message: e.message };
     throw e;
   }
   const { nwo, defaultBranch } = repo;
@@ -404,6 +406,17 @@ export async function preflight({ exec, cwd, env, base = null, head = null, preR
 }
 
 export const runTitle = (tier, baseSha, headSha) => `MegaLens ${tier} ${baseSha}..${headSha}`;
+
+function workflowRange(title) {
+  const match = typeof title === 'string' && /^MegaLens (?:standard|deep) (?<base>[0-9a-f]{40})\.\.(?<head>[0-9a-f]{40})$/.exec(title);
+  return match && match[0] === title ? match.groups : null;
+}
+
+function reviewedRangeLine(title, id) {
+  const range = workflowRange(title);
+  return range ? `Reviewed ${short(range.base)}..${short(range.head)}\n` : `Commit range unavailable for gh:${id}.\n`;
+}
+
 const listRuns = async (run, nwo, limit = 50) => {
   const l = await run('gh', ['run', 'list', '--workflow', WORKFLOW_FILE, '--event', 'workflow_dispatch', '--limit', String(limit), '--json', 'databaseId,displayTitle,createdAt,url', '-R', nwo]);
   const rows = l.code === 0 ? jsonOf(l.stdout) : null;
@@ -547,26 +560,32 @@ async function viewRun({ exec, cwd, env, signal = null }, id, nwo = null) {
   const r = await exec('gh', scoped(['run', 'view', id, '--json', 'status,conclusion,url,workflowName,displayTitle'], nwo), { cwd, env: ghEnv(env), signal });
   if (r.aborted || signal?.aborted) return { aborted: true };
   const j = r.code === 0 ? jsonOf(r.stdout) : null;
-  if (!j || typeof j.status !== 'string') return { error: `Could not read run gh:${id}: ${scrub(firstLine(r.stderr), env) || 'no usable answer from gh'}. Check the id, that you are in the same repository, and \`gh auth status\`. This is not a finished review.\n` };
+  if (!j || typeof j.status !== 'string') {
+    return {
+      error: `Could not read run gh:${id}: ${scrub(firstLine(r.stderr), env) || 'no usable answer from gh'}. Check the id, that you are in the same repository, and \`gh auth status\`. This is not a finished review.\n`,
+      retryable: true,
+    };
+  }
   if (j.workflowName !== WORKFLOW_NAME) return { error: `gh:${id} is not a MegaLens review run. Nothing was read from it.\n` };
   return { j };
 }
 
-export async function runnerStatus(ctx, rawId, { showId = true } = {}) {
+export async function runnerStatus(ctx, rawId, { showId = true, showRange = false } = {}) {
   const id = runIdOf(rawId);
   const nwo = ctx.nwo ?? await repoOf(ctx);
   if (ctx.signal?.aborted) return { text: '', code: 4, state: 'aborted' };
   const v = await viewRun(ctx, id, nwo);
   if (v.aborted) return { text: '', code: 4, state: 'aborted' };
-  if (v.error) return { text: v.error, code: 4, state: 'error' };
+  if (v.error) return { text: v.error, code: 4, state: 'error', retryable: v.retryable };
   const state = mapState(v.j.status, v.j.conclusion); const url = String(v.j.url ?? '').slice(0, 300);
+  const rangeLine = showRange ? reviewedRangeLine(v.j.displayTitle, id) : '';
   if (!showId && state !== 'failed') {
     const shortWords = {
       queued: `Queued on GitHub. ${STILL_RUNNING_LINE}\n`,
       running: `${STILL_RUNNING_LINE}\n`,
       done: 'Finished. Run /megalens:result to see it.\n',
     }[state];
-    return { text: shortWords, code: 0, state };
+    return { text: shortWords + rangeLine, code: 0, state };
   }
   const words = {
     queued: 'Queued: GitHub has not started it yet. Check again in a minute.',
@@ -574,10 +593,10 @@ export async function runnerStatus(ctx, rawId, { showId = true } = {}) {
     done: `Done. Fetch it with /megalens:result gh:${id}.`,
     failed: `FAILED: the run did not finish successfully (${scrub(String(v.j.conclusion ?? v.j.status), ctx.env).slice(0, 40)}). It is not a clean review and says nothing about your change. /megalens:result gh:${id} shows what was recorded, if anything.`,
   }[state];
-  return { text: `Review gh:${id}: ${state}. ${words}\nRun: ${url}\n`, code: 0, state };
+  return { text: `Review gh:${id}: ${state}. ${words}\nRun: ${url}\n${rangeLine}`, code: 0, state };
 }
 
-export async function runnerResult(ctx, rawId, { showId = true } = {}) {
+export async function runnerResult(ctx, rawId, { showId = true, showRange = false } = {}) {
   const id = runIdOf(rawId);
   const nwo = ctx.nwo ?? await repoOf(ctx);
   if (ctx.signal?.aborted) return { text: '', code: 4, aborted: true };
@@ -585,11 +604,12 @@ export async function runnerResult(ctx, rawId, { showId = true } = {}) {
   if (v.aborted) return { text: '', code: 4, aborted: true };
   if (v.error) return { text: v.error, code: 4 };
   const state = mapState(v.j.status, v.j.conclusion);
+  const rangeLine = showRange ? reviewedRangeLine(v.j.displayTitle, id) : '';
   if (state === 'queued' || state === 'running') {
     const msg = showId
       ? `That review is still ${state === 'queued' ? 'queued' : 'running'}, so there is no result yet. Nothing has been found or ruled out. Check with /megalens:status gh:${id}.\n`
       : `${STILL_RUNNING_LINE}\n`;
-    return { text: msg, code: 4 };
+    return { text: msg + rangeLine, code: 4 };
   }
   const dir = mkdtempSync(path.join(tmpdir(), 'megalens-'), { mode: 0o700 });
   try {
@@ -610,7 +630,7 @@ export async function runnerResult(ctx, rawId, { showId = true } = {}) {
     }), ctx.env);
     const url = String(v.j.url ?? '').slice(0, 300);
     const trailer = (showId || somethingWrong) ? `${somethingWrong && !showId ? `Review id: gh:${id}\n` : ''}Run: ${url}\n` : '';
-    return { text: `${text}${trailer}`, code: ok ? 0 : 4, doc };
+    return { text: `${text}${trailer}${rangeLine}`, code: ok ? 0 : 4, doc };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
@@ -678,7 +698,13 @@ export async function runnerReview({
   }
   const baseCtx = { exec, cwd, env, nwo: pre.nwo };
   const w = await waitForReview({
-    poll: (callSignal) => runnerStatus({ ...baseCtx, signal: callSignal }, started.id, { showId: false }),
+    poll: async (callSignal) => {
+      const ctx = { ...baseCtx, signal: callSignal };
+      const status = await runnerStatus(ctx, started.id, { showId: false });
+      return status.retryable && !callSignal.aborted
+        ? runnerStatus(ctx, started.id, { showId: false })
+        : status;
+    },
     onLine: emit,
     startedLine: 'Review started',
     queuedLine: 'Queued on GitHub...',
@@ -963,13 +989,19 @@ export async function appReview({
   return { text: acc, code: 0, id, timedOut: w.timedOut, aborted: w.aborted };
 }
 
-/** Find the latest workflow review for no-id status and result. */
+/** Find the latest workflow review of the checked-out commit for no-id status and result. */
 export async function findLatestRemoteReview({ exec, cwd, env, signal = null }) {
-  const nwo = await repoOf({ exec, cwd, env, signal });
-  if (!nwo) return null;
   const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
+  const head = await run('git', ['rev-parse', '--verify', 'HEAD^{commit}']);
+  const headSha = head.stdout.trim();
+  if (head.code !== 0 || !SHA_RE.test(headSha) || signal?.aborted) return null;
+
+  const nwo = await repoOf({ exec, cwd, env, signal });
+  if (!nwo || signal?.aborted) return null;
   const rows = await listRuns(run, nwo, 5);
-  if (!rows?.length) return null;
-  const [latest] = rows.sort((a, b) => (parseTs(b.createdAt) - parseTs(a.createdAt)) || (b.databaseId - a.databaseId));
+  if (!rows) return null;
+  const [latest] = rows.filter((row) => workflowRange(row.displayTitle)?.head === headSha)
+    .sort((a, b) => (parseTs(b.createdAt) - parseTs(a.createdAt)) || (b.databaseId - a.databaseId));
+  if (!latest) return null;
   return { id: `gh:${latest.databaseId}`, runner: 'github', nwo, startedAt: parseTs(latest.createdAt) };
 }

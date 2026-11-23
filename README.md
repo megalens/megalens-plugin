@@ -21,12 +21,12 @@ You need Node 18+, `git`, and the GitHub CLI (`gh auth login`). Set up the MegaL
 MegaLens starts the review on your GitHub Actions runner, prints progress while it runs, and shows the findings when it finishes. If the workflow is missing, the command prints one line.
 
 ```text
-Install the MegaLens GitHub App or add the workflow: https://megalens.ai/app/start
+Copy the plugin's templates/megalens-dispatch.yml to .github/workflows/megalens-dispatch.yml on your repository's default branch and push the change, then run this again.
 ```
 
 Standard is the default tier. For a deeper pass, run `/megalens:review deep`.
 
-If you stop waiting or reach the 20 minute limit, MegaLens prints `Still running. Run /megalens:result to see it.` You can also run `/megalens:status` to check progress.
+If you stop waiting or reach the 20 minute limit, MegaLens prints `Still running. Run /megalens:result to see it.` You can also run `/megalens:status` to check progress. Both commands use the saved review or a newer GitHub Actions review of your checked out commit. They show the commit range for GitHub Actions reviews.
 
 MegaLens asks before pushing commits, reports partial or failed reviews as incomplete, and keeps tokens out of the output.
 

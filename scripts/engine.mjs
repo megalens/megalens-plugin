@@ -266,7 +266,7 @@ export async function main(argv, {
 
     if (cmd === 'review' && rest.some((a, i) => a === 'double' && !['--base', '--head', '--first-review'].includes(rest[i - 1])) && !(flags.double ?? DOUBLE_TIER_ENABLED)) { say(DOUBLE_OFF_MESSAGE + '\n'); return 4; }
 
-    // ---- status / result (with optional id; no id -> newest review for this repo across bookmark & GitHub) ----
+    // ---- status / result (with optional id; no id -> bookmark or newer GitHub review of HEAD) ----
     if (cmd === 'status' || cmd === 'result') {
       if (rest.length > 1) throw new UsageError('give at most one review id (or none to use the latest review for this repo)');
       const explicitId = rest.length === 1;
@@ -299,7 +299,10 @@ export async function main(argv, {
       }
       if (/^gh:/.test(targetId)) {
         if (!isRunnerId(targetId)) throw new UsageError('that is not a GitHub review id (they look like gh:123456789)');
-        const r = await (cmd === 'status' ? runnerStatus : runnerResult)({ exec, cwd, env, signal }, targetId, { showId: explicitId });
+        const r = await (cmd === 'status' ? runnerStatus : runnerResult)({ exec, cwd, env, signal }, targetId, {
+          showId: explicitId,
+          showRange: !explicitId,
+        });
         sayExact(r.text); return r.code;
       }
       const id = assertReviewId(targetId);
