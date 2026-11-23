@@ -1,5 +1,6 @@
-// Shared wait loop for /megalens:review across all runners (GitHub App, GitHub Actions, local deep).
-// Injectable clock (`now`, `sleep`) and `signal` so tests simulate the full 20-minute cap in milliseconds.
+// Shared wait loop for /megalens:review across all runners (GitHub App, GitHub Actions, local).
+// Injectable clock (`now`, `sleep`) and `signal` so tests simulate the full 20-minute cap in milliseconds,
+// and in-flight poll / result calls are cancelled promptly on deadline or user interrupt.
 
 export const DEFAULT_WAIT_MS = 20 * 60_000;
 export const DEFAULT_POLL_MS = 15_000;
@@ -24,7 +25,73 @@ export function formatElapsed(elapsedMs) {
 }
 
 /**
+ * Run `fn(callSignal)` bounded by both `signal` (user interrupt) and `remainingMs` (deadline).
+ * If `signal` aborts or the deadline expires while `fn` is in flight, `callSignal` is aborted immediately
+ * (terminating any child process) and this returns `{ interrupted: 'aborted' | 'timeout' }` without waiting
+ * for a hung child. Also checks `now() - t0 >= waitMs` after `fn` resolves so fake-clock overtime polls are
+ * never accepted as finished.
+ */
+export async function raceWithDeadline(fn, {
+  signal = null,
+  remainingMs,
+  now = () => Date.now(),
+  t0 = now(),
+  waitMs = remainingMs,
+} = {}) {
+  if (signal?.aborted) return { interrupted: 'aborted', value: undefined };
+  if (remainingMs <= 0) return { interrupted: 'timeout', value: undefined };
+
+  const callAc = new AbortController();
+  let timer = null;
+  let onUserAbort = null;
+
+  const race = new Promise((resolve) => {
+    let settled = false;
+    const finish = (outcome) => {
+      if (settled) return;
+      settled = true;
+      resolve(outcome);
+    };
+    onUserAbort = () => {
+      callAc.abort();
+      finish({ interrupted: 'aborted', value: undefined });
+    };
+    if (signal) {
+      if (signal.aborted) return onUserAbort();
+      signal.addEventListener('abort', onUserAbort, { once: true });
+    }
+    if (Number.isFinite(remainingMs) && remainingMs > 0) {
+      timer = setTimeout(() => {
+        callAc.abort();
+        finish({ interrupted: 'timeout', value: undefined });
+      }, remainingMs);
+    }
+    Promise.resolve()
+      .then(() => fn(callAc.signal))
+      .then(
+        (value) => finish({ interrupted: null, value }),
+        (error) => finish({ interrupted: 'error', error }),
+      );
+  });
+
+  try {
+    const res = await race;
+    if (res.interrupted === 'error') throw res.error;
+    if (res.interrupted) return res;
+    if (signal?.aborted) return { interrupted: 'aborted', value: undefined };
+    if (Number.isFinite(waitMs) && Math.max(0, now() - t0) >= waitMs) {
+      return { interrupted: 'timeout', value: undefined };
+    }
+    return res;
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    if (signal && onUserAbort) signal.removeEventListener('abort', onUserAbort);
+  }
+}
+
+/**
  * Poll until the review reaches a terminal state, the 20-minute cap passes, or `signal` aborts.
+ * Passes a per-call AbortSignal to `poll(callSignal)` so in-flight child processes are killed on deadline/abort.
  * Prints short, non-repeating progress lines through `onLine`. Never prints review ids.
  */
 export async function waitForReview({
@@ -37,17 +104,30 @@ export async function waitForReview({
   pollMs = DEFAULT_POLL_MS,
   progressMs = DEFAULT_PROGRESS_MS,
   now = () => Date.now(),
+  t0 = null,
   sleep = defaultSleep,
   signal = null,
 }) {
   if (startedLine) onLine(`${startedLine}\n`);
-  const t0 = now();
+  const start = t0 ?? now();
   let last = null;
   let lastState = null;
   let lastBucket = 0;
 
   while (!signal?.aborted) {
-    last = await poll();
+    const remainingBeforePoll = waitMs - Math.max(0, now() - start);
+    if (remainingBeforePoll <= 0) break;
+
+    const polled = await raceWithDeadline((callSignal) => poll(callSignal), {
+      signal,
+      remainingMs: remainingBeforePoll,
+      now,
+      t0: start,
+      waitMs,
+    });
+    if (polled.interrupted) break;
+
+    last = polled.value;
     const st = last?.state;
     if (st === 'done' || st === 'complete' || st === 'partial' || st === 'failed' || st === 'cancelled' || st === 'error') {
       return { finished: true, timedOut: false, aborted: false, last };
@@ -57,7 +137,7 @@ export async function waitForReview({
       else if (st === 'running' && runningLine) onLine(`${runningLine}\n`);
       lastState = st;
     }
-    const elapsed = Math.max(0, now() - t0);
+    const elapsed = Math.max(0, now() - start);
     if (progressMs > 0) {
       const bucket = Math.floor(elapsed / progressMs);
       if (bucket > lastBucket) {
@@ -68,18 +148,8 @@ export async function waitForReview({
     const remaining = waitMs - elapsed;
     if (remaining <= 0 || signal?.aborted) break;
     await sleep(Math.min(pollMs, remaining), signal);
-    const afterSleep = Math.max(0, now() - t0);
-    if (afterSleep >= waitMs || signal?.aborted) {
-      // One final poll right at the boundary if not aborted, in case it finished during the last sleep.
-      if (!signal?.aborted) {
-        last = await poll();
-        const st2 = last?.state;
-        if (st2 === 'done' || st2 === 'complete' || st2 === 'partial' || st2 === 'failed' || st2 === 'cancelled' || st2 === 'error') {
-          return { finished: true, timedOut: false, aborted: false, last };
-        }
-      }
-      break;
-    }
+    const afterSleep = Math.max(0, now() - start);
+    if (afterSleep >= waitMs || signal?.aborted) break;
   }
 
   onLine(`${STILL_RUNNING_LINE}\n`);

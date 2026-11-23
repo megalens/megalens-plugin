@@ -48,8 +48,8 @@ const env = { PATH: process.env.PATH, HOME: tmpdir(), MEGALENS_TOKEN: TOKEN, GH_
 const pf = (over, extra = {}) => preflight({ exec: fakeExec(over).exec, cwd: '/r', env, ...extra });
 const msgOf = async (p) => { try { await p; return null; } catch (e) { return e; } };
 
-test('route choice: platform, local engine first on Linux, flags force a route', () => {
-  assert.deepEqual(chooseRoute({ platform: 'linux' }), { route: 'local', fallbackAllowed: true });
+test('route choice: auto first on all platforms (Linux allows local fallback when no remote runner), flags force a route', () => {
+  assert.deepEqual(chooseRoute({ platform: 'linux' }), { route: 'auto', fallbackAllowed: true });
   assert.deepEqual(chooseRoute({ platform: 'darwin' }), { route: 'auto', fallbackAllowed: false });
   assert.deepEqual(chooseRoute({ platform: 'win32' }), { route: 'auto', fallbackAllowed: false });
   assert.deepEqual(chooseRoute({ platform: 'linux', runner: 'app' }), { route: 'app', fallbackAllowed: false });
@@ -311,16 +311,18 @@ test('main: macOS and Windows auto-pick the runner; no engine and no MEGALENS_TO
   }
 });
 
-test('main: Linux with a missing engine, or a failed sandbox pre-check, falls back to the runner; other failures do not', async () => {
+test('main: Linux prefers remote runner (workflow/App) over local even when MEGALENS_TOKEN is set; falls back to local only when no remote runner exists', async () => {
   const f1 = fakeExec({}, { runs: runList });
-  const missing = await viaMain(['review', 'standard'], { exec: f1.exec, env: { MEGALENS_REVIEW_BIN: '/nonexistent/megalens-review' } });
-  assert.equal(missing.code, 0); assert.match(missing.text, /## MegaLens standard review: complete/); assert.ok(f1.calls.some((c) => c.args[0] === 'workflow'));
-  const f2 = fakeExec({}, { runs: runList });
-  const sb = await viaMain(['review', 'standard'], { exec: f2.exec, bin: fakeBin(4, 'error: Your runner blocks nested sandboxes (Ubuntu AppArmor). Add this') });
-  assert.equal(sb.code, 0); assert.match(sb.text, /## MegaLens standard review: complete/); assert.ok(f2.calls.some((c) => c.args[0] === 'workflow'));
-  const f3 = fakeExec({}, { runs: runList });
-  const other = await viaMain(['review', 'standard'], { exec: f3.exec, bin: fakeBin(4, 'error: something unrelated') });
-  assert.equal(other.code, 4); assert.equal(f3.calls.length, 0); assert.doesNotMatch(other.text, /GitHub runner/);
+  const remoteFirst = await viaMain(['review', 'standard'], { exec: f1.exec, bin: fakeBin(4, 'should not run local') });
+  assert.equal(remoteFirst.code, 0); assert.match(remoteFirst.text, /## MegaLens standard review: complete/); assert.ok(f1.calls.some((c) => c.args[0] === 'workflow'));
+  // When neither App nor workflow is present on Linux and local creds + binary exist, local engine runs.
+  const noRemote = fakeExec({ 'gh api': bad('HTTP 404') });
+  const localErr = await viaMain(['review', 'standard'], { exec: noRemote.exec, bin: fakeBin(4, 'error: something unrelated') });
+  assert.equal(localErr.code, 4); assert.equal(noRemote.calls.some((c) => c.args[0] === 'workflow'), false); assert.match(localErr.text, /something unrelated/);
+  // When neither App nor workflow is present AND local binary is missing, Linux shows the clean one-line repo setup message.
+  const noRemoteMissing = fakeExec({ 'gh api': bad('HTTP 404') });
+  const setup = await viaMain(['review', 'standard'], { exec: noRemoteMissing.exec, env: { MEGALENS_REVIEW_BIN: '/nonexistent/megalens-review' } });
+  assert.equal(setup.code, 4); assert.match(setup.text, /not set up for acme\/widget/); assert.equal(setup.text.trim().split('\n').length, 1);
 });
 
 // A fake engine that ran a review, found something and failed (exit 4 / document written). Its text may carry any marker string.
@@ -332,13 +334,13 @@ function fakeBinDoc(exit, title, stderr = '') {
 }
 test('main: marker words inside findings or engine text never start a second paid review on the runner', async () => {
   for (const marker of ['blocks nested sandboxes', 'No MegaLens credentials.', 'The engine is not installed: `megalens-review` was not found']) {
-    const f = fakeExec({}, { runs: runList });
+    const f = fakeExec({ 'gh api': bad('HTTP 404') }, { runs: runList });
     const r = await viaMain(['review', 'standard'], { exec: f.exec, bin: fakeBinDoc(4, `docs say: ${marker}`, 'engine: review failed') });
-    assert.equal(f.calls.length, 0, `no gh call for marker "${marker}"`); assert.equal(r.code, 4); assert.match(r.text, /review: FAILED/); assert.doesNotMatch(r.text, /runs on your GitHub runner/);
-    // even with the sandbox words on stderr: a document exists, so a review ran
-    const g = fakeExec({}, { runs: runList });
+    assert.equal(f.calls.some((c) => c.args[0] === 'workflow'), false, `no workflow dispatch for marker "${marker}"`); assert.equal(r.code, 4); assert.match(r.text, /review: FAILED/);
+    // even with the sandbox words on stderr: a document exists, so a review ran and is never re-dispatched
+    const g = fakeExec({ 'gh api': bad('HTTP 404') }, { runs: runList });
     await viaMain(['review', 'standard'], { exec: g.exec, bin: fakeBinDoc(4, 'x', 'Your runner blocks nested sandboxes') });
-    assert.equal(g.calls.length, 0);
+    assert.equal(g.calls.some((c) => c.args[0] === 'workflow'), false);
   }
 });
 
@@ -349,36 +351,40 @@ function fakeBinPrecheck(reviewId = 'rv_none', extra = {}) {
   writeFileSync(bin, `#!/usr/bin/env node\nconst a=process.argv;const i=a.indexOf('--out');if(i>0)require('fs').writeFileSync(a[i+1],${JSON.stringify(JSON.stringify(document))});process.stderr.write('error: Your runner blocks nested sandboxes\\n');process.exit(4);\n`);
   chmodSync(bin, 0o755); return bin;
 }
-test('main: the engine\'s own sandbox pre-check document (rv_none) falls back to the runner; a real review id or findings never do', async () => {
-  const f = fakeExec({}, { runs: runList });
-  const r = await viaMain(['review', 'standard'], { exec: f.exec, bin: fakeBinPrecheck() });
-  assert.equal(r.code, 0); assert.match(r.text, /## MegaLens standard review: complete/); assert.ok(f.calls.some((c) => c.args[0] === 'workflow'));
-  const real = fakeExec({}, { runs: runList });
-  await viaMain(['review', 'standard'], { exec: real.exec, bin: fakeBinPrecheck('rv_abc12345') });
-  assert.equal(real.calls.length, 0);
-  const withFinding = fakeExec({}, { runs: runList });
-  await viaMain(['review', 'standard'], { exec: withFinding.exec, bin: fakeBinPrecheck('rv_none', { findings: [{ id: 'f' }] }) });
-  assert.equal(withFinding.calls.length, 0);
+test('main: isSandboxPrecheckDoc only matches rv_none with empty findings and sandbox_unusable pass', async () => {
+  assert.equal(isSandboxPrecheckDoc({ review_id: 'rv_none', findings: [], passes: [{ reason: 'sandbox_unusable' }] }, 4), true);
+  assert.equal(isSandboxPrecheckDoc({ review_id: 'rv_abc12345', findings: [], passes: [{ reason: 'sandbox_unusable' }] }, 4), false);
+  assert.equal(isSandboxPrecheckDoc({ review_id: 'rv_none', findings: [{ id: 'f' }], passes: [{ reason: 'sandbox_unusable' }] }, 4), false);
   assert.equal(isSandboxPrecheckDoc({ review_id: 'rv_none', findings: [], passes: [{ reason: 'other' }] }, 4), false);
   assert.equal(isSandboxPrecheckDoc({ review_id: 'rv_none', findings: [], passes: [{ reason: 'sandbox_unusable' }] }, 3), false);
+  // On Linux with no remote runner, a sandbox pre-check doc falls cleanly to the repo setup line; a real review id shows the local FAILED result.
+  const noRemote1 = fakeExec({ 'gh api': bad('HTTP 404') });
+  const r = await viaMain(['review', 'standard'], { exec: noRemote1.exec, bin: fakeBinPrecheck() });
+  assert.equal(r.code, 4); assert.match(r.text, /not set up for acme\/widget/);
+  const noRemote2 = fakeExec({ 'gh api': bad('HTTP 404') });
+  const r2 = await viaMain(['review', 'standard'], { exec: noRemote2.exec, bin: fakeBinPrecheck('rv_abc12345') });
+  assert.equal(r2.code, 4); assert.match(r2.text, /review: FAILED/);
 });
 
-test('main: engine error text that mentions a missing token does not trigger the fallback when a token is set', async () => {
-  const f = fakeExec({}, { runs: runList });
+test('main: engine error text that mentions a missing token does not trigger a remote workflow when running local', async () => {
+  const f = fakeExec({ 'gh api': bad('HTTP 404') }, { runs: runList });
   const r = await viaMain(['review', 'standard'], { exec: f.exec, bin: fakeBin(4, 'No MegaLens credentials. Set MEGALENS_TOKEN') });
-  assert.equal(f.calls.length, 0); assert.equal(r.code, 4);
+  assert.equal(f.calls.some((c) => c.args[0] === 'workflow'), false); assert.equal(r.code, 4);
 });
 
-test('main: Linux with no local MEGALENS_TOKEN cannot run the engine, so it uses the runner (which needs no local token)', async () => {
+test('main: Linux with no local MEGALENS_TOKEN uses the remote runner (which needs no local token)', async () => {
   const f = fakeExec({}, { runs: runList });
   const r = await viaMain(['review', 'standard'], { exec: f.exec, bin: fakeBin(0, ''), env: { MEGALENS_TOKEN: undefined } });
   assert.equal(r.code, 0); assert.match(r.text, /## MegaLens standard review: complete/); assert.ok(f.calls.some((c) => c.args[0] === 'workflow'));
 });
 
-test('main: the runner failing too still says why the local engine did not run', async () => {
+test('main: Linux with gh missing and local token set reports why the local engine could not run; without token reports missing gh cleanly', async () => {
   const f = fakeExec({ 'gh --version': bad('', 127) });
   const r = await viaMain(['review', 'standard'], { exec: f.exec, env: { MEGALENS_REVIEW_BIN: '/nonexistent/megalens-review' } });
-  assert.match(r.text, /not installed/); assert.match(r.text, /GitHub CLI/); assert.equal(r.code, 4);
+  assert.match(r.text, /not installed/); assert.equal(r.code, 4);
+  const f2 = fakeExec({ 'gh --version': bad('', 127) });
+  const r2 = await viaMain(['review', 'standard'], { exec: f2.exec, env: { MEGALENS_TOKEN: undefined, MEGALENS_REVIEW_BIN: '/nonexistent/megalens-review' } });
+  assert.match(r2.text, /GitHub CLI/); assert.equal(r2.text.includes('local engine said'), false); assert.equal(r2.code, 4);
 });
 
 test('main: --runner github forces the runner on Linux; --runner local never touches gh', async () => {
@@ -421,14 +427,17 @@ test('workflow template: pinned shas, run-name carries tier, base and head, publ
   assert.equal(/secrets\.MEGALENS_TOKEN/.test(y.split('review:')[1] ?? ''), false);
 });
 
-test('redaction: GH_TOKEN, GITHUB_TOKEN, GH_ENTERPRISE_TOKEN exact values and gh*_ / github_pat_ shapes are cut; repo names are not', async () => {
+test('redaction: GH_TOKEN, GITHUB_TOKEN, GH_ENTERPRISE_TOKEN exact values and gh*_ / ghs_APPID_JWT / github_pat_ shapes are cut; repo names are not', async () => {
   const { scrub } = await import('../scripts/lib/engine-core.mjs');
   const { scrubExact } = await import('../scripts/lib/gh-runner.mjs');
   const e = { GH_TOKEN: 'tok-gh-1234567', GITHUB_TOKEN: 'tok-github-7654321', GH_ENTERPRISE_TOKEN: 'tok-ent-abcdefg' };
-  const raw = `a ${e.GH_TOKEN} b ${e.GITHUB_TOKEN} c ${e.GH_ENTERPRISE_TOKEN} ghp_${'A'.repeat(36)} gho_${'b'.repeat(20)} ghu_${'c'.repeat(20)} ghs_${'d'.repeat(20)} ghr_${'e'.repeat(20)} github_pat_${'F'.repeat(30)}`;
+  const jwtTok = 'ghs_123456_eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJnaXRodWIiLCJleHAiOjE3MDAwMDAwMDB9.SigPayload_ABC-123';
+  const raw = `a ${e.GH_TOKEN} b ${e.GITHUB_TOKEN} c ${e.GH_ENTERPRISE_TOKEN} ghp_${'A'.repeat(36)} gho_${'b'.repeat(20)} ghu_${'c'.repeat(20)} ghs_${'d'.repeat(20)} ${jwtTok} ghr_${'e'.repeat(20)} github_pat_${'F'.repeat(30)}`;
   for (const f of [scrub, scrubExact]) {
     const out = f(raw, e);
-    for (const bad1 of [e.GH_TOKEN, e.GITHUB_TOKEN, e.GH_ENTERPRISE_TOKEN, 'ghp_AAAA', 'gho_bbbb', 'ghu_cccc', 'ghs_dddd', 'ghr_eeee', 'github_pat_FFFF']) assert.equal(out.includes(bad1), false, bad1);
+    for (const bad1 of [e.GH_TOKEN, e.GITHUB_TOKEN, e.GH_ENTERPRISE_TOKEN, 'ghp_AAAA', 'gho_bbbb', 'ghu_cccc', 'ghs_dddd', 'ghr_eeee', 'github_pat_FFFF', 'eyJhbGci', 'eyJpc3Mi', 'SigPayload_ABC']) {
+      assert.equal(out.includes(bad1), false, bad1);
+    }
   }
   assert.equal(scrubExact('megalens/ml-e2e-review-test ghost_town', {}), 'megalens/ml-e2e-review-test ghost_town');
 });

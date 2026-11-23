@@ -12,3 +12,5 @@
 
 10. **Root.** The engine refuses to run as root unless `MEGALENS_ALLOW_ROOT=1`; the plugin deliberately does not pass that variable, so root shells fail closed (README says so).
 11. **Exit 3 for BYO.** The plugin refuses the BYO modes itself, before the engine, so the engine's exit-3 BYO refusal is only a second line of defence here.
+12. **GitHub App on-demand trigger & personal-repo installation lookup (backend, not modified here).** The MegaLens GitHub App (`src/lib/github-setup/flag.ts` & `webhook.ts`) currently only handles `installation`, `installation_repositories`, `pull_request`, and default-branch `push` webhooks, and runs only the `standard` tier (`APP_REVIEW_TIER = 'standard'`); there is no on-demand review-start API endpoint or `check_suite.rerequested` handler. In addition, GitHub's `GET /repos/{owner}/{repo}/installation` requires a GitHub App JWT, so personal repos (where `GET /orgs/{owner}/installations` and `GET /user/installations` return 404/403 for standard `gh` OAuth tokens) with zero prior check runs cannot be confirmed installed via `gh` alone until the MegaLens backend exposes a repo-status / on-demand-review endpoint.
+

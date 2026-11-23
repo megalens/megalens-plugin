@@ -10,7 +10,11 @@ Run `node ${CLAUDE_PLUGIN_ROOT}/scripts/engine.mjs review $ARGUMENTS` (if `$ARGU
 
 Standard is the default tier; `deep` is the only optional word users need. The script picks the runner automatically (MegaLens's review machine via the GitHub App when installed for this repo, else the user's GitHub Actions runner when the workflow is present, else one setup line), starts the review, waits while printing progress lines (up to 20 minutes), and prints the result inline. Advanced flags (`--runner`, `--base REF --head REF`, `--quiet`, `--no-wait`) are passed through only when the user typed them. If the user asks for `double`, the script answers that the Double tier is not available yet; relay that and offer standard or deep.
 
-Wait for the command to finish, then present what it printed in the same order with at most a short lead. Rules:
+**Waiting for long reviews (up to 20 minutes):**
+- Pass the maximum foreground Bash timeout (`timeout: 600000`, 10 minutes) on the initial call so most Standard reviews finish in one foreground step without moving to the background.
+- If Claude Code moves the Bash command to the background (for longer Standard or Deep reviews), **never start a second review command** while it is still running. Keep following that background task until it exits: wait for its background task completion notification (or read its task output file when notified or when checking progress), then present the final output once the process exits. The script itself enforces the 20-minute cap and exits with `Still running. Run /megalens:result to see it.` if the review is still in progress.
+
+Once the command finishes, present what it printed in the same order with at most a short lead. Rules:
 - If the script says `Still running. Run /megalens:result to see it.`, relay that line and do not claim the change is clean or reviewed.
 - If the script says `NEEDS THE USER'S OK` (the commit is not on GitHub), ask the user that question and stop. Never push on your own. Only if the user answers yes, run `git push` (as the script says), then run the review command again.
 - If the script stops because of uncommitted changes, or says "do NOT start another one" (a run may have been started but could not be found), relay it as written; never start the review again for a lost run.

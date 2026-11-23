@@ -45,7 +45,7 @@ export async function resolveRepoKey({ exec, cwd, env }) {
   return path.resolve(cwd || '.');
 }
 
-export function saveLatestReview({ env = process.env, repoKey, id, runner, nwo = null, tier = 'standard', now = () => Date.now() }) {
+export function saveLatestReview({ env = process.env, repoKey, id, runner, nwo = null, tier = 'standard', startedAt = null, now = () => Date.now() }) {
   if (!repoKey || !isAnyReviewId(id)) return false;
   if (!['app', 'github', 'local'].includes(runner)) return false;
   const dir = stateDir(env);
@@ -55,12 +55,15 @@ export function saveLatestReview({ env = process.env, repoKey, id, runner, nwo =
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     if (isSymlink(dir) || isSymlink(file)) return false;
     const map = readMap(file);
+    const ts = typeof startedAt === 'number' && Number.isFinite(startedAt) && startedAt > 0
+      ? startedAt
+      : (Number(now()) || Date.now());
     map[String(repoKey)] = {
       id,
       runner,
       nwo: typeof nwo === 'string' && NWO_RE.test(nwo) ? nwo : null,
       tier: ['standard', 'deep', 'double'].includes(tier) ? tier : 'standard',
-      startedAt: Number(now()) || Date.now(),
+      startedAt: ts,
     };
     const entries = Object.entries(map)
       .filter(([, v]) => v && typeof v === 'object' && isAnyReviewId(v.id))

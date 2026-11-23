@@ -160,7 +160,7 @@ test('byo-login is refused before the engine is called, even with a token presen
 });
 
 test('no credentials: nothing runs, message names the fallback', async () => {
-  const r = await run(['review'], { env: { MEGALENS_TOKEN: undefined } });
+  const r = await run(['review', '--runner', 'local'], { env: { MEGALENS_TOKEN: undefined } });
   assert.equal(r.code, 4); assert.equal(r.calls.length, 0); assert.match(r.text, /MEGALENS_TOKEN/); assert.match(r.text, /megalens-review/);
 });
 

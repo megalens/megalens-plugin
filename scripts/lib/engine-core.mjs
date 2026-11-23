@@ -88,7 +88,15 @@ export function scrub(text, env = {}) {
   for (const k of ['MEGALENS_TOKEN', 'OPENAI_API_KEY', 'MEGALENS_REVIEW_KEY', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN']) {
     const v = env[k]; if (typeof v === 'string' && v.length >= 6) t = t.split(v).join('[redacted]');
   }
-  return t.replace(/\b(?:sk|ml|mlk|rk)[-_][A-Za-z0-9_-]{12,}/g, '[redacted]').replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, '[redacted]').replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, '[redacted]').replace(/\b(Bearer\s+)[A-Za-z0-9._~+\/-]{12,}/gi, '$1[redacted]');
+  return t
+    .replace(/\b(?:sk|ml|mlk|rk)[-_][A-Za-z0-9_-]{12,}/g, '[redacted]')
+    .replace(/\bgh[pousr]_[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_=-]+){2}/g, '[redacted]')
+    .replace(/\bghs_[A-Za-z0-9_.-]{14,}[A-Za-z0-9_=-]/g, '[redacted]')
+    .replace(/\[redacted\]\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_=-]{8,}/g, '[redacted]')
+    .replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, '[redacted]')
+    .replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, '[redacted]')
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_=-]{8,}/g, '[redacted]')
+    .replace(/\b(Bearer\s+)[A-Za-z0-9._~+\/=-]{12,}/gi, '$1[redacted]');
 }
 
 const oneLine = (s, n) => String(s ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]+/g, ' ').trim().slice(0, n);

@@ -49,3 +49,48 @@ Workspace: `/root/review-input/ws-plugin-ux`
 
 - `npm test`: **159 passed, 0 failed** across all 8 test files (`collect`, `mcp-server`, `security`, `review2`, `install`, `engine-v2`, `gh-runner`, `one-command`).
 - No secrets printed; `/var/www` and `ACTIVE-JOB` untouched.
+
+## Fix round
+
+Addresses all 9 points from `/root/review-input/rv-plugin-one-cmd/SOL.md` (preserving all prior security and fallback fixes):
+
+1. **App path on-demand start & `deep` handling (`SOL.md` #1):**
+   - **Fixed in plugin (`scripts/lib/gh-runner.mjs`, `scripts/engine.mjs`):** When both the MegaLens GitHub App and `.github/workflows/megalens-dispatch.yml` are present on a repository and the App has no check run for `headSha` (e.g. a pushed feature branch without an open PR), auto-pick now transparently falls back to the dispatch workflow (`allowNoCheckFallback`) and starts a review on demand without emitting a spurious App error. `deep` also routes to the dispatch workflow when present.
+   - **External server boundary (evidence):** For App-only repositories (no dispatch workflow), the plugin cannot trigger an on-demand review or run `deep` on the MegaLens GitHub App without a backend change: the App backend only handles `installation`, `installation_repositories`, `pull_request`, and default-branch `push` webhooks (`/root/wt/github-app-a/src/lib/github-setup/flag.ts:53-54`, `/root/wt/github-app-a/src/lib/github-setup/webhook.ts:128,312`), only supports the `standard` tier (`/root/wt/github-app-a/src/lib/github-setup/flag.ts:20`), and exposes no on-demand review-start route under `/root/wt/github-app-a/src/app/api/github-app/`. Documented in `PLUGIN-NEEDS.md` #12; covered by `SOL-1` test in `tests/one-command.test.mjs`.
+
+2. **App detection via live installation & repository access (`SOL.md` #2):**
+   - **Fixed (`checkAppInstallation` & `detectRemoteRunner` in `scripts/lib/gh-runner.mjs`):** Queries GitHub's live installation endpoints first: `GET /orgs/{owner}/installations` (paginated, checking `app_slug`, `!suspended_at`, and `repository_selection`) and `GET /user/installations` + `GET /user/installations/{id}/repositories` (paginated). A newly installed App with zero prior checks is now detected, and a removed or suspended App is definitively rejected even when historical checks exist, so it never suppresses the workflow fallback.
+   - **Fallback safety & GitHub API boundary:** When GitHub denies both installation endpoints to the user's `gh` token (e.g. a personal repository or non-org-admin using a standard `gh` OAuth token — GitHub restricts `GET /repos/{owner}/{repo}/installation` to App JWT auth, documented in `PLUGIN-NEEDS.md` #12), detection inspects `headSha` first and never lets stale `defaultBranch` check history suppress a present dispatch workflow (`allowHistoryFallback: !hasWorkflow`). Covered by `SOL-2` test in `tests/one-command.test.mjs`.
+
+3. **Linux runner order & single-line setup message (`SOL.md` #3):**
+   - **Fixed (`chooseRoute` in `scripts/lib/gh-runner.mjs`, `runAutoRemote` in `scripts/engine.mjs`):** No-flag `/megalens:review` now follows the same order on Linux as macOS/Windows: **GitHub App → GitHub Actions workflow → local engine (Linux only, when no remote runner is configured and local credentials are set) → one setup line**. Without local credentials or either remote runner, Linux prints strictly the single setup line with no appended local-engine explanation. Covered by `SOL-3` test in `tests/one-command.test.mjs` and updated route tests in `tests/gh-runner.test.mjs`.
+
+4. **Deadline & cancellation on in-flight child processes and Local Standard (`SOL.md` #4):**
+   - **Fixed (`raceWithDeadline` & `waitForReview` in `scripts/lib/wait-loop.mjs`, `realExec` in `scripts/lib/gh-runner.mjs`, `runBin` & local review paths in `scripts/engine.mjs`):**
+     - Added `raceWithDeadline` passing a per-call `AbortSignal` to every in-flight poll and result-fetch call (`runnerStatus`, `runnerResult`, `appStatus`, `findAppCheckRun`, `localStatus`, `fetchAndRender`), immediately resolving and killing the spawned child (`SIGTERM` + unref'd `SIGKILL` fallback) when either `signal` aborts or `waitMs` expires.
+     - Removed the overtime post-deadline poll and rejected any poll that finishes at or after the deadline (`now() - t0 >= waitMs`).
+     - Wired the same deadline cap, cancellation, and periodic elapsed progress updates to **Local Standard** as well as Local Deep and remote runners.
+     - Covered by `SOL-4` tests in `tests/one-command.test.mjs` (overtime fake-clock poll, hanging real-clock poll abort, slow `gh run download` timeout, Local Standard abort & deadline, and `realExec` abort).
+
+5. **No-id `/megalens:status` and `/megalens:result` always pick the newest review (`SOL.md` #5):**
+   - **Fixed (`findLatestRemoteReview` in `scripts/lib/gh-runner.mjs`, `pickNewerReview` in `scripts/engine.mjs`, `saveLatestReview` in `scripts/lib/latest-review.mjs`):**
+     - `findLatestRemoteReview` inspects **both** the latest MegaLens App check run on `HEAD` and the latest `MegaLens Dispatch` workflow run, returning whichever started more recently by timestamp (`started_at`/`completed_at` vs `createdAt`).
+     - No-id `status`/`result` compares the saved bookmark against `findLatestRemoteReview` via `pickNewerReview` (and stores GitHub's own timestamp when saving remote bookmarks), so a newer remote review always beats an older cached bookmark.
+     - Covered by `SOL-5` test in `tests/one-command.test.mjs`.
+
+6. **App path never silently ignores `--base` (`SOL.md` #6):**
+   - **Fixed (`appPreflight` / `appReview` in `scripts/lib/gh-runner.mjs`, `runAutoRemote` in `scripts/engine.mjs`):** Explicit `--base`/`--head` ranges are automatically routed to the GitHub Actions workflow when present, and rejected immediately with `MSG.appRangeUnsupported` (`code: 4`) on App-only repos or `--runner app` before reading any check run. Covered by `SOL-6` test in `tests/one-command.test.mjs`.
+
+7. **Claude Code long-wait Bash continuation (`SOL.md` #7):**
+   - **Fixed (`commands/review.md`):** Explicitly instructs Claude to pass the 10-minute maximum foreground Bash timeout (`timeout: 600000`) and, if Claude Code moves the Bash command to the background, to never start a second review command and instead follow the background task through its completion notification / task output file until the script finishes (preserving `allowed-tools` and all F2/F3/R7 rules). Covered by `SOL-7` test in `tests/one-command.test.mjs`.
+
+8. **Full redaction of stateless `ghs_APPID_JWT` tokens (`SOL.md` #8):**
+   - **Fixed (`scrub` in `scripts/lib/engine-core.mjs`, `scrubExact` in `scripts/lib/gh-runner.mjs`, `CONTENT_PATTERNS` in `scripts/lib/safety.mjs`):** Redacts full stateless `gh[pousr]_APPID_JWT` tokens (with `.`/`-`/`=` segments), standalone JWTs, and even publisher-pre-truncated `[redacted].eyJ<payload>.<sig>` tails so neither header, payload, nor signature can appear in plugin output. Covered in `tests/one-command.test.mjs` and `tests/gh-runner.test.mjs`.
+
+9. **Strip publisher-embedded `rv_…` review IDs on clean App results (`SOL.md` #9):**
+   - **Fixed (`stripPublisherReviewId` & `renderAppCheckRun` in `scripts/lib/gh-runner.mjs`):** On clean completion (`state === 'done' && !showId`), strips the publisher's `Review: \`rv_…\`` metadata (from `format.js:287`) and hidden `<!-- megalens-review-summary/meta -->` HTML markers while preserving `Tier`, findings, and keeping review IDs on explicit `app:<id>` lookups or partial/failed runs. Covered by `SOL-9` test in `tests/one-command.test.mjs`.
+
+### Verification (Fix round)
+
+- Full test suite (`npm test`): **167 passed, 0 failed** across all 8 test files.
+- No secrets printed; `/var/www`, `ACTIVE-JOB`, and `.env` untouched.

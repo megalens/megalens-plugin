@@ -24,7 +24,7 @@ export function secretPath(p) { return SECRET_PATH_RE.test(p) && !ENV_SAFE_RE.te
 const CONTENT_PATTERNS = [
   [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY( BLOCK)?-----/, 'private key'],
   [/\b(AKIA|ASIA|AGPA|AIDA|AROA)[0-9A-Z]{16}\b/, 'AWS access key id'],
-  [/\bgh[pousr]_[A-Za-z0-9]{30,}\b|\bgithub_pat_[A-Za-z0-9_]{40,}\b/, 'GitHub token'],
+  [/\bgh[pousr]_[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_=-]+){2}|\bghs_[A-Za-z0-9_.-]{14,}[A-Za-z0-9_=-]|\bgh[pousr]_[A-Za-z0-9_]{30,}\b|\bgithub_pat_[A-Za-z0-9_]{40,}\b/, 'GitHub token'],
   [/\bglpat-[A-Za-z0-9_-]{16,}/, 'GitLab token'],
   [/\bsk-(ant-|proj-|live-)?[A-Za-z0-9_-]{24,}/, 'API key (sk-)'],
   [/\b[sr]k_live_[A-Za-z0-9]{16,}/, 'Stripe live key'],

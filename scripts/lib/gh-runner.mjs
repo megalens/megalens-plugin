@@ -1,5 +1,5 @@
 // Review through MegaLens's GitHub App (our review machine) or the user's own GitHub Actions runner: `gh` front end.
-// Every `gh` / `git` call goes through an injectable `exec(cmd, args, {cwd, env})` -> {code, stdout, stderr}, so tests use a fake.
+// Every `gh` / `git` call goes through an injectable `exec(cmd, args, {cwd, env, signal})` -> {code, stdout, stderr}, so tests use a fake.
 // This file never reads, prints or passes MEGALENS_TOKEN or any secret value. It only asks `gh secret list` for the NAME.
 import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { effectiveStatus, renderResult, scrub } from './engine-core.mjs';
-import { DEFAULT_POLL_MS, DEFAULT_PROGRESS_MS, DEFAULT_WAIT_MS, STILL_RUNNING_LINE, defaultSleep, waitForReview } from './wait-loop.mjs';
+import { DEFAULT_POLL_MS, DEFAULT_PROGRESS_MS, DEFAULT_WAIT_MS, STILL_RUNNING_LINE, defaultSleep, raceWithDeadline, waitForReview } from './wait-loop.mjs';
 
 export const WORKFLOW_FILE = 'megalens-dispatch.yml';
 export const WORKFLOW_PATH = `.github/workflows/${WORKFLOW_FILE}`;
@@ -30,8 +30,13 @@ export class SetupError extends Error { constructor(msg, { needsUser = false } =
 export function scrubExact(text, env = {}) {
   let t = String(text ?? '');
   for (const k of ['MEGALENS_TOKEN', 'OPENAI_API_KEY', 'MEGALENS_REVIEW_KEY', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN']) { const v = env[k]; if (typeof v === 'string' && v.length >= 6) t = t.split(v).join('[redacted]'); }
-  // GitHub token shapes cannot be a repo name that matters here, so they are safe to cut by pattern.
-  return t.replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, '[redacted]').replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, '[redacted]');
+  // GitHub token shapes (including stateless ghs_APPID_JWT tokens) cannot be a repo name that matters here, so they are safe to cut by pattern.
+  return t
+    .replace(/\bgh[pousr]_[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_=-]+){2}/g, '[redacted]')
+    .replace(/\bghs_[A-Za-z0-9_.-]{14,}[A-Za-z0-9_=-]/g, '[redacted]')
+    .replace(/\[redacted\]\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_=-]{8,}/g, '[redacted]')
+    .replace(/\bgh[pousr]_[A-Za-z0-9_]{16,}/g, '[redacted]')
+    .replace(/\bgithub_pat_[A-Za-z0-9_]{16,}/g, '[redacted]');
 }
 
 export const isRunnerId = (s) => typeof s === 'string' && RUN_ID_RE.test(s);
@@ -51,15 +56,14 @@ export function isMegaLensAppSlug(slug, env = {}) {
 /**
  * Which route runs the review?
  *   --runner app|github|local -> forced route (no fallback);
- *   not Linux -> auto (our review machine via the GitHub App when installed, else user's GitHub runner when workflow is present);
- *   Linux -> local first when configured, with fall back to auto when the engine is missing, has no local token, or fails its sandbox pre-check.
+ *   no flag -> auto across ALL platforms (MegaLens GitHub App -> user's GitHub Actions runner);
+ *              on Linux, if neither remote runner is set up and local credentials are configured, falls back to local.
  */
 export function chooseRoute({ platform = process.platform, runner = null } = {}) {
   if (runner === 'app') return { route: 'app', fallbackAllowed: false };
   if (runner === 'github') return { route: 'github', fallbackAllowed: false };
   if (runner === 'local') return { route: 'local', fallbackAllowed: false };
-  if (platform !== 'linux') return { route: 'auto', fallbackAllowed: false };
-  return { route: 'local', fallbackAllowed: true };
+  return { route: 'auto', fallbackAllowed: platform === 'linux' };
 }
 
 /** True when the local engine result means "use the remote auto route instead": binary missing, or the sandbox pre-check failed (exit 4). */
@@ -89,16 +93,33 @@ export function ghEnv(env) {
   return out;
 }
 
-/** Real exec: spawn without a shell, capped output. Missing binary -> code 127. */
-export function realExec(cmd, args, { cwd, env }) {
+/** Real exec: spawn without a shell, capped output, kills child promptly on AbortSignal. Missing binary -> code 127. */
+export function realExec(cmd, args, { cwd, env, signal = null } = {}) {
   return new Promise((resolve) => {
+    if (signal?.aborted) return resolve({ code: 4, stdout: '', stderr: '', aborted: true });
     let child;
-    try { child = spawn(cmd, args, { cwd, env: ghEnv(env), stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }); } catch (e) { return resolve({ code: 127, stdout: '', stderr: String(e.message) }); }
-    let stdout = ''; let stderr = '';
+    try { child = spawn(cmd, args, { cwd, env: ghEnv(env ?? {}), stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }); } catch (e) { return resolve({ code: 127, stdout: '', stderr: String(e.message) }); }
+    let stdout = ''; let stderr = ''; let settled = false; let killTimer = null;
+    const finish = (res) => {
+      if (settled) return;
+      settled = true;
+      if (killTimer !== null) clearTimeout(killTimer);
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve(res);
+    };
+    const onAbort = () => {
+      try { child.kill('SIGTERM'); } catch { /* ignore */ }
+      killTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* ignore */ } }, 250);
+      killTimer.unref?.();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      finish({ code: 4, stdout, stderr, aborted: true });
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
     child.stdout.on('data', (c) => { if (stdout.length < MAX_FINDINGS) stdout += c; });
     child.stderr.on('data', (c) => { if (stderr.length < MAX_FINDINGS) stderr += c; });
-    child.on('error', (e) => resolve({ code: e.code === 'ENOENT' ? 127 : 4, stdout, stderr: String(e.message) }));
-    child.on('close', (code) => resolve({ code: code ?? 4, stdout, stderr }));
+    child.on('error', (e) => finish({ code: e.code === 'ENOENT' ? 127 : 4, stdout, stderr: String(e.message) }));
+    child.on('close', (code) => finish({ code: code ?? 4, stdout, stderr }));
   });
 }
 
@@ -108,6 +129,45 @@ const sanitizeMultiline = (s, n = 60_000) => String(s ?? '').replace(/[\u0000-\u
 const short = (sha) => String(sha).slice(0, 7);
 const jsonOf = (s) => { try { return JSON.parse(s); } catch { return null; } };
 const SHA_RE = /^[0-9a-f]{40}$/;
+
+function parseTs(v) {
+  if (typeof v === 'number' && Number.isFinite(v) && v > 0) return v;
+  if (typeof v === 'string' && v.trim()) {
+    const t = Date.parse(v);
+    if (Number.isFinite(t) && t > 0) return t;
+  }
+  return 0;
+}
+
+export function checkRunTimestamp(cr) {
+  return parseTs(cr?.started_at) || parseTs(cr?.completed_at) || parseTs(cr?.created_at);
+}
+
+/** Parse either a single JSON array, a wrapper object (`{installations:[]}`/`{repositories:[]}`), or newline-delimited JSON arrays from `gh api --paginate`. */
+function parsePaginatedList(stdout, wrapperKey = null) {
+  const raw = String(stdout ?? '').trim();
+  if (!raw) return [];
+  const whole = jsonOf(raw);
+  if (Array.isArray(whole)) return whole;
+  if (wrapperKey && whole && Array.isArray(whole[wrapperKey])) return whole[wrapperKey];
+  const pages = raw.split('\n').map((l) => l.trim()).filter(Boolean).map(jsonOf);
+  if (pages.length && pages.every(Array.isArray)) return pages.flat();
+  if (wrapperKey && pages.length && pages.every((p) => p && Array.isArray(p[wrapperKey]))) {
+    return pages.flatMap((p) => p[wrapperKey]);
+  }
+  return null;
+}
+
+/** Strip publisher-embedded review IDs (`Review: \`rv_...\``) and hidden summary HTML markers from clean App results when `showId` is false. */
+export function stripPublisherReviewId(text) {
+  return String(text ?? '')
+    .replace(/^<!--\s*megalens-review-(?:summary|meta):[^\n]*-->\s*\n?/gm, '')
+    .replace(/\s*·\s*Review:\s*`?rv_[A-Za-z0-9_-]{6,64}`?/gi, '')
+    .replace(/Review:\s*`?rv_[A-Za-z0-9_-]{6,64}`?\s*·\s*/gi, '')
+    .replace(/^\s*Review:\s*`?rv_[A-Za-z0-9_-]{6,64}`?\s*$/gim, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
 
 export const MSG = {
   noGh: 'GitHub CLI (`gh`) is not installed. Install it from https://cli.github.com, then run `gh auth login`, then run this again.',
@@ -122,6 +182,7 @@ export const MSG = {
   notFound: (url) => `The workflow was started, but its run could not be found, so there is no id to give you. A review may have been started and charged: do NOT start another one. Open ${url} to find the run, then use its number as gh:<number> with /megalens:status and /megalens:result. Nothing has been reviewed yet.`,
   notSetup: (nwo) => `MegaLens is not set up for ${nwo} yet. Install the MegaLens GitHub App at ${APP_INSTALL_URL} (no workflow or token needed), or add ${WORKFLOW_PATH} for your own GitHub runner, then run /megalens:review again.`,
   appDeepUnsupported: `The MegaLens GitHub App runs Standard reviews. Run /megalens:review for Standard, or add ${WORKFLOW_PATH} to run Deep reviews on your own GitHub runner.`,
+  appRangeUnsupported: `The MegaLens GitHub App reviews pull requests and pushes using GitHub's base commit, not custom --base/--head ranges. Add ${WORKFLOW_PATH} (or pass --runner github / --runner local) to review an explicit range, or run /megalens:review without --base/--head.`,
 };
 
 export function workflowMissingMessage(branch) {
@@ -133,8 +194,8 @@ export function notPushedMessage(sha, branch) {
 }
 
 /** Verify gh is installed, logged in, and this folder has a GitHub repo. Returns {nwo, defaultBranch} or throws SetupError. */
-async function ghRepoPreflight({ exec, cwd, env }) {
-  const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env) });
+async function ghRepoPreflight({ exec, cwd, env, signal = null }) {
+  const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
   const v = await run('gh', ['--version']);
   if (v.code === 127) throw new SetupError(MSG.noGh);
   let au = await run('gh', ['auth', 'status', '--active']);
@@ -149,8 +210,8 @@ async function ghRepoPreflight({ exec, cwd, env }) {
 }
 
 /** True when the dispatch workflow file is present on the default branch. */
-export async function hasDispatchWorkflow({ exec, cwd, env, nwo, defaultBranch }) {
-  const wf = await exec('gh', ['api', '-X', 'GET', `repos/${nwo}/contents/${WORKFLOW_PATH}`, '-f', `ref=${defaultBranch}`, '--jq', '.type'], { cwd, env: ghEnv(env) });
+export async function hasDispatchWorkflow({ exec, cwd, env, nwo, defaultBranch, signal = null }) {
+  const wf = await exec('gh', ['api', '-X', 'GET', `repos/${nwo}/contents/${WORKFLOW_PATH}`, '-f', `ref=${defaultBranch}`, '--jq', '.type'], { cwd, env: ghEnv(env), signal });
   return wf.code === 0 && wf.stdout.trim() === 'file';
 }
 
@@ -164,21 +225,105 @@ function parseAppSlugs(stdout) {
   return String(stdout ?? '').split('\n').map((s) => s.trim()).filter(Boolean);
 }
 
-/** True when the MegaLens GitHub App is detected on `nwo` (via check suites or check runs on `headSha` or `defaultBranch`). */
-export async function isAppInstalled({ exec, cwd, env, nwo, defaultBranch, headSha = null }) {
-  const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env) });
-  const refs = [];
-  if (headSha && SHA_RE.test(headSha)) refs.push(headSha);
-  if (defaultBranch && !refs.includes(defaultBranch)) refs.push(defaultBranch);
-  for (const ref of refs) {
+async function installationHasRepo({ run, instId, nwo }) {
+  if (!Number.isInteger(instId) || instId <= 0) return null;
+  const r = await run('gh', ['api', '-X', 'GET', `user/installations/${instId}/repositories`, '-f', 'per_page=100', '--paginate', '--jq', '[.repositories[]?.full_name]']);
+  if (r.code !== 0) return null;
+  const list = parsePaginatedList(r.stdout, 'repositories');
+  if (!Array.isArray(list)) return null;
+  const target = nwo.toLowerCase();
+  return list.some((x) => (typeof x === 'string' ? x : x?.full_name ?? '').toLowerCase() === target);
+}
+
+/**
+ * Determine whether the MegaLens GitHub App is currently installed and active on `nwo`.
+ * Queries live installation endpoints first (`orgs/{owner}/installations` and `user/installations`) so:
+ *   - newly installed Apps with 0 prior checks are detected;
+ *   - removed or suspended Apps with historical checks are definitively rejected.
+ * Only when GitHub denies both installation endpoints (e.g. personal repo or non-admin org member with a
+ * standard OAuth token) does it fall back to check suites/runs — checking `headSha` first, and consulting
+ * `defaultBranch` check history only when `allowHistoryFallback` is true (so stale history never suppresses
+ * an existing dispatch workflow).
+ */
+export async function checkAppInstallation({ exec, cwd, env, nwo, defaultBranch, headSha = null, allowHistoryFallback = true, signal = null }) {
+  const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
+  const owner = String(nwo).split('/')[0];
+  let orgSelectedActive = false;
+
+  // 1. Live organization installations API (authoritative when the user is an org admin).
+  if (owner) {
+    const orgRes = await run('gh', [
+      'api', '-X', 'GET', `orgs/${owner}/installations`,
+      '-f', 'per_page=100', '--paginate',
+      '--jq', '[.installations[]? | {id: .id, app_slug: .app_slug, repository_selection: .repository_selection, suspended_at: .suspended_at, account_login: .account.login}]',
+    ]);
+    if (orgRes.code === 0) {
+      const installs = parsePaginatedList(orgRes.stdout, 'installations');
+      if (Array.isArray(installs)) {
+        const active = installs.filter((i) => i && isMegaLensAppSlug(i.app_slug, env) && !i.suspended_at);
+        if (active.length === 0) return { installed: false, source: 'org-api' };
+        if (active.some((i) => i.repository_selection === 'all')) return { installed: true, source: 'org-api' };
+        // `repository_selection === 'selected'`: check repo list when permitted.
+        let repoCheckConclusive = true;
+        for (const inst of active) {
+          const has = await installationHasRepo({ run, instId: inst.id, nwo });
+          if (has === true) return { installed: true, source: 'org-api' };
+          if (has === null) repoCheckConclusive = false;
+        }
+        if (repoCheckConclusive) return { installed: false, source: 'org-api' };
+        orgSelectedActive = true;
+      }
+    }
+  }
+
+  // 2. Live user installations API (authoritative when authenticated with a GitHub App user access token).
+  const userRes = await run('gh', [
+    'api', '-X', 'GET', 'user/installations',
+    '-f', 'per_page=100', '--paginate',
+    '--jq', '[.installations[]? | {id: .id, app_slug: .app_slug, repository_selection: .repository_selection, suspended_at: .suspended_at, account_login: .account.login}]',
+  ]);
+  if (userRes.code === 0) {
+    const installs = parsePaginatedList(userRes.stdout, 'installations');
+    if (Array.isArray(installs)) {
+      const ownerLower = owner.toLowerCase();
+      const active = installs.filter((i) => {
+        if (!i || !isMegaLensAppSlug(i.app_slug, env) || i.suspended_at) return false;
+        const login = typeof i.account_login === 'string' ? i.account_login : i.account?.login;
+        return !login || login.toLowerCase() === ownerLower;
+      });
+      if (active.length === 0) return { installed: false, source: 'user-api' };
+      if (active.some((i) => i.repository_selection === 'all')) return { installed: true, source: 'user-api' };
+      let repoCheckConclusive = true;
+      for (const inst of active) {
+        const has = await installationHasRepo({ run, instId: inst.id, nwo });
+        if (has === true) return { installed: true, source: 'user-api' };
+        if (has === null) repoCheckConclusive = false;
+      }
+      if (repoCheckConclusive) return { installed: false, source: 'user-api' };
+    }
+  }
+
+  // 3. Check suites / check runs fallback when live installation endpoints are inaccessible to the token.
+  const hasMegaLensOnRef = async (ref) => {
     const cs = await run('gh', ['api', '-X', 'GET', `repos/${nwo}/commits/${ref}/check-suites`, '--jq', '[.check_suites[]?.app?.slug]']);
     if (cs.code === 0 && parseAppSlugs(cs.stdout).some((s) => isMegaLensAppSlug(s, env))) return true;
-  }
-  for (const ref of refs) {
     const cr = await run('gh', ['api', '-X', 'GET', `repos/${nwo}/commits/${ref}/check-runs`, '--jq', '[.check_runs[]? | {name: .name, slug: .app.slug}]']);
     if (cr.code === 0 && parseAppSlugs(cr.stdout).some((s) => isMegaLensAppSlug(s, env))) return true;
+    return false;
+  };
+
+  if (headSha && SHA_RE.test(headSha)) {
+    if (await hasMegaLensOnRef(headSha)) return { installed: true, source: orgSelectedActive ? 'org-api' : 'head-check' };
   }
-  return false;
+  if ((allowHistoryFallback || orgSelectedActive) && defaultBranch && defaultBranch !== headSha) {
+    if (await hasMegaLensOnRef(defaultBranch)) return { installed: true, source: orgSelectedActive ? 'org-api' : 'history-check' };
+  }
+  return { installed: false, source: 'none' };
+}
+
+/** True when the MegaLens GitHub App is detected on `nwo`. */
+export async function isAppInstalled(opts) {
+  return (await checkAppInstallation(opts)).installed;
 }
 
 /**
@@ -187,32 +332,37 @@ export async function isAppInstalled({ exec, cwd, env, nwo, defaultBranch, headS
  *   2. Else the user's GitHub Actions runner when `.github/workflows/megalens-dispatch.yml` is present;
  *   3. Else `none` with one clear setup line.
  */
-export async function detectRemoteRunner({ exec, cwd, env, headSha = null }) {
+export async function detectRemoteRunner({ exec, cwd, env, headSha = null, signal = null }) {
   let repo;
-  try { repo = await ghRepoPreflight({ exec, cwd, env }); }
+  try { repo = await ghRepoPreflight({ exec, cwd, env, signal }); }
   catch (e) {
-    if (e instanceof SetupError) return { runner: 'none', message: e.message };
+    if (e instanceof SetupError) return { runner: 'none', message: e.message, reason: 'preflight' };
     throw e;
   }
   const { nwo, defaultBranch } = repo;
   let sha = headSha;
   if (!sha) {
-    const hs = await exec('git', ['rev-parse', '--verify', 'HEAD^{commit}'], { cwd, env: ghEnv(env) });
+    const hs = await exec('git', ['rev-parse', '--verify', 'HEAD^{commit}'], { cwd, env: ghEnv(env), signal });
     if (hs.code === 0 && SHA_RE.test(hs.stdout.trim())) sha = hs.stdout.trim();
   }
-  const app = await isAppInstalled({ exec, cwd, env, nwo, defaultBranch, headSha: sha });
-  if (app) return { runner: 'app', nwo, defaultBranch };
-  const wf = await hasDispatchWorkflow({ exec, cwd, env, nwo, defaultBranch });
-  if (wf) return { runner: 'github', nwo, defaultBranch };
-  return { runner: 'none', nwo, defaultBranch, message: MSG.notSetup(nwo) };
+  const hasWorkflow = await hasDispatchWorkflow({ exec, cwd, env, nwo, defaultBranch, signal });
+  const app = await checkAppInstallation({
+    exec, cwd, env, nwo, defaultBranch, headSha: sha,
+    // Never let historical check suites on defaultBranch suppress a present dispatch workflow.
+    allowHistoryFallback: !hasWorkflow,
+    signal,
+  });
+  if (app.installed) return { runner: 'app', nwo, defaultBranch, hasWorkflow, appSource: app.source };
+  if (hasWorkflow) return { runner: 'github', nwo, defaultBranch, hasWorkflow: true };
+  return { runner: 'none', nwo, defaultBranch, hasWorkflow: false, message: MSG.notSetup(nwo), reason: 'not_setup' };
 }
 
 /** Everything the GitHub Actions runner needs before it starts. Throws SetupError with a message naming the exact fix. */
-export async function preflight({ exec, cwd, env, base = null, head = null }) {
-  const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env) });
-  const { nwo, defaultBranch } = await ghRepoPreflight({ exec, cwd, env });
+export async function preflight({ exec, cwd, env, base = null, head = null, signal = null }) {
+  const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
+  const { nwo, defaultBranch } = await ghRepoPreflight({ exec, cwd, env, signal });
 
-  if (!(await hasDispatchWorkflow({ exec, cwd, env, nwo, defaultBranch }))) throw new SetupError(workflowMissingMessage(defaultBranch));
+  if (!(await hasDispatchWorkflow({ exec, cwd, env, nwo, defaultBranch, signal }))) throw new SetupError(workflowMissingMessage(defaultBranch));
 
   let note = '';
   const sl = await run('gh', ['secret', 'list', '--json', 'name', '-R', nwo]);
@@ -272,24 +422,31 @@ const listRuns = async (run, nwo, limit = 50) => {
  * Start the workflow run and find the id it created. Run ids that exist before the dispatch are recorded; only a NEW run
  * whose title is exactly "MegaLens <tier> <base>..<head>" counts. If the match is not certain nothing is started again.
  */
-export async function startRun({ exec, cwd, env, tier, pre, sleepMs = 2000, tries = 15, sleep = defaultSleep }) {
-  const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env) });
+export async function startRun({ exec, cwd, env, tier, pre, sleepMs = 2000, tries = 15, sleep = defaultSleep, signal = null }) {
+  const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
   const before = await listRuns(run, pre.nwo);
   if (before === null) throw new SetupError('Could not list the existing workflow runs, so a new run could not be told apart. Nothing was started and no credit was used. Check `gh auth status` and your network, then run this again.');
   const seen = new Set(before.map((x) => x.databaseId));
   const title = runTitle(tier, pre.baseSha, pre.headSha);
   const r = await run('gh', ['workflow', 'run', WORKFLOW_FILE, '--ref', pre.defaultBranch, '-f', `tier=${tier}`, '-f', `base_sha=${pre.baseSha}`, '-f', `head_sha=${pre.headSha}`, '-R', pre.nwo]);
   if (r.code !== 0) throw new SetupError(`GitHub did not start the workflow: ${scrub(firstLine(r.stderr), env) || 'no reason given'}. Check that ${WORKFLOW_PATH} is on ${pre.defaultBranch} and that you can run workflows in this repository.`);
-  for (let i = 0; i < tries; i++) {
+  for (let i = 0; i < tries && !signal?.aborted; i++) {
     const rows = await listRuns(run, pre.nwo);
     if (rows) {
       const hits = rows.filter((x) => !seen.has(x.databaseId) && x.displayTitle === title);
-      if (hits.length === 1) { const hit = hits[0]; return { id: `gh:${hit.databaseId}`, url: typeof hit.url === 'string' ? hit.url : `https://github.com/${pre.nwo}/actions/runs/${hit.databaseId}` }; }
+      if (hits.length === 1) {
+        const hit = hits[0];
+        return {
+          id: `gh:${hit.databaseId}`,
+          url: typeof hit.url === 'string' ? hit.url : `https://github.com/${pre.nwo}/actions/runs/${hit.databaseId}`,
+          createdAt: typeof hit.createdAt === 'string' ? hit.createdAt : null,
+        };
+      }
       if (hits.length > 1) break;
     }
-    await sleep(sleepMs);
+    await sleep(sleepMs, signal);
   }
-  return { id: null, url: `https://github.com/${pre.nwo}/actions/workflows/${WORKFLOW_FILE}` };
+  return { id: null, url: `https://github.com/${pre.nwo}/actions/workflows/${WORKFLOW_FILE}`, createdAt: null };
 }
 
 /** gh run state -> queued / running / done / failed. */
@@ -302,15 +459,16 @@ export function mapState(status, conclusion) {
 }
 
 /** The repository gh works in, resolved once; every later call names it with -R. Null when gh cannot tell. */
-async function repoOf({ exec, cwd, env }) {
-  const rv = await exec('gh', ['repo', 'view', '--json', 'nameWithOwner'], { cwd, env: ghEnv(env) });
+async function repoOf({ exec, cwd, env, signal = null }) {
+  const rv = await exec('gh', ['repo', 'view', '--json', 'nameWithOwner'], { cwd, env: ghEnv(env), signal });
   const j = rv.code === 0 ? jsonOf(rv.stdout) : null;
   return typeof j?.nameWithOwner === 'string' && /^[\w.-]+\/[\w.-]+$/.test(j.nameWithOwner) ? j.nameWithOwner : null;
 }
 const scoped = (args, nwo) => (nwo ? [...args, '-R', nwo] : args);
 
-async function viewRun({ exec, cwd, env }, id, nwo = null) {
-  const r = await exec('gh', scoped(['run', 'view', id, '--json', 'status,conclusion,url,workflowName,displayTitle'], nwo), { cwd, env: ghEnv(env) });
+async function viewRun({ exec, cwd, env, signal = null }, id, nwo = null) {
+  const r = await exec('gh', scoped(['run', 'view', id, '--json', 'status,conclusion,url,workflowName,displayTitle'], nwo), { cwd, env: ghEnv(env), signal });
+  if (r.aborted || signal?.aborted) return { aborted: true };
   const j = r.code === 0 ? jsonOf(r.stdout) : null;
   if (!j || typeof j.status !== 'string') return { error: `Could not read run gh:${id}: ${scrub(firstLine(r.stderr), env) || 'no usable answer from gh'}. Check the id, that you are in the same repository, and \`gh auth status\`. This is not a finished review.\n` };
   if (j.workflowName !== WORKFLOW_NAME) return { error: `gh:${id} is not a MegaLens review run. Nothing was read from it.\n` };
@@ -319,7 +477,11 @@ async function viewRun({ exec, cwd, env }, id, nwo = null) {
 
 export async function runnerStatus(ctx, rawId, { showId = true } = {}) {
   const id = runIdOf(rawId);
-  const v = await viewRun(ctx, id, await repoOf(ctx)); if (v.error) return { text: v.error, code: 4, state: 'error' };
+  const nwo = ctx.nwo ?? await repoOf(ctx);
+  if (ctx.signal?.aborted) return { text: '', code: 4, state: 'aborted' };
+  const v = await viewRun(ctx, id, nwo);
+  if (v.aborted) return { text: '', code: 4, state: 'aborted' };
+  if (v.error) return { text: v.error, code: 4, state: 'error' };
   const state = mapState(v.j.status, v.j.conclusion); const url = String(v.j.url ?? '').slice(0, 300);
   if (!showId && state !== 'failed') {
     const shortWords = {
@@ -340,8 +502,11 @@ export async function runnerStatus(ctx, rawId, { showId = true } = {}) {
 
 export async function runnerResult(ctx, rawId, { showId = true } = {}) {
   const id = runIdOf(rawId);
-  const nwo = await repoOf(ctx);
-  const v = await viewRun(ctx, id, nwo); if (v.error) return { text: v.error, code: 4 };
+  const nwo = ctx.nwo ?? await repoOf(ctx);
+  if (ctx.signal?.aborted) return { text: '', code: 4, aborted: true };
+  const v = await viewRun(ctx, id, nwo);
+  if (v.aborted) return { text: '', code: 4, aborted: true };
+  if (v.error) return { text: v.error, code: 4 };
   const state = mapState(v.j.status, v.j.conclusion);
   if (state === 'queued' || state === 'running') {
     const msg = showId
@@ -351,7 +516,8 @@ export async function runnerResult(ctx, rawId, { showId = true } = {}) {
   }
   const dir = mkdtempSync(path.join(tmpdir(), 'megalens-'), { mode: 0o700 });
   try {
-    const d = await ctx.exec('gh', scoped(['run', 'download', id, '-n', ARTIFACT_NAME, '-D', dir], nwo), { cwd: ctx.cwd, env: ghEnv(ctx.env) });
+    const d = await ctx.exec('gh', scoped(['run', 'download', id, '-n', ARTIFACT_NAME, '-D', dir], nwo), { cwd: ctx.cwd, env: ghEnv(ctx.env), signal: ctx.signal ?? null });
+    if (d.aborted || ctx.signal?.aborted) return { text: '', code: 4, aborted: true };
     let doc = null;
     const file = path.join(dir, 'findings.json');
     if (d.code === 0) { try { if (statSync(file).size <= MAX_FINDINGS) doc = JSON.parse(readFileSync(file, 'utf8')); } catch { doc = null; } }
@@ -398,9 +564,9 @@ export async function runnerReview({
 }) {
   if (tier !== 'standard' && tier !== 'deep') return { text: 'The GitHub runner path runs the standard or deep tier.\n', code: 4 };
   let pre;
-  try { pre = await preflight({ exec, cwd, env, base, head }); } catch (e) { if (e instanceof SetupError) return { text: e.message.endsWith('\n') ? e.message : `${e.message}\n`, code: 4, setup: true, needsUser: e.needsUser }; throw e; }
+  try { pre = await preflight({ exec, cwd, env, base, head, signal }); } catch (e) { if (e instanceof SetupError) return { text: e.message.endsWith('\n') ? e.message : `${e.message}\n`, code: 4, setup: true, needsUser: e.needsUser }; throw e; }
   let started;
-  try { started = await startRun({ exec, cwd, env, tier, pre, sleepMs, tries, sleep }); } catch (e) { if (e instanceof SetupError) return { text: `${e.message}\n`, code: 4, setup: true }; throw e; }
+  try { started = await startRun({ exec, cwd, env, tier, pre, sleepMs, tries, sleep, signal }); } catch (e) { if (e instanceof SetupError) return { text: `${e.message}\n`, code: 4, setup: true }; throw e; }
   let acc = '';
   const emit = (s) => { acc += s; onLine?.(s); };
   if (pre.note) emit(pre.note);
@@ -409,7 +575,7 @@ export async function runnerReview({
     emit(errText);
     return { text: acc, code: 4 };
   }
-  saveLatest?.({ id: started.id, runner: 'github', nwo: pre.nwo, tier });
+  saveLatest?.({ id: started.id, runner: 'github', nwo: pre.nwo, tier, startedAt: parseTs(started.createdAt) || undefined });
   if (!wait) {
     const noWaitMsg = showIdOnNoWait
       ? `Review of ${short(pre.baseSha)}..${short(pre.headSha)} in ${pre.nwo}, tier ${tier}, runs on your GitHub runner.\nReview started on GitHub: ${started.id}\nRun: ${started.url}\n${STILL_RUNNING_LINE}\n`
@@ -417,9 +583,10 @@ export async function runnerReview({
     emit(noWaitMsg);
     return { text: acc, code: 0, id: started.id };
   }
-  const ctx = { exec, cwd, env };
+  const t0 = now();
+  const baseCtx = { exec, cwd, env, nwo: pre.nwo };
   const w = await waitForReview({
-    poll: () => runnerStatus(ctx, started.id, { showId: false }),
+    poll: (callSignal) => runnerStatus({ ...baseCtx, signal: callSignal }, started.id, { showId: false }),
     onLine: emit,
     startedLine: 'Review started',
     queuedLine: 'Queued on GitHub...',
@@ -428,11 +595,21 @@ export async function runnerReview({
     pollMs,
     progressMs,
     now,
+    t0,
     sleep,
     signal,
   });
   if (w.finished && (w.last?.state === 'done' || w.last?.state === 'failed')) {
-    const r = await runnerResult(ctx, started.id, { showId: false });
+    const remainingMs = Math.max(0, waitMs - Math.max(0, now() - t0));
+    const fetched = await raceWithDeadline(
+      (callSignal) => runnerResult({ ...baseCtx, signal: callSignal }, started.id, { showId: false }),
+      { signal, remainingMs, now, t0, waitMs },
+    );
+    if (fetched.interrupted || fetched.value?.aborted) {
+      emit(`${STILL_RUNNING_LINE}\n`);
+      return { text: acc, code: 0, id: started.id, timedOut: fetched.interrupted === 'timeout', aborted: fetched.interrupted === 'aborted' || Boolean(fetched.value?.aborted) };
+    }
+    const r = fetched.value;
     emit(r.text);
     return { text: acc, code: r.code, id: started.id };
   }
@@ -474,18 +651,19 @@ function parseCheckRuns(stdout) {
 }
 
 /** Find the newest MegaLens App check run on `headSha`. */
-export async function findAppCheckRun({ exec, cwd, env, nwo, headSha }) {
-  const r = await exec('gh', ['api', '-X', 'GET', `repos/${nwo}/commits/${headSha}/check-runs`], { cwd, env: ghEnv(env) });
-  if (r.code !== 0) return null;
+export async function findAppCheckRun({ exec, cwd, env, nwo, headSha, signal = null }) {
+  const r = await exec('gh', ['api', '-X', 'GET', `repos/${nwo}/commits/${headSha}/check-runs`], { cwd, env: ghEnv(env), signal });
+  if (r.code !== 0 || r.aborted) return null;
   const runs = parseCheckRuns(r.stdout)
     .filter((c) => c && Number.isInteger(c.id) && c.name === CHECK_NAME && isMegaLensAppSlug(c.app?.slug, env))
-    .sort((a, b) => b.id - a.id);
+    .sort((a, b) => (checkRunTimestamp(b) - checkRunTimestamp(a)) || (b.id - a.id));
   return runs[0] ?? null;
 }
 
-async function viewCheckRun({ exec, cwd, env }, checkRunId, nwo) {
+async function viewCheckRun({ exec, cwd, env, signal = null }, checkRunId, nwo) {
   if (!nwo) return { error: `Could not read MegaLens review app:${checkRunId}: no GitHub repository found in this folder. This is not a finished review.\n` };
-  const r = await exec('gh', ['api', '-X', 'GET', `repos/${nwo}/check-runs/${checkRunId}`], { cwd, env: ghEnv(env) });
+  const r = await exec('gh', ['api', '-X', 'GET', `repos/${nwo}/check-runs/${checkRunId}`], { cwd, env: ghEnv(env), signal });
+  if (r.aborted || signal?.aborted) return { aborted: true };
   const cr = r.code === 0 ? jsonOf(r.stdout) : null;
   if (!cr || typeof cr.status !== 'string') return { error: `Could not read MegaLens review app:${checkRunId}: ${scrub(firstLine(r.stderr), env) || 'no usable answer from gh'}. This is not a finished review.\n` };
   if (cr.name !== CHECK_NAME || !isMegaLensAppSlug(cr.app?.slug, env)) return { error: `app:${checkRunId} is not a MegaLens review check run. Nothing was read from it.\n` };
@@ -494,8 +672,12 @@ async function viewCheckRun({ exec, cwd, env }, checkRunId, nwo) {
 
 function renderAppCheckRun(cr, rawId, { env = {}, showId = false } = {}) {
   const state = mapCheckState(cr);
-  const title = scrub(oneLine(cr?.output?.title ?? '', 200), env);
-  const summary = scrub(sanitizeMultiline(cr?.output?.summary ?? '', 60_000), env);
+  let title = scrub(oneLine(cr?.output?.title ?? '', 200), env);
+  let summary = scrub(sanitizeMultiline(cr?.output?.summary ?? '', 60_000), env);
+  if (state === 'done' && !showId) {
+    title = stripPublisherReviewId(title);
+    summary = stripPublisherReviewId(summary);
+  }
   const url = String(cr?.html_url ?? '').slice(0, 300);
   if (state === 'queued' || state === 'running') {
     const msg = showId ? `Review ${rawId} is still ${state}. Run /megalens:result to see it.\n` : `${STILL_RUNNING_LINE}\n`;
@@ -532,7 +714,9 @@ function renderAppCheckRun(cr, rawId, { env = {}, showId = false } = {}) {
 export async function appStatus(ctx, rawId, { showId = true } = {}) {
   const id = checkRunIdOf(rawId);
   const nwo = ctx.nwo || await repoOf(ctx);
+  if (ctx.signal?.aborted) return { text: '', code: 4, state: 'aborted' };
   const v = await viewCheckRun(ctx, id, nwo);
+  if (v.aborted) return { text: '', code: 4, state: 'aborted' };
   if (v.error) return { text: v.error, code: 4, state: 'error' };
   const state = mapCheckState(v.cr);
   const url = String(v.cr.html_url ?? '').slice(0, 300);
@@ -559,14 +743,17 @@ export async function appStatus(ctx, rawId, { showId = true } = {}) {
 export async function appResult(ctx, rawId, { showId = true } = {}) {
   const id = checkRunIdOf(rawId);
   const nwo = ctx.nwo || await repoOf(ctx);
+  if (ctx.signal?.aborted) return { text: '', code: 4, aborted: true };
   const v = await viewCheckRun(ctx, id, nwo);
+  if (v.aborted) return { text: '', code: 4, aborted: true };
   if (v.error) return { text: v.error, code: 4 };
   return renderAppCheckRun(v.cr, `app:${id}`, { env: ctx.env, showId });
 }
 
-export async function appPreflight({ exec, cwd, env, nwo = null, defaultBranch = null, base = null, head = null }) {
-  const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env) });
-  const repo = nwo && defaultBranch ? { nwo, defaultBranch } : await ghRepoPreflight({ exec, cwd, env });
+export async function appPreflight({ exec, cwd, env, nwo = null, defaultBranch = null, base = null, head = null, signal = null }) {
+  if (base !== null) throw new SetupError(MSG.appRangeUnsupported);
+  const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
+  const repo = nwo && defaultBranch ? { nwo, defaultBranch } : await ghRepoPreflight({ exec, cwd, env, signal });
   const headRef = head ?? 'HEAD';
   const hs = await run('git', ['rev-parse', '--verify', `${headRef}^{commit}`]);
   const headSha = hs.stdout.trim();
@@ -610,41 +797,55 @@ export async function appReview({
   onLine = null,
   saveLatest = null,
   preRepo = null,
+  allowNoCheckFallback = false,
 }) {
   if (tier !== 'standard') return { text: `${MSG.appDeepUnsupported}\n`, code: 4 };
+  if (base !== null) return { text: `${MSG.appRangeUnsupported}\n`, code: 4 };
   let pre;
-  try { pre = await appPreflight({ exec, cwd, env, nwo: preRepo?.nwo, defaultBranch: preRepo?.defaultBranch, base, head }); }
+  try { pre = await appPreflight({ exec, cwd, env, nwo: preRepo?.nwo, defaultBranch: preRepo?.defaultBranch, base, head, signal }); }
   catch (e) { if (e instanceof SetupError) return { text: e.message.endsWith('\n') ? e.message : `${e.message}\n`, code: 4, setup: true, needsUser: e.needsUser }; throw e; }
 
+  const t0 = now();
   let acc = '';
   const emit = (s) => { acc += s; onLine?.(s); };
-  if (pre.note) emit(pre.note);
 
-  let cr = await findAppCheckRun({ exec, cwd, env, nwo: pre.nwo, headSha: pre.headSha });
+  let cr = await findAppCheckRun({ exec, cwd, env, nwo: pre.nwo, headSha: pre.headSha, signal });
   if (!cr) {
     // Check if commit is on default branch or has an open PR (webhook may still be arriving).
-    const br = await exec('git', ['branch', '--show-current'], { cwd, env: ghEnv(env) });
+    const br = await exec('git', ['branch', '--show-current'], { cwd, env: ghEnv(env), signal });
     const onDefault = br.code === 0 && br.stdout.trim() === pre.defaultBranch;
-    const prRes = await exec('gh', ['api', '-X', 'GET', `repos/${pre.nwo}/commits/${pre.headSha}/pulls`, '--jq', '[.[] | select(.state == "open") | .number]'], { cwd, env: ghEnv(env) });
+    const prRes = await exec('gh', ['api', '-X', 'GET', `repos/${pre.nwo}/commits/${pre.headSha}/pulls`, '--jq', '[.[] | select(.state == "open") | .number]'], { cwd, env: ghEnv(env), signal });
     const openPrs = prRes.code === 0 ? jsonOf(prRes.stdout) : null;
     const hasOpenPr = Array.isArray(openPrs) && openPrs.length > 0;
     if (onDefault || hasOpenPr) {
       for (let i = 0; i < appearTries && !cr && !signal?.aborted; i++) {
-        await sleep(sleepMs, signal);
-        cr = await findAppCheckRun({ exec, cwd, env, nwo: pre.nwo, headSha: pre.headSha });
+        const rem = waitMs - Math.max(0, now() - t0);
+        if (rem <= 0) break;
+        await sleep(Math.min(sleepMs, rem), signal);
+        const remAfter = waitMs - Math.max(0, now() - t0);
+        if (remAfter <= 0 || signal?.aborted) break;
+        const found = await raceWithDeadline(
+          (callSignal) => findAppCheckRun({ exec, cwd, env, nwo: pre.nwo, headSha: pre.headSha, signal: callSignal }),
+          { signal, remainingMs: remAfter, now, t0, waitMs },
+        );
+        if (found.interrupted) break;
+        cr = found.value;
       }
     }
     if (!cr) {
+      if (allowNoCheckFallback) return { text: '', code: 4, noCheck: true };
+      if (pre.note) emit(pre.note);
       const msg = (onDefault || hasOpenPr)
         ? `No MegaLens review started for this commit yet. Check that reviews are turned on for ${pre.nwo} at ${APP_INSTALL_URL}.\n`
         : `The MegaLens GitHub App reviews pull requests and pushes to ${pre.defaultBranch}. Open a pull request (e.g. \`gh pr create\`) or push to ${pre.defaultBranch}, then run /megalens:review again.\n`;
       emit(msg);
-      return { text: acc, code: 4, setup: true };
+      return { text: acc, code: 4, setup: true, noCheck: true };
     }
   }
 
+  if (pre.note) emit(pre.note);
   const id = `app:${cr.id}`;
-  saveLatest?.({ id, runner: 'app', nwo: pre.nwo, tier });
+  saveLatest?.({ id, runner: 'app', nwo: pre.nwo, tier, startedAt: checkRunTimestamp(cr) || undefined });
   const initialState = mapCheckState(cr);
   if (initialState === 'done' || initialState === 'partial' || initialState === 'failed' || initialState === 'cancelled') {
     const rendered = renderAppCheckRun(cr, id, { env, showId: false });
@@ -655,9 +856,9 @@ export async function appReview({
     emit(`Review started\n${STILL_RUNNING_LINE}\n`);
     return { text: acc, code: 0, id };
   }
-  const ctx = { exec, cwd, env, nwo: pre.nwo };
+  const baseCtx = { exec, cwd, env, nwo: pre.nwo };
   const w = await waitForReview({
-    poll: () => appStatus(ctx, id, { showId: false }),
+    poll: (callSignal) => appStatus({ ...baseCtx, signal: callSignal }, id, { showId: false }),
     onLine: emit,
     startedLine: 'Review started',
     queuedLine: 'Waiting for MegaLens review machine...',
@@ -666,6 +867,7 @@ export async function appReview({
     pollMs,
     progressMs,
     now,
+    t0,
     sleep,
     signal,
   });
@@ -682,19 +884,32 @@ export async function appReview({
 }
 
 /**
- * Fallback lookup when `/megalens:result` or `/megalens:status` is called with no id and no local bookmark exists:
- * checks for a MegaLens App check run on HEAD, else the latest MegaLens Dispatch workflow run on this repo.
+ * Fallback lookup when `/megalens:result` or `/megalens:status` is called with no id:
+ * checks BOTH a MegaLens App check run on HEAD AND the latest MegaLens Dispatch workflow run,
+ * returning whichever started more recently.
  */
-export async function findLatestRemoteReview({ exec, cwd, env }) {
-  const nwo = await repoOf({ exec, cwd, env });
+export async function findLatestRemoteReview({ exec, cwd, env, signal = null }) {
+  const nwo = await repoOf({ exec, cwd, env, signal });
   if (!nwo) return null;
-  const hs = await exec('git', ['rev-parse', '--verify', 'HEAD^{commit}'], { cwd, env: ghEnv(env) });
+  let appCand = null;
+  const hs = await exec('git', ['rev-parse', '--verify', 'HEAD^{commit}'], { cwd, env: ghEnv(env), signal });
   if (hs.code === 0 && SHA_RE.test(hs.stdout.trim())) {
-    const cr = await findAppCheckRun({ exec, cwd, env, nwo, headSha: hs.stdout.trim() });
-    if (cr) return { id: `app:${cr.id}`, runner: 'app', nwo };
+    const cr = await findAppCheckRun({ exec, cwd, env, nwo, headSha: hs.stdout.trim(), signal });
+    if (cr) appCand = { id: `app:${cr.id}`, runner: 'app', nwo, startedAt: checkRunTimestamp(cr) };
   }
-  const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env) });
+  let ghCand = null;
+  const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
   const rows = await listRuns(run, nwo, 1);
-  if (rows && rows.length > 0) return { id: `gh:${rows[0].databaseId}`, runner: 'github', nwo };
-  return null;
+  if (rows && rows.length > 0) {
+    ghCand = { id: `gh:${rows[0].databaseId}`, runner: 'github', nwo, startedAt: parseTs(rows[0].createdAt) };
+  }
+  if (appCand && ghCand) {
+    if (ghCand.startedAt > 0 && appCand.startedAt > 0) {
+      return ghCand.startedAt > appCand.startedAt ? ghCand : appCand;
+    }
+    if (ghCand.startedAt > 0) return ghCand;
+    if (appCand.startedAt > 0) return appCand;
+    return appCand;
+  }
+  return appCand || ghCand || null;
 }
