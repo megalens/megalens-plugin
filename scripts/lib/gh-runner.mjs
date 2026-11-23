@@ -433,17 +433,26 @@ export function notPushedMessage(sha, branch) {
   return `NEEDS THE USER'S OK: your latest commit (${short(sha)}) is not on GitHub yet, and GitHub can only review what is on GitHub. Nothing was pushed. Ask the user: "Push ${branch || 'this branch'} to GitHub so it can be reviewed?" Only if the user says yes, run \`git push\` (if the branch has no upstream: \`git push -u origin HEAD\`), then run /megalens:review again. If the user says no, stop.\n`;
 }
 
+async function ghAuthStatus(run, hostArgs = []) {
+  const status = await run('gh', ['auth', 'status', '--active', ...hostArgs]);
+  if (status.code !== 0 && /unknown flag/i.test(status.stderr)) {
+    return run('gh', ['auth', 'status', ...hostArgs]);
+  }
+  return status;
+}
+
+function ghIsSignedOut({ code, stderr, stdout }) {
+  return code !== 0 && /^You are not logged into (?:any GitHub hosts|any accounts on github\.com)(?:\.|$)/im.test(`${stderr}\n${stdout}`);
+}
+
 /** Verify gh is installed, logged in, and this folder has a GitHub repo. Retains host so GitHub Enterprise repos are never sent to github.com's App. */
 async function ghRepoPreflight({ exec, cwd, env, signal = null }) {
   const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
   const v = await run('gh', ['--version']);
   if (v.code === 127) throw new GhUnavailableError(MSG.noGh);
-  let au = await run('gh', ['auth', 'status', '--active']);
-  if (au.code !== 0 && /unknown flag/i.test(au.stderr)) au = await run('gh', ['auth', 'status']);
+  const au = await ghAuthStatus(run);
   if (au.code !== 0) {
-    if (/^You are not logged into any GitHub hosts(?:\.|$)/im.test(`${au.stderr}\n${au.stdout}`)) {
-      throw new GhUnavailableError(MSG.noLogin);
-    }
+    if (ghIsSignedOut(au)) throw new GhUnavailableError(MSG.noLogin);
     throw new SetupError(MSG.noLogin);
   }
   const rv = await run('gh', ['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef,url']);
@@ -481,10 +490,15 @@ async function ghRepoPreflight({ exec, cwd, env, signal = null }) {
 async function gitRepoFallback({ exec, cwd, env, signal = null, ghError }) {
   const envHost = typeof env?.GH_HOST === 'string' && env.GH_HOST.trim() ? env.GH_HOST.trim().toLowerCase() : '';
   if (envHost && envHost !== 'github.com') return null;
-  const r = await exec('git', ['remote', 'get-url', 'origin'], { cwd, env: ghEnv(env), signal });
+  const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
+  const r = await run('git', ['remote', 'get-url', 'origin']);
   if (r.code !== 0) return null;
   const nwo = parseGitHubRemote(r.stdout.trim());
-  return nwo ? { nwo, defaultBranch: null, host: 'github.com', isGithubCom: true, hasGh: !(ghError instanceof GhUnavailableError) } : null;
+  if (!nwo) return null;
+  // The global auth check may have found an account on a different host.
+  const hasGh = !(ghError instanceof GhUnavailableError)
+    && !ghIsSignedOut(await ghAuthStatus(run, ['--hostname', 'github.com']));
+  return { nwo, defaultBranch: null, host: 'github.com', isGithubCom: true, hasGh };
 }
 
 /**

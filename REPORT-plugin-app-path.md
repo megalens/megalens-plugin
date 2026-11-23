@@ -274,3 +274,21 @@ Exclude both findings from the plugin confirmation count. They belong to `ondema
 ### Verification
 
 `npm test` passed all 206 tests. `git diff --check` passed. The suite ran with disposable fixtures inside the workspace and required no Postgres instance.
+
+## Fix round
+
+The latest confirmation lists zero open plugin findings. This round extends the signed-out `gh` fix to App-only users whose GitHub CLI has an account on another host. [LOOP-CONFIRM1.md:6](/root/review-input/rv-plugin-app-path/LOOP-CONFIRM1.md:6)
+
+- **Signed-out GitHub CLI.** After falling back to a verified GitHub.com origin, the App checks GitHub.com authentication when the initial `gh` preflight left it uncertain. GitHub CLI 2.88.1 reports a missing GitHub.com account separately from a global sign-out. Either response uses the existing App-only commit review path. The new regression failed on the previous runner and passes for automatic and explicit App selection on a branch and detached HEAD. [Auth detection](scripts/lib/gh-runner.mjs#L444) · [Repository fallback](scripts/lib/gh-runner.mjs#L490) · [Global sign-out test](tests/app-path.test.mjs#L297) · [GitHub.com sign-out test](tests/app-path.test.mjs#L327)
+- **GitHub API failures.** An inconclusive auth check keeps PR discovery active. A 502 during PR lookup stops before an App submission, workflow dispatch, or saved result read. [App preflight](scripts/lib/gh-runner.mjs#L1600) · [Bookmark check](scripts/lib/gh-runner.mjs#L1892) · [Outage test](tests/app-path.test.mjs#L459)
+
+### Server track
+
+The plugin confirmation count is zero. Both entries below are assigned to `ondemand-server-fix`.
+
+- **FIRST #4.** Worker settlement can precede delivery when `ONE_PATH_V1` is off. [worker-api.ts:599](/root/review-input/ws-ondemand-merge/src/lib/github-setup/worker-api.ts:599)
+- **Earlier LOOP-CONFIRM2 new high #1.** On-demand queue matching after a PR base change. [20261123230000_github_app_on_demand.sql:113](/root/review-input/ws-ondemand-merge/supabase/migrations/20261123230000_github_app_on_demand.sql:113)
+
+### Verification
+
+`npm test` passed all 207 tests with disposable fixtures under `/tmp`. `git diff --check` passed. The suite required no Postgres instance.

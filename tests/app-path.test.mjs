@@ -324,6 +324,43 @@ test('App reviews pushed commits when gh is installed without a GitHub login', a
   }
 });
 
+test('App reviews pushed commits when gh knows another host but has no github.com login', async (t) => {
+  for (const runnerArgs of [[], ['--runner', 'app']]) {
+    for (const detached of [false, true]) {
+      const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-gh-other-host-'));
+      t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+      const gh = makeGitGhExec({
+        authError: detached ? null : 'HTTP 502 checking another GitHub host',
+        repoLookupError: 'GraphQL: Requires authentication',
+      });
+      const githubCalls = [];
+      const exec = (cmd, args, opts) => {
+        if (cmd === 'git' && detached && args.join(' ') === 'branch --show-current') return ok('');
+        if (cmd === 'gh' && args[0] === 'auth' && args.includes('--hostname')) {
+          assert.equal(args.at(-1), 'github.com');
+          return bad('You are not logged into any accounts on github.com\n');
+        }
+        if (cmd === 'gh' && ['pr', 'api'].includes(args[0])) {
+          githubCalls.push(args[0]);
+          return bad('GraphQL: Requires authentication');
+        }
+        return gh.exec(cmd, args, opts);
+      };
+      const srv = makeAppServer();
+
+      const result = await runCli(['review', ...runnerArgs], {
+        exec, fetch: srv.fetch, stateDir, env: { GH_TOKEN: undefined },
+      });
+      assert.equal(result.code, 0, result.text);
+      assert.match(result.text, /## MegaLens standard review: complete/);
+      assert.deepEqual(srv.requests.filter((r) => r.method === 'POST').map((r) => r.body), [
+        { repo: 'acme/widget', tier: 'standard', ref: H },
+      ]);
+      assert.deepEqual(githubCalls, []);
+    }
+  }
+});
+
 const openPaymentPr = {
   number: 42,
   state: 'OPEN',
