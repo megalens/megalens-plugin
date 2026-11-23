@@ -78,7 +78,8 @@ async function showChange(rest, cwd, say) {
   return df.code === 0 ? 0 : 4;
 }
 
-const KILL_GRACE_MS = 150;
+const FAST_KILL_GRACE_MS = 150;
+const LOCAL_CANCEL_GRACE_MS = 10_000;
 
 function killChildTree(child, sig) {
   if (process.platform !== 'win32' && Number.isInteger(child.pid) && child.pid > 0) {
@@ -87,9 +88,9 @@ function killChildTree(child, sig) {
   try { child.kill(sig); } catch { /* ignore */ }
 }
 
-function runBin(bin, args, { env, cwd, signal = null }) {
+function runBin(bin, args, { env, cwd, signal = null, graceMs = FAST_KILL_GRACE_MS, waitForExitOnAbort = false }) {
   return new Promise((resolve) => {
-    if (signal?.aborted) return resolve({ code: 4, stdout: '', stderr: '', aborted: true });
+    if (signal?.aborted) return resolve({ code: 4, stdout: '', stderr: '', aborted: true, finalized: true });
     let child;
     try {
       child = spawn(bin, args, {
@@ -99,8 +100,8 @@ function runBin(bin, args, { env, cwd, signal = null }) {
         detached: process.platform !== 'win32',
         windowsHide: true,
       });
-    } catch (e) { return resolve({ code: 127, stdout: '', stderr: String(e.message) }); }
-    let stdout = ''; let stderr = ''; let settled = false; let exited = false; let killTimer = null;
+    } catch (e) { return resolve({ code: 127, stdout: '', stderr: String(e.message), aborted: false, finalized: true }); }
+    let stdout = ''; let stderr = ''; let settled = false; let exited = false; let aborted = false; let forceKilled = false; let killTimer = null;
     const clearKillTimer = () => {
       if (killTimer !== null) { clearTimeout(killTimer); killTimer = null; }
     };
@@ -111,18 +112,40 @@ function runBin(bin, args, { env, cwd, signal = null }) {
       resolve(res);
     };
     const onAbort = () => {
+      aborted = true;
       if (!exited) {
-        killChildTree(child, 'SIGTERM');
+        if (waitForExitOnAbort) {
+          // Signal the engine process directly first so engine-v2 catches SIGTERM, sets cancelled=true,
+          // stops Codex cleanly, closes the gateway review (`POST /complete`), and removes its workspace.
+          try { child.kill('SIGTERM'); } catch { /* ignore */ }
+        } else {
+          killChildTree(child, 'SIGTERM');
+        }
         // Keep killTimer ref'd until the child actually exits so SIGKILL always fires even if the parent is exiting.
         killTimer = setTimeout(() => {
           killTimer = null;
-          if (!exited) killChildTree(child, 'SIGKILL');
+          if (!exited) {
+            forceKilled = true;
+            killChildTree(child, 'SIGKILL');
+          }
           child.unref?.();
-        }, KILL_GRACE_MS);
+          if (waitForExitOnAbort) {
+            child.stdout?.destroy();
+            child.stderr?.destroy();
+            finish({ code: 4, stdout, stderr, aborted: true, finalized: false });
+          }
+        }, graceMs);
+      } else if (waitForExitOnAbort) {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        finish({ code: 4, stdout, stderr, aborted: true, finalized: !forceKilled });
+        return;
       }
-      child.stdout?.destroy();
-      child.stderr?.destroy();
-      finish({ code: 4, stdout, stderr, aborted: true });
+      if (!waitForExitOnAbort) {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        finish({ code: 4, stdout, stderr, aborted: true, finalized: false });
+      }
     };
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
     child.stdout.on('data', (c) => { if (stdout.length < MAX_OUT) stdout += c; });
@@ -130,16 +153,27 @@ function runBin(bin, args, { env, cwd, signal = null }) {
     child.on('error', (e) => {
       exited = true;
       clearKillTimer();
-      finish({ code: e.code === 'ENOENT' ? 127 : 4, stdout, stderr: e.code === 'ENOENT' ? 'engine binary not found' : String(e.message) });
+      finish({ code: e.code === 'ENOENT' ? 127 : 4, stdout, stderr: e.code === 'ENOENT' ? 'engine binary not found' : String(e.message), aborted, finalized: !forceKilled });
     });
     child.on('exit', () => {
       exited = true;
       clearKillTimer();
+      if (aborted && waitForExitOnAbort) {
+        // Engine exited cleanly (closed gateway review & cleaned workspace); reap any stray descendants and settle.
+        killChildTree(child, 'SIGKILL');
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        finish({ code: 4, stdout, stderr, aborted: true, finalized: !forceKilled });
+      }
     });
     child.on('close', (code, sig) => {
       exited = true;
       clearKillTimer();
-      finish({ code: code ?? (sig ? 4 : 0), stdout, stderr });
+      if (aborted) {
+        finish({ code: 4, stdout, stderr, aborted: true, finalized: !forceKilled });
+      } else {
+        finish({ code: code ?? (sig ? 4 : 0), stdout, stderr, aborted: false, finalized: true });
+      }
     });
   });
 }
@@ -151,13 +185,20 @@ export function pickNewerReview(saved, remote) {
   if (saved.id === remote.id) return remote;
   const sTs = Number(saved.startedAt) || 0;
   const rTs = Number(remote.startedAt) || 0;
+  const sameRemoteSource = saved.runner === remote.runner
+    && (saved.runner === 'github' || saved.runner === 'app')
+    && (!saved.nwo || !remote.nwo || saved.nwo === remote.nwo);
   if (rTs > 0 && sTs > 0) {
-    if (rTs > sTs) return remote;
-    if (sTs > rTs) return saved;
-    // Equal-second timestamps (GitHub ISO-8601 has 1-second resolution): fall through to ID tie-breaker.
+    // Compare GitHub timestamps at 1-second resolution for same-source reviews so local Date.now() milliseconds
+    // cannot outrank a newer GitHub ISO-8601 timestamp from the same second.
+    const sCmp = sameRemoteSource ? Math.floor(sTs / 1000) : sTs;
+    const rCmp = sameRemoteSource ? Math.floor(rTs / 1000) : rTs;
+    if (rCmp > sCmp) return remote;
+    if (sCmp > rCmp) return saved;
+    // Equal-second timestamps: fall through to numeric ID tie-breaker.
   }
   if (rTs > 0 && sTs === 0) return remote;
-  if (saved.runner === remote.runner && (!saved.nwo || !remote.nwo || saved.nwo === remote.nwo)) {
+  if (sameRemoteSource) {
     const sNum = Number(String(saved.id).split(':')[1]);
     const rNum = Number(String(remote.id).split(':')[1]);
     if (Number.isFinite(sNum) && Number.isFinite(rNum) && rNum !== sNum) return rNum > sNum ? remote : saved;
@@ -294,6 +335,7 @@ export async function main(argv, {
 
     const runAutoRemote = async ({ allowLocalFallback = false } = {}) => {
       const detected = await detectRemoteRunner({ exec, cwd, env, signal });
+      if (signal?.aborted) return 4;
       if (detected.runner === 'app') {
         const hasWf = detected.hasWorkflow ?? await hasDispatchWorkflow({ exec, cwd, env, nwo: detected.nwo, defaultBranch: detected.defaultBranch, signal });
         if (o.tier === 'deep') {
@@ -361,19 +403,49 @@ export async function main(argv, {
       const waitMs = timing.waitMs ?? DEFAULT_WAIT_MS;
       const pollMs = timing.pollMs ?? DEFAULT_POLL_MS;
       const progressMs = timing.progressMs ?? DEFAULT_PROGRESS_MS;
+      const cancelGraceMs = timing.cancelGraceMs ?? LOCAL_CANCEL_GRACE_MS;
 
       if (o.tier === 'deep') {
         args.push('--background');
-        const r = await runBin(bin, args, base);
+        const t0 = nowFn();
+        const startAc = new AbortController();
+        let startInterrupted = null;
+        const onStartAbort = () => { if (!startInterrupted) { startInterrupted = 'aborted'; startAc.abort(); } };
+        if (signal) {
+          if (signal.aborted) onStartAbort();
+          else signal.addEventListener('abort', onStartAbort, { once: true });
+        }
+        let startTimer = null;
+        if (o.wait && Number.isFinite(waitMs) && waitMs > 0 && !startInterrupted) {
+          startTimer = setTimeout(() => { if (!startInterrupted) { startInterrupted = 'timeout'; startAc.abort(); } }, waitMs);
+        } else if (o.wait && waitMs <= 0 && !startInterrupted) {
+          startInterrupted = 'timeout'; startAc.abort();
+        }
+        let r;
+        try {
+          r = await runBin(bin, args, { ...base, signal: startAc.signal, graceMs: cancelGraceMs, waitForExitOnAbort: true });
+        } finally {
+          if (startTimer !== null) clearTimeout(startTimer);
+          if (signal) signal.removeEventListener('abort', onStartAbort);
+        }
         if (r.code === 127) { if (probe) probe.setup = true; say(missingBin()); return 4; }
         let j; try { j = JSON.parse(r.stdout); } catch { j = null; }
+        if (j && REVIEW_ID(j.review_id)) {
+          await recordLatest({ id: j.review_id, runner: 'local', tier: 'deep' }, false);
+          if (r.aborted || startInterrupted || signal?.aborted) {
+            say(`${STILL_RUNNING_LINE}\n`);
+            return 0;
+          }
+        }
+        if (r.aborted || startInterrupted || signal?.aborted) {
+          say(`## MegaLens deep review: ${startInterrupted === 'timeout' ? 'NOT COMPLETED' : 'CANCELLED'}\n\n${startInterrupted === 'timeout' ? 'Timed out' : 'Interrupted'} while starting the local deep review. This is not a clean review.\n`);
+          return 4;
+        }
         if (r.code !== 0 || !j || !REVIEW_ID(j.review_id)) return await finishNoDoc(r, say, env, probe);
-        await recordLatest({ id: j.review_id, runner: 'local', tier: 'deep' }, false);
         if (!o.wait) {
           say(`Review started\n${STILL_RUNNING_LINE}\n`);
           return 0;
         }
-        const t0 = nowFn();
         const w = await waitForReview({
           poll: async (callSignal) => {
             const st = await runBin(bin, ['status', j.review_id], { ...base, signal: callSignal });
@@ -410,13 +482,32 @@ export async function main(argv, {
         return 0;
       }
 
-      // Local Standard (or Double): enforce the same wait cap, abort handling, and elapsed progress updates.
+      // Local Standard (or Double): enforce wait cap, abort handling, and elapsed progress updates,
+      // and wait for engine-v2's SIGTERM finalization (gateway POST /complete + workspace cleanup) before printing CANCELLED.
       const t0 = nowFn();
+      const callAc = new AbortController();
+      let interruptKind = null;
+      const triggerInterrupt = (kind) => {
+        if (interruptKind) return;
+        interruptKind = kind;
+        callAc.abort();
+      };
+      const onUserAbort = () => triggerInterrupt('aborted');
+      if (signal) {
+        if (signal.aborted) onUserAbort();
+        else signal.addEventListener('abort', onUserAbort, { once: true });
+      }
+      let deadlineTimer = null;
+      if (Number.isFinite(waitMs) && waitMs > 0 && !interruptKind) {
+        deadlineTimer = setTimeout(() => triggerInterrupt('timeout'), waitMs);
+      } else if (waitMs <= 0 && !interruptKind) {
+        triggerInterrupt('timeout');
+      }
       let progressTimer = null;
       let lastBucket = 0;
       if (Number.isFinite(progressMs) && progressMs > 0 && progressMs < waitMs) {
         progressTimer = setInterval(() => {
-          if (signal?.aborted) return;
+          if (interruptKind || signal?.aborted) return;
           const elapsed = Math.max(0, nowFn() - t0);
           const bucket = Math.floor(elapsed / progressMs);
           if (bucket > lastBucket) {
@@ -428,23 +519,41 @@ export async function main(argv, {
       }
       try {
         // Local Standard/Double runs in the foreground (engine-v2 rejects --background for non-deep tiers
-        // and does not persist status/result state on disk). Interrupting or hitting the wait cap cancels the
-        // foreground run, so we report CANCELLED / NOT COMPLETED (exit 4) instead of claiming it is still running.
-        const res = await raceWithDeadline(
-          (callSignal) => fetchAndRender(bin, args, { ...base, signal: callSignal }, say, env, probe, { showId: false }),
-          { signal, remainingMs: waitMs, now: nowFn, t0, waitMs },
+        // and does not persist status/result state on disk). Interrupting or hitting the wait cap sends SIGTERM,
+        // waits up to cancelGraceMs for engine-v2 to close the gateway review and remove its workspace, then
+        // reports CANCELLED / NOT COMPLETED (exit 4) instead of claiming it is still running.
+        const meta = { aborted: false, finalized: true };
+        const isOvertime = () => Boolean(interruptKind) || (Number.isFinite(waitMs) && Math.max(0, nowFn() - t0) >= waitMs);
+        const code = await fetchAndRender(
+          bin,
+          args,
+          { ...base, signal: callAc.signal, graceMs: cancelGraceMs, waitForExitOnAbort: true },
+          say,
+          env,
+          probe,
+          { showId: false, meta, shouldSuppress: isOvertime },
         );
-        if (res.interrupted) {
-          if (res.interrupted === 'aborted') {
-            say(`## MegaLens ${o.tier} review: CANCELLED\n\nThe local review was interrupted and stopped. This is not a clean review. Run /megalens:review to start a new review.\n`);
+        if (!interruptKind && isOvertime()) interruptKind = 'timeout';
+        if (interruptKind || meta.aborted) {
+          const kind = interruptKind || 'aborted';
+          if (kind === 'aborted') {
+            const detail = meta.finalized
+              ? 'The local review was interrupted and stopped. This is not a clean review. Run /megalens:review to start a new review.'
+              : 'The local review did not shut down within the grace period and was force-stopped. If a gateway review was still open, wait a moment before retrying. This is not a clean review.';
+            say(`## MegaLens ${o.tier} review: CANCELLED\n\n${detail}\n`);
           } else {
-            say(`## MegaLens ${o.tier} review: NOT COMPLETED\n\nThe local review hit the wait limit and was stopped. This is not a clean review. Run /megalens:review to try again.\n`);
+            const detail = meta.finalized
+              ? 'The local review hit the wait limit and was stopped. This is not a clean review. Run /megalens:review to try again.'
+              : 'The local review hit the wait limit, did not shut down within the grace period, and was force-stopped. If a gateway review was still open, wait a moment before retrying. This is not a clean review.';
+            say(`## MegaLens ${o.tier} review: NOT COMPLETED\n\n${detail}\n`);
           }
           return 4;
         }
-        return res.value;
+        return code;
       } finally {
+        if (deadlineTimer !== null) clearTimeout(deadlineTimer);
         if (progressTimer !== null) clearInterval(progressTimer);
+        if (signal) signal.removeEventListener('abort', onUserAbort);
       }
     } finally {
       for (const d of tmpDirs) rmSync(d, { recursive: true, force: true });
@@ -490,12 +599,16 @@ async function finishNoDoc(r, say, env, probe = null) {
   say(renderResult(null, { exit: r.code, stderrText: scrub(firstLine(r.stderr), env) })); return r.code === 0 ? 4 : r.code;
 }
 
-async function fetchAndRender(bin, args, base, say, env, probe = null, { showId = false, onDoc = null } = {}) {
+async function fetchAndRender(bin, args, base, say, env, probe = null, { showId = false, onDoc = null, meta = null, shouldSuppress = null } = {}) {
   const d = privateDir();
   try {
     const outFile = path.join(d, 'findings.json');
     const r = await runBin(bin, [...args, '--out', outFile], base);
-    if (r.aborted || base.signal?.aborted) return 0;
+    if (meta) {
+      meta.aborted = Boolean(r.aborted || base.signal?.aborted);
+      meta.finalized = r.finalized !== false;
+    }
+    if (r.aborted || base.signal?.aborted || shouldSuppress?.()) return 0;
     if (r.code === 127) { if (probe) probe.setup = true; say(missingBin()); return 4; }
     let doc = null;
     try { if (statSync(outFile).size <= MAX_OUT) doc = JSON.parse(readFileSync(outFile, 'utf8')); } catch { doc = null; }

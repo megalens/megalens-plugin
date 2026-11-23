@@ -132,7 +132,9 @@ function makeScenario({
       return ok(JSON.stringify({ check_runs: checks }));
     }
     if (k.startsWith('gh api') && args.some((a) => a.includes('/contents/'))) return workflowPresent ? ok('file\n') : bad('HTTP 404');
+    if (k.startsWith('gh api') && args.some((a) => a.includes('/branches-where-head'))) return ok(JSON.stringify([branch]));
     if (k.startsWith('gh api') && args.some((a) => a.includes('/pulls'))) return ok(JSON.stringify(openPrs));
+    if (k.startsWith('gh api') && args.some((a) => a === `repos/${nwo}/commits`)) return ok(JSON.stringify([]));
     if (k.startsWith('gh api') && args.some((a) => a.includes('/commits/'))) return ok(`${H}\n`);
     if (k.startsWith('gh workflow run')) { dispatched = true; return ok(''); }
     if (k.startsWith('gh run list')) {
@@ -950,7 +952,7 @@ test('LC1-SOL4: SIGTERM-ignoring child is killed by SIGKILL fallback and parent 
     cwd: dir,
     platform: 'linux',
     env: { MEGALENS_TOKEN: TOKEN, MEGALENS_REVIEW_BIN: bin },
-    timing: { waitMs: 5000 },
+    timing: { waitMs: 5000, cancelGraceMs: 150 },
     signal: ac2.signal,
   });
   let binPid = 0;
@@ -1182,4 +1184,228 @@ test('LC1-NEW3: interrupted or timed-out Local Standard stops honestly (exit 4, 
   assert.match(rCap.text, /not a clean review/i);
   assert.equal(rCap.text.includes(STILL_RUNNING_LINE), false, 'must not promise /megalens:result for a stopped foreground run');
   assert.equal(existsSync(stateFilePath({ MEGALENS_STATE_DIR: dir })), false, 'must not write an unretrievable foreground review bookmark');
+});
+
+// ---- 7. Loop-confirm round 3 tests (LOOP-CONFIRM2.md: NEW #1, SOL #4, SOL #5, LC1-NEW1) ----
+
+test('LC2-NEW1: local Standard cancel and timeout wait for engine SIGTERM finalization (gateway complete + workspace cleanup) before printing CANCELLED', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'mlgrace-'));
+  const wsDir = path.join(dir, 'workspace-snapshot');
+  const callsFile = path.join(dir, 'gateway-calls.log');
+  const readyFile = path.join(dir, 'ready');
+  const bin = path.join(dir, 'finalizing-engine');
+  // Mirrors real engine-v2 shutdown: catches SIGTERM, waits 600ms on GET /reviews/:id, posts /complete {outcome:"cancelled"}, removes workspace, then exits.
+  writeFileSync(bin, `#!/usr/bin/env node
+const fs = require('node:fs');
+const ws = ${JSON.stringify(wsDir)};
+const calls = ${JSON.stringify(callsFile)};
+const ready = ${JSON.stringify(readyFile)};
+fs.mkdirSync(ws, { recursive: true });
+fs.writeFileSync(ws + '/source.js', 'export const x = 1;\\n');
+fs.appendFileSync(calls, 'POST /api/v2/reviews\\n');
+fs.writeFileSync(ready, '1');
+let stopping = false;
+process.on('SIGTERM', () => {
+  if (stopping) return;
+  stopping = true;
+  fs.appendFileSync(calls, 'GET /api/v2/reviews/rv_grace001\\n');
+  setTimeout(() => {
+    fs.appendFileSync(calls, 'POST /api/v2/reviews/rv_grace001/complete\\n{"outcome":"cancelled"}\\n');
+    fs.rmSync(ws, { recursive: true, force: true });
+    process.exit(4);
+  }, 600);
+});
+setInterval(() => {}, 1000);
+`);
+  chmodSync(bin, 0o755);
+
+  // 1a. User abort (default cancelGraceMs — no override): must NOT SIGKILL at 150ms; waits for /complete + workspace removal before returning.
+  const ac = new AbortController();
+  const pCancel = runMain(['review', '--runner', 'local'], {
+    exec: async () => bad('no gh', 127),
+    stateDir: dir,
+    cwd: dir,
+    platform: 'linux',
+    env: { MEGALENS_TOKEN: TOKEN, MEGALENS_REVIEW_BIN: bin },
+    timing: { waitMs: 5000 },
+    signal: ac.signal,
+  });
+  for (let i = 0; i < 200 && !existsSync(readyFile); i++) await new Promise((r) => setTimeout(r, 10));
+  assert.equal(existsSync(readyFile), true, 'engine started and created workspace');
+  ac.abort();
+  const rCancel = await pCancel;
+  assert.equal(rCancel.code, 4);
+  assert.match(rCancel.text, /## MegaLens standard review: CANCELLED/);
+  assert.equal(rCancel.text.includes('force-stopped'), false, 'graceful finalization must not say force-stopped');
+  const callsAfter = readFileSync(callsFile, 'utf8').trim().split('\n');
+  assert.deepEqual(callsAfter, [
+    'POST /api/v2/reviews',
+    'GET /api/v2/reviews/rv_grace001',
+    'POST /api/v2/reviews/rv_grace001/complete',
+    '{"outcome":"cancelled"}',
+  ], 'gateway review must be closed as cancelled BEFORE main returns CANCELLED');
+  assert.equal(existsSync(wsDir), false, 'workspace snapshot must be removed BEFORE main returns CANCELLED');
+
+  // 1b. Wait-cap timeout also lets engine-v2 finalize cleanly before returning NOT COMPLETED.
+  writeFileSync(callsFile, '');
+  try { execFileSync('rm', ['-f', readyFile]); } catch {}
+  const rTimeout = await runMain(['review', '--runner', 'local'], {
+    exec: async () => bad('no gh', 127),
+    stateDir: dir,
+    cwd: dir,
+    platform: 'linux',
+    env: { MEGALENS_TOKEN: TOKEN, MEGALENS_REVIEW_BIN: bin },
+    timing: { waitMs: 120 },
+  });
+  assert.equal(rTimeout.code, 4);
+  assert.match(rTimeout.text, /## MegaLens standard review: NOT COMPLETED/);
+  assert.equal(existsSync(wsDir), false, 'workspace snapshot must be removed on wait-cap timeout');
+  assert.match(readFileSync(callsFile, 'utf8'), /POST \/api\/v2\/reviews\/rv_grace001\/complete/);
+
+  // 1c. Stubborn engine ignoring SIGTERM past cancelGraceMs is force-stopped and warns honestly.
+  const stubborn = path.join(dir, 'stubborn-warn');
+  writeFileSync(stubborn, '#!/usr/bin/env node\nprocess.on("SIGTERM", () => {});\nsetInterval(() => {}, 1000);\n');
+  chmodSync(stubborn, 0o755);
+  const acStub = new AbortController();
+  const pStub = runMain(['review', '--runner', 'local'], {
+    exec: async () => bad('no gh', 127),
+    stateDir: dir,
+    cwd: dir,
+    platform: 'linux',
+    env: { MEGALENS_TOKEN: TOKEN, MEGALENS_REVIEW_BIN: stubborn },
+    timing: { waitMs: 5000, cancelGraceMs: 120 },
+    signal: acStub.signal,
+  });
+  setTimeout(() => acStub.abort(), 40);
+  const rStub = await pStub;
+  assert.equal(rStub.code, 4);
+  assert.match(rStub.text, /force-stopped/);
+});
+
+test('LC2-SOL4: appReview bounds initial check-runs lookup by waitMs and never accepts an overtime check as complete', async () => {
+  let checkSignalAborted = false;
+  const tStart = performance.now();
+  const res = await appReview({
+    cwd: '/repo-a',
+    env: {},
+    preRepo: { nwo: 'acme/widget', defaultBranch: 'main' },
+    waitMs: 15,
+    now: () => performance.now(),
+    exec: async (cmd, args, opts) => {
+      if (cmd === 'git' && args[0] === 'rev-parse') return ok(`${H}\n`);
+      if (cmd === 'git' && args[0] === 'status') return ok('');
+      if (args.some((a) => a.endsWith('/check-runs'))) {
+        return await new Promise((resolve) => {
+          opts?.signal?.addEventListener('abort', () => { checkSignalAborted = true; }, { once: true });
+          const t = setTimeout(() => resolve(ok(JSON.stringify({ check_runs: [makeAppCheckRun({ id: 777, started_at: '2026-11-23T10:00:00Z' })] }))), 200);
+          t.unref?.();
+        });
+      }
+      if (args.some((a) => a === `repos/acme/widget/commits/${H}`)) return ok(`${H}\n`);
+      return bad(`unexpected ${cmd} ${args.join(' ')}`);
+    },
+  });
+  const elapsed = performance.now() - tStart;
+  assert.equal(res.code, 4);
+  assert.equal(res.timedOut, true);
+  assert.equal(checkSignalAborted, true, 'overtime initial check-runs call must be aborted');
+  assert.equal(res.text.includes('## MegaLens standard review: complete'), false, 'must never accept overtime check as complete');
+  assert.ok(elapsed < 180, `appReview should time out promptly around waitMs, took ${Math.round(elapsed)}ms`);
+});
+
+test('LC2-NEW1-BWH: appReview fails closed (zero workflow dispatch) when branches-where-head or check-runs lookup fails', async () => {
+  for (const mode of ['bwh-fail', 'checks-fail']) {
+    let dispatches = 0;
+    const exec = async (cmd, args) => {
+      if (cmd === 'git') {
+        if (args.includes('--show-toplevel')) return ok('/repo-a\n');
+        if (args[0] === 'rev-parse') return ok(`${H}\n`);
+        if (args[0] === 'merge-base') return ok(`${B}\n`);
+        if (args[0] === 'status') return ok('');
+        if (args[0] === 'branch') return ok('feature\n');
+      }
+      if (args[0] === '--version' || args[0] === 'auth') return ok('');
+      if (args[0] === 'repo') return ok(JSON.stringify({ nameWithOwner: 'acme/widget', defaultBranchRef: { name: 'main' } }));
+      if (args[0] === 'secret') return ok('[{"name":"MEGALENS_TOKEN"}]');
+      if (args[0] === 'api') {
+        if (args.includes('orgs/acme/installations')) return ok('[{"id":10,"app_slug":"megalens","repository_selection":"all"}]');
+        if (args.some((a) => a.includes('/contents/'))) return ok('file\n');
+        if (args.some((a) => a.includes('/branches-where-head'))) return mode === 'bwh-fail' ? bad('HTTP 502') : ok('["feature"]');
+        if (args.some((a) => a.includes('/pulls'))) return ok('[]');
+        if (args.some((a) => a.endsWith('/check-runs'))) return mode === 'checks-fail' ? bad('HTTP 502') : ok('{"check_runs":[]}');
+        if (args.some((a) => a.includes('/commits/'))) return ok(`${H}\n`);
+      }
+      if (args[0] === 'workflow' && args[1] === 'run') { dispatches += 1; return ok(''); }
+      if (args[0] === 'run' && args[1] === 'list') return ok('[]');
+      return bad(`unexpected ${cmd} ${args.join(' ')}`);
+    };
+    let clock = 0;
+    const r = await runMain(['review'], {
+      exec,
+      timing: { now: () => clock, sleep: async (ms) => { clock += ms; }, sleepMs: 2000, appearWaitMs: 4000 },
+    });
+    assert.equal(r.code, 4, `${mode}: must fail closed`);
+    assert.equal(dispatches, 0, `${mode}: must NEVER dispatch a second billable workflow when check/branch state is inconclusive`);
+    assert.match(r.text, /not charged twice/);
+  }
+});
+
+test('LC2-SOL5: findLatestRemoteReview checks up to 20 PRs and recent default-branch commits, and pickNewerReview handles same-second ms skew', async () => {
+  // 5a. Newer App check on PR #12 (beyond the old per_page=5 limit) beats an older workflow run
+  const prHeads = Array.from({ length: 12 }, (_, i) => i.toString(16).repeat(40));
+  const targetPrSha = prHeads[11];
+  let sawPerPage20 = false;
+  const execPr12 = async (cmd, args) => {
+    if (cmd === 'git') return ok(`${H}\n`);
+    if (args[0] === 'repo') return ok(JSON.stringify({ nameWithOwner: 'acme/widget', defaultBranchRef: { name: 'main' } }));
+    if (args[0] === 'run') return ok(JSON.stringify([{ databaseId: 23, createdAt: '2026-11-23T10:00:00Z' }]));
+    if (args[0] === 'api' && args.includes('repos/acme/widget/pulls')) {
+      if (args.includes('per_page=20')) sawPerPage20 = true;
+      return ok(JSON.stringify(prHeads));
+    }
+    if (args[0] === 'api' && args.includes('repos/acme/widget/commits')) return ok(JSON.stringify([]));
+    if (args[0] === 'api' && args.some((a) => a === `repos/acme/widget/commits/${targetPrSha}/check-runs`)) {
+      return ok(JSON.stringify({ check_runs: [makeAppCheckRun({ id: 25, started_at: '2026-11-23T11:00:00Z' })] }));
+    }
+    if (args[0] === 'api' && args.some((a) => a.endsWith('/check-runs'))) return ok(JSON.stringify({ check_runs: [] }));
+    return bad(`unexpected ${cmd} ${args.join(' ')}`);
+  };
+  const latestPr = await findLatestRemoteReview({ exec: execPr12, cwd: '/repo-a', env: {} });
+  assert.equal(sawPerPage20, true, 'must query per_page=20 PRs');
+  assert.equal(latestPr.id, 'app:25');
+
+  // 5b. Newer App check on a recent default-branch commit behind tip is discovered via repos/{nwo}/commits
+  const tipSha = 'd'.repeat(40);
+  const prevMainSha = 'e'.repeat(40);
+  const execCommits = async (cmd, args) => {
+    if (cmd === 'git') return ok(`${H}\n`);
+    if (args[0] === 'repo') return ok(JSON.stringify({ nameWithOwner: 'acme/widget', defaultBranchRef: { name: 'main' } }));
+    if (args[0] === 'run') return ok(JSON.stringify([{ databaseId: 23, createdAt: '2026-11-23T10:00:00Z' }]));
+    if (args[0] === 'api' && args.includes('repos/acme/widget/pulls')) return ok(JSON.stringify([]));
+    if (args[0] === 'api' && args.includes('repos/acme/widget/commits')) return ok(JSON.stringify([tipSha, prevMainSha]));
+    if (args[0] === 'api' && args.some((a) => a === `repos/acme/widget/commits/${prevMainSha}/check-runs`)) {
+      return ok(JSON.stringify({ check_runs: [makeAppCheckRun({ id: 29, started_at: '2026-11-23T11:05:00Z' })] }));
+    }
+    if (args[0] === 'api' && args.some((a) => a.endsWith('/check-runs'))) return ok(JSON.stringify({ check_runs: [] }));
+    return bad(`unexpected ${cmd} ${args.join(' ')}`);
+  };
+  const latestCommit = await findLatestRemoteReview({ exec: execCommits, cwd: '/repo-a', env: {} });
+  assert.equal(latestCommit.id, 'app:29');
+
+  // 5c. Sub-second local Date.now() ms on older bookmark does not beat newer GitHub run in the same second
+  const isoSec = Date.parse('2026-11-23T10:00:00Z');
+  assert.equal(
+    pickNewerReview(
+      { id: 'gh:800', runner: 'github', nwo: 'acme/widget', startedAt: isoSec + 850 },
+      { id: 'gh:801', runner: 'github', nwo: 'acme/widget', startedAt: isoSec },
+    ).id,
+    'gh:801',
+  );
+  assert.equal(
+    pickNewerReview(
+      { id: 'app:700', runner: 'app', nwo: 'acme/widget', startedAt: isoSec + 900 },
+      { id: 'app:701', runner: 'app', nwo: 'acme/widget', startedAt: isoSec },
+    ).id,
+    'app:701',
+  );
 });

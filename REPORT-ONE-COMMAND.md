@@ -125,3 +125,44 @@ Addresses all 7 points from `/root/review-input/rv-plugin-one-cmd/LOOP-CONFIRM1.
 
 - Full test suite (`npm test`): **173 passed, 0 failed** across all 8 test files.
 - No secrets printed; `/var/www`, `ACTIVE-JOB`, and `.env` untouched.
+
+## Fix round (LOOP-CONFIRM2.md)
+
+Addresses every open point in `/root/review-input/rv-plugin-one-cmd/LOOP-CONFIRM2.md` (preserving all earlier round-1, round-2, security, and fallback fixes):
+
+1. **Local cancellation waits for engine gateway finalization & workspace cleanup (`LOOP-CONFIRM2 NEW #1`):**
+   - **Fixed (`runBin`, Local Standard/Double, and Local Deep start in `scripts/engine.mjs`):**
+     - Separated fast probe kill grace (`FAST_KILL_GRACE_MS = 150`) from local engine run cancellation grace (`LOCAL_CANCEL_GRACE_MS = 10_000`, injectable via `cancelGraceMs` for tests).
+     - On user interrupt (`SIGINT`/`SIGTERM`/`AbortSignal`) or wait-cap timeout during a local review (`waitForExitOnAbort: true`), `runBin` sends `SIGTERM` directly to the `engine-v2` child process first (so `engine-v2`'s `SIGTERM` handler in `/root/wt/engine-013/packages/engine-v2/src/cli.mjs:119-121` cleanly aborts Codex with `aborted = true`, calls `GET /api/v2/reviews/:id` + `POST /api/v2/reviews/:id/complete` with `{"outcome":"cancelled"}` at `engine.mjs:391,475`, and deletes `workspace_dir` in `engine.mjs:243`), and **waits for the engine process to exit** (up to `cancelGraceMs`) BEFORE printing `## MegaLens standard review: CANCELLED` / `NOT COMPLETED` and returning exit `4`.
+     - If the engine exits cleanly on `SIGTERM`, any stray process-group descendants are reaped and the gateway slot is already closed so an immediate retry succeeds without hitting `account_concurrency` (`/root/wt/github-app-a/src/lib/engine-v2/service.ts:406-412`). If a stubborn engine ignores `SIGTERM` past `cancelGraceMs`, `killChildTree(child, 'SIGKILL')` force-stops the process group and the message honestly warns that it was force-stopped.
+     - Verified by `LC2-NEW1` in `tests/one-command.test.mjs` (600 ms gateway finalization on both abort and timeout, plus stubborn force-stop warning) AND verified against the real `/root/wt/engine-013/packages/engine-v2/src/cli.mjs` offline repro (`POST /api/v2/reviews`, `GET`, `POST /complete` `{"outcome":"cancelled"}`, `workspaceRemains: false`).
+
+2. **Initial `appReview` check-runs / preflight and `runnerReview` preflight / dispatch bounded by `waitMs` (`SOL #4`):**
+   - **Fixed (`appReview`, `runnerReview`, `startRun` in `scripts/lib/gh-runner.mjs`; `runAutoRemote` in `scripts/engine.mjs`):**
+     - Captured `t0 = now()` at the very start of `appReview` and `runnerReview` and wrapped `appPreflight`, initial `findAppCheckRunWithStatus`, `git branch`, `branches-where-head`, `pulls`, `preflight`, and `startRun` list/dispatch/poll calls in `raceWithDeadline(..., { signal, remainingMs, now, t0, waitMs })`.
+     - An overtime initial `check-runs` lookup is aborted at `waitMs` and returns `code: 4, timedOut: true` instead of waiting past the deadline and accepting the check as `complete`.
+     - Covered by `LC2-SOL4` in `tests/one-command.test.mjs` (alongside existing `SOL-4` and `LC1-SOL4` tests).
+
+3. **Inconclusive `branches-where-head` or `check-runs` lookup fails closed against double-dispatch (`LOOP-CONFIRM1 NEW #1`):**
+   - **Fixed (`findAppCheckRunWithStatus` & `appReview` in `scripts/lib/gh-runner.mjs`):**
+     - `appReview` now checks `bwhCheckOk = bwh.code === 0 && Array.isArray(bwhList)` and `initialCheckOk` from `findAppCheckRunWithStatus` in addition to `prCheckOk`. Whenever `branches-where-head` returns an API error (e.g. `HTTP 502`) or `check-runs` fails, `mayBeTriggeredByApp` fails closed (`true`, `safeToFallback: false`) so `workflow_dispatch` is never launched on top of an App review.
+     - Covered by `LC2-NEW1-BWH` in `tests/one-command.test.mjs` (and fixed `makeScenario` in `tests/one-command.test.mjs` to mock `branches-where-head` explicitly).
+   - **External GitHub API / backend boundary (`unknown-live-installation` on personal repos / non-admin org tokens — `SOL #2` & `LOOP-CONFIRM1 NEW #1`):**
+     - When `GET /orgs/{owner}/installations` and `GET /user/installations` both return `403`/`404` (personal repo or non-admin org account using a standard `gh` OAuth token) AND `.github/workflows/megalens-dispatch.yml` is present with zero active check runs on `HEAD`, GitHub's REST API provides identical responses (`403`, `403`, `check_runs: []`) for (a) a pure GitHub Actions repo that never installed the App, (b) a repo that uninstalled the App (`SOL #2`), and (c) a repo with the App installed whose check has not yet been created (`LOOP-CONFIRM1 NEW #1`). Blocking workflow dispatch on `403`/`403`/`[]` would break all personal-repo GitHub Actions users. Resolving this requires a MegaLens backend repo-status endpoint (none exists under `/root/wt/github-app-a/src/app/api/github-app/{callback,install,setup,start,webhook}/route.ts`; tracked in `PLUGIN-NEEDS.md` #12).
+
+4. **Broader no-id remote App check discovery & sub-second bookmark tie-breaking (`SOL #5`):**
+   - **Fixed (`findLatestRemoteReview` in `scripts/lib/gh-runner.mjs`, `pickNewerReview` in `scripts/engine.mjs`):**
+     - Expanded `findLatestRemoteReview` to probe up to 20 recently updated PR head SHAs (`repos/{nwo}/pulls?...&per_page=20`) plus the 10 most recent commits on `defaultBranch` (`repos/{nwo}/commits?sha=${defaultBranch}&per_page=10`) in bounded batches of 5.
+     - Updated `pickNewerReview` to compare same-source GitHub timestamps at 1-second resolution so local `Date.now()` milliseconds on a saved bookmark cannot outrank a newer GitHub ISO-8601 run/check from the same second before the numeric ID tie-breaker runs.
+     - Covered by `LC2-SOL5` in `tests/one-command.test.mjs`.
+   - **External GitHub API / backend boundary:** GitHub REST has no repo-wide `GET /repos/{owner}/{repo}/check-runs` endpoint (check runs can only be queried per commit ref `commits/{ref}/check-runs`); discovering an App check on an arbitrary older ref outside `HEAD`, the 20 most recently updated PRs, and the 10 most recent default-branch commits requires a MegaLens backend latest-review endpoint (tracked in `PLUGIN-NEEDS.md` #12).
+
+5. **External boundaries confirmed unchanged (`SOL #1`, `LOOP-CONFIRM1 NEW #3`):**
+   - **`SOL #1` (App-only on-demand start & `deep`):** Unreachable from this plugin repo without backend changes — `/root/wt/github-app-a/src/lib/github-setup/flag.ts:20,53-54` pins `APP_REVIEW_TIER = 'standard'` and `HANDLED_EVENTS = ['installation', 'installation_repositories', 'pull_request', 'push']`, `/root/wt/github-app-a/src/lib/github-setup/webhook.ts:128,253-320` only enqueues on `pull_request` / default-branch `push` webhooks, and `/root/wt/github-app-a/src/app/api/github-app/` has no on-demand start route. Documented in `PLUGIN-NEEDS.md` #12.
+   - **`LOOP-CONFIRM1 NEW #3` (retrieving interrupted Local Standard via `/megalens:result`):** Unreachable from this plugin repo without `engine-v2` changes — `/root/wt/engine-013/packages/engine-v2/src/tiers.mjs:6-12` sets `TIERS.standard.background = false` and `cli.mjs:102,117-135` rejects `--background` for `standard` and writes no disk `state.json`/`result.json` on interrupt. The plugin stops Local Standard cleanly (letting `engine-v2` close the gateway review and remove its snapshot) and reports `CANCELLED` / `NOT COMPLETED` (exit `4`) without writing a broken bookmark. Documented in `PLUGIN-NEEDS.md` #13.
+
+### Verification (Fix round — LOOP-CONFIRM2.md)
+
+- Full test suite (`npm test`): **177 passed, 0 failed** across all 8 test files.
+- Real `/root/wt/engine-013/packages/engine-v2/src/cli.mjs` offline cancellation repro (600 ms gateway `GET`): confirmed `POST /api/v2/reviews`, `GET /api/v2/reviews/rv_confirm001`, `POST /api/v2/reviews/rv_confirm001/complete` (`{"outcome":"cancelled"}`), `workspaceRemains: false`, `code: 4`, `## MegaLens standard review: CANCELLED`.
+- No secrets printed; `/var/www`, `ACTIVE-JOB`, and `.env` untouched.
