@@ -6,13 +6,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { detectRemoteRunner, appReview, appStatus, appResult, mapCheckState, findLatestRemoteReview, realExec, CHECK_NAME, APP_INSTALL_URL, WORKFLOW_FILE } from '../scripts/lib/gh-runner.mjs';
+import { detectRemoteRunner, appReview, appStatus, appResult, mapCheckState, findLatestRemoteReview, startRun, runnerReview, realExec, CHECK_NAME, APP_INSTALL_URL, WORKFLOW_FILE } from '../scripts/lib/gh-runner.mjs';
 import { waitForReview, DEFAULT_WAIT_MS, STILL_RUNNING_LINE } from '../scripts/lib/wait-loop.mjs';
 import { saveLatestReview, loadLatestReview, stateFilePath } from '../scripts/lib/latest-review.mjs';
 import { secretContent } from '../scripts/lib/safety.mjs';
-import { main } from '../scripts/engine.mjs';
+import { main, pickNewerReview } from '../scripts/engine.mjs';
 
 const H = 'a'.repeat(40);
 const B = 'b'.repeat(40);
@@ -176,7 +177,12 @@ async function runMain(argv, { exec, stateDir, cwd = '/repo-a', platform = 'darw
 // ---- 1. Runner auto-pick ----
 
 test('auto-pick: prefers our review machine via GitHub App when installed, even if workflow is also present', async () => {
-  const sc = makeScenario({ appSuites: ['megalens'], appChecks: [makeAppCheckRun()], workflowPresent: true });
+  const sc = makeScenario({
+    orgInstallations: [{ id: 10, app_slug: 'megalens', repository_selection: 'all', suspended_at: null }],
+    appSuites: ['megalens'],
+    appChecks: [makeAppCheckRun()],
+    workflowPresent: true,
+  });
   const det = await detectRemoteRunner({ exec: sc.exec, cwd: '/repo-a', env: {} });
   assert.equal(det.runner, 'app');
   assert.equal(det.nwo, 'acme/widget');
@@ -224,6 +230,7 @@ test('auto-pick: spoofed check run from a non-MegaLens app slug is never accepte
 test('auto-pick: deep with App installed + workflow present routes to GitHub runner; App-only explains clearly', async () => {
   const deepTitle = `MegaLens deep ${B}..${H}`;
   const withWf = makeScenario({
+    orgInstallations: [{ id: 10, app_slug: 'megalens', repository_selection: 'all', suspended_at: null }],
     appSuites: ['megalens'],
     workflowPresent: true,
     runsAfterDispatch: [{ databaseId: 9002, displayTitle: deepTitle, createdAt: new Date().toISOString(), url: 'https://github.com/acme/widget/actions/runs/9002' }],
@@ -631,7 +638,12 @@ test('SOL-3: Linux follows App -> workflow -> local order, and without local cre
   chmodSync(bin, 0o755);
 
   // Linux with MEGALENS_TOKEN + working local bin MUST still pick App first
-  const scApp = makeScenario({ appSuites: ['megalens'], appChecks: [makeAppCheckRun()], workflowPresent: true });
+  const scApp = makeScenario({
+    orgInstallations: [{ id: 10, app_slug: 'megalens', repository_selection: 'all', suspended_at: null }],
+    appSuites: ['megalens'],
+    appChecks: [makeAppCheckRun()],
+    workflowPresent: true,
+  });
   const rApp = await runMain(['review'], { exec: scApp.exec, platform: 'linux', env: { MEGALENS_TOKEN: TOKEN, MEGALENS_REVIEW_BIN: bin } });
   assert.equal(rApp.code, 0);
   assert.equal(existsSync(marker), false, 'local engine must not run before App');
@@ -725,8 +737,9 @@ test('SOL-4: deadline & abort interrupt in-flight polls, result downloads, and l
   });
   setTimeout(() => acStd.abort(), 20);
   const rStd = await pStd;
-  assert.equal(rStd.code, 0);
-  assert.match(rStd.text, /Still running\. Run \/megalens:result to see it\./);
+  assert.equal(rStd.code, 4);
+  assert.match(rStd.text, /## MegaLens standard review: CANCELLED/);
+  assert.equal(rStd.text.includes(STILL_RUNNING_LINE), false, 'cancelled foreground review must never claim to be still running');
   assert.ok(performance.now() - tStd < 1000, 'local Standard abort must not wait for slow child');
 
   // Local Standard deadline cap without explicit abort
@@ -739,8 +752,9 @@ test('SOL-4: deadline & abort interrupt in-flight polls, result downloads, and l
     env: { MEGALENS_TOKEN: TOKEN, MEGALENS_REVIEW_BIN: slowBin },
     timing: { waitMs: 30 },
   });
-  assert.equal(rStdCap.code, 0);
-  assert.match(rStdCap.text, /Still running\. Run \/megalens:result to see it\./);
+  assert.equal(rStdCap.code, 4);
+  assert.match(rStdCap.text, /## MegaLens standard review: NOT COMPLETED/);
+  assert.equal(rStdCap.text.includes(STILL_RUNNING_LINE), false, 'timed-out foreground review must never claim to be still running');
   assert.ok(performance.now() - tStdCap < 1000, 'local Standard deadline must not wait for slow child');
 
   // 4e. realExec kills a long-running child promptly when AbortSignal fires
@@ -862,4 +876,310 @@ test('SOL-9: successful App results strip publisher-embedded rv_ review IDs and 
   const rPart = await runMain(['review'], { exec: scPart.exec });
   assert.equal(rPart.code, 2);
   assert.match(rPart.text, /rv_pub98765/);
+});
+
+// ---- 6. Loop-confirm round 2 tests (LOOP-CONFIRM1.md: SOL #2, #4, #5 + NEW #1, #2, #3) ----
+
+test('LC1-SOL2: when live installation APIs are denied and workflow exists, historical HEAD check does not suppress workflow, while live in-progress check attaches to App', async () => {
+  // Completed (historical) check on HEAD + workflowPresent + live APIs denied (403) -> falls back to workflow
+  const histHead = makeScenario({
+    headSuites: ['megalens'],
+    headChecks: [makeAppCheckRun({ status: 'completed', conclusion: 'success' })],
+    workflowPresent: true,
+  });
+  const d1 = await detectRemoteRunner({ exec: histHead.exec, cwd: '/repo-a', env: {} });
+  assert.equal(d1.runner, 'github', 'historical completed HEAD check must not suppress workflow fallback');
+
+  // Actively running check on HEAD + workflowPresent + live APIs denied -> attaches to App to prevent double-billing
+  const activeHead = makeScenario({
+    headSuites: ['megalens'],
+    headChecks: [makeAppCheckRun({ status: 'in_progress', conclusion: null })],
+    workflowPresent: true,
+  });
+  const d2 = await detectRemoteRunner({ exec: activeHead.exec, cwd: '/repo-a', env: {} });
+  assert.equal(d2.runner, 'app');
+  assert.equal(d2.appSource, 'head-active-check');
+});
+
+test('LC1-SOL4: SIGTERM-ignoring child is killed by SIGKILL fallback and parent exits promptly (realExec & local runBin)', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'mlsigkill-'));
+  const pidFile = path.join(dir, 'child.pid');
+  const ac = new AbortController();
+  const childPromise = realExec(
+    process.execPath,
+    ['-e', `process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`],
+    { cwd: dir, env: { PATH: process.env.PATH }, signal: ac.signal },
+  );
+  let pid = 0;
+  for (let i = 0; i < 200 && !pid; i++) {
+    try { pid = Number(readFileSync(pidFile, 'utf8')); } catch { await new Promise((r) => setTimeout(r, 10)); }
+  }
+  assert.ok(pid > 0, 'child wrote its pid');
+  ac.abort();
+  const res = await childPromise;
+  assert.equal(res.aborted, true);
+  await new Promise((r) => setTimeout(r, 350));
+  let alive = true;
+  try { process.kill(pid, 0); } catch (e) { alive = e.code === 'EPERM'; }
+  if (alive) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+  assert.equal(alive, false, 'SIGTERM-ignoring child must be terminated by SIGKILL fallback');
+
+  // Parent process exits promptly instead of hanging for the child's 1500ms timer
+  const script = `
+    import { realExec } from ${JSON.stringify(new URL('../scripts/lib/gh-runner.mjs', import.meta.url).href)};
+    const ac = new AbortController();
+    const p = realExec(process.execPath, ['-e', 'process.on("SIGTERM", () => {}); setTimeout(() => {}, 1500);'], { env: { PATH: process.env.PATH }, signal: ac.signal });
+    setTimeout(() => ac.abort(), 50);
+    const r = await p;
+    if (!r.aborted) process.exit(2);
+  `;
+  const t0 = performance.now();
+  execFileSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8', timeout: 2500 });
+  const parentMs = performance.now() - t0;
+  assert.ok(parentMs < 900, `parent should exit promptly after SIGKILL, took ${Math.round(parentMs)}ms`);
+
+  // Local engine (runBin) also SIGKILLs a SIGTERM-ignoring binary on abort
+  const bin = path.join(dir, 'stubborn-engine');
+  const binPidFile = path.join(dir, 'bin.pid');
+  writeFileSync(bin, `#!/usr/bin/env node\nprocess.on('SIGTERM', () => {});\nrequire('node:fs').writeFileSync(${JSON.stringify(binPidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`);
+  chmodSync(bin, 0o755);
+  const ac2 = new AbortController();
+  const pLocal = runMain(['review', '--runner', 'local'], {
+    exec: async () => bad('no gh', 127),
+    stateDir: dir,
+    cwd: dir,
+    platform: 'linux',
+    env: { MEGALENS_TOKEN: TOKEN, MEGALENS_REVIEW_BIN: bin },
+    timing: { waitMs: 5000 },
+    signal: ac2.signal,
+  });
+  let binPid = 0;
+  for (let i = 0; i < 200 && !binPid; i++) {
+    try { binPid = Number(readFileSync(binPidFile, 'utf8')); } catch { await new Promise((r) => setTimeout(r, 10)); }
+  }
+  assert.ok(binPid > 0, 'stubborn engine wrote its pid');
+  ac2.abort();
+  const rLocal = await pLocal;
+  assert.equal(rLocal.code, 4);
+  assert.match(rLocal.text, /CANCELLED/);
+  await new Promise((r) => setTimeout(r, 350));
+  let binAlive = true;
+  try { process.kill(binPid, 0); } catch (e) { binAlive = e.code === 'EPERM'; }
+  if (binAlive) { try { process.kill(binPid, 'SIGKILL'); } catch {} }
+  assert.equal(binAlive, false, 'SIGTERM-ignoring local engine must be terminated by SIGKILL fallback');
+});
+
+test('LC1-SOL5: equal-second runs break ties by ID, and findLatestRemoteReview discovers newer App checks on PR heads / default branch', async () => {
+  const ts = Date.parse('2026-11-23T10:00:00Z');
+  // Equal-second workflow runs prefer higher databaseId
+  assert.equal(
+    pickNewerReview(
+      { id: 'gh:800', runner: 'github', nwo: 'acme/widget', startedAt: ts },
+      { id: 'gh:801', runner: 'github', nwo: 'acme/widget', startedAt: ts },
+    ).id,
+    'gh:801',
+  );
+  // Equal-second App checks prefer higher check run id
+  assert.equal(
+    pickNewerReview(
+      { id: 'app:700', runner: 'app', nwo: 'acme/widget', startedAt: ts },
+      { id: 'app:701', runner: 'app', nwo: 'acme/widget', startedAt: ts },
+    ).id,
+    'app:701',
+  );
+
+  // Newer App check on another PR's head SHA (different from local HEAD) beats an older workflow run
+  const otherHead = 'c'.repeat(40);
+  const exec = async (cmd, args) => {
+    if (cmd === 'git') return ok(`${H}\n`);
+    if (args[0] === 'repo') return ok(JSON.stringify({ nameWithOwner: 'acme/widget', defaultBranchRef: { name: 'main' } }));
+    if (args[0] === 'run') return ok(JSON.stringify([{ databaseId: 801, createdAt: '2026-11-23T10:00:00Z' }]));
+    if (args[0] === 'api' && args.includes('repos/acme/widget/pulls')) return ok(JSON.stringify([otherHead]));
+    if (args[0] === 'api' && args.some((a) => a === `repos/acme/widget/commits/${otherHead}/check-runs`)) {
+      return ok(JSON.stringify({ check_runs: [makeAppCheckRun({ id: 702, started_at: '2026-11-23T11:00:00Z' })] }));
+    }
+    if (args[0] === 'api' && args.some((a) => a.endsWith('/check-runs'))) return ok(JSON.stringify({ check_runs: [] }));
+    return bad(`unexpected: ${cmd} ${args.join(' ')}`);
+  };
+  const latest = await findLatestRemoteReview({ exec, cwd: '/repo-a', env: {} });
+  assert.equal(latest.id, 'app:702');
+});
+
+test('LC1-NEW1: App+workflow repo NEVER dispatches a second billable workflow when App check is delayed on PR, default branch, or inconclusive PR lookup', async () => {
+  // 1a. Open PR with delayed App check arriving at 9 seconds -> waits, picks up App check, ZERO workflow dispatch
+  let clock = 0;
+  let dispatched = false;
+  const delayedCheck = makeAppCheckRun({ id: 701, started_at: '2026-11-23T10:30:00Z' });
+  const makeDualExec = ({ delayCheck = 9000, openPr = true, branch = 'feature', pullsFail = false, onRemoteDefault = false } = {}) => async (cmd, args) => {
+    if (cmd === 'git') {
+      if (args.includes('--show-toplevel')) return ok('/repo-a\n');
+      if (args[0] === 'rev-parse') return ok(`${H}\n`);
+      if (args[0] === 'merge-base') return ok(`${B}\n`);
+      if (args[0] === 'status') return ok('');
+      if (args[0] === 'branch') return ok(`${branch}\n`);
+    }
+    if (args[0] === '--version' || args[0] === 'auth') return ok('');
+    if (args[0] === 'repo') return ok(JSON.stringify({ nameWithOwner: 'acme/widget', defaultBranchRef: { name: 'main' } }));
+    if (args[0] === 'secret') return ok('[{"name":"MEGALENS_TOKEN"}]');
+    if (args[0] === 'api') {
+      if (args.includes('orgs/acme/installations')) return ok('[{"id":10,"app_slug":"megalens","repository_selection":"all"}]');
+      if (args.some((a) => a.includes('/contents/'))) return ok('file\n');
+      if (args.some((a) => a.includes('/branches-where-head'))) return ok(JSON.stringify(onRemoteDefault ? ['main'] : [branch]));
+      if (args.some((a) => a.includes('/pulls'))) return pullsFail ? bad('HTTP 500') : ok(JSON.stringify(openPr ? [12] : []));
+      if (args.some((a) => a.endsWith('/check-runs'))) return ok(JSON.stringify({ check_runs: clock >= delayCheck ? [delayedCheck] : [] }));
+      if (args.some((a) => a.includes('/commits/'))) return ok(`${H}\n`);
+    }
+    if (args[0] === 'workflow' && args[1] === 'run') { dispatched = true; return ok(''); }
+    if (args[0] === 'run' && args[1] === 'list') return ok('[]');
+    return bad(`unexpected ${cmd} ${args.join(' ')}`);
+  };
+
+  const rDelayed = await runMain(['review'], {
+    exec: makeDualExec({ delayCheck: 9000, openPr: true }),
+    timing: { now: () => clock, sleep: async (ms) => { clock += ms; }, sleepMs: 2000 },
+  });
+  assert.equal(rDelayed.code, 0);
+  assert.equal(dispatched, false, 'must NEVER dispatch workflow while App check is still arriving');
+  assert.match(rDelayed.text, /## MegaLens standard review: complete/);
+  assert.ok(clock >= 9000 && clock <= 12000);
+
+  // 1b. Open PR where App check NEVER appears within grace window -> still ZERO workflow dispatch, clear message
+  clock = 0; dispatched = false;
+  const rNever = await runMain(['review'], {
+    exec: makeDualExec({ delayCheck: Infinity, openPr: true }),
+    timing: { now: () => clock, sleep: async (ms) => { clock += ms; }, sleepMs: 2000, appearWaitMs: 10000 },
+  });
+  assert.equal(rNever.code, 4);
+  assert.equal(dispatched, false, 'must NEVER double-dispatch after appear window expires on open PR');
+  assert.match(rNever.text, /not charged twice/);
+
+  // 1c. Detached HEAD on remote default branch -> fails closed, ZERO workflow dispatch
+  clock = 0; dispatched = false;
+  const rDetachedMain = await runMain(['review'], {
+    exec: makeDualExec({ delayCheck: Infinity, openPr: false, branch: '', onRemoteDefault: true }),
+    timing: { now: () => clock, sleep: async (ms) => { clock += ms; }, sleepMs: 2000, appearWaitMs: 6000 },
+  });
+  assert.equal(rDetachedMain.code, 4);
+  assert.equal(dispatched, false, 'detached HEAD on default branch must never double-dispatch');
+
+  // 1d. Failed /pulls lookup -> fails closed, ZERO workflow dispatch
+  clock = 0; dispatched = false;
+  const rPullErr = await runMain(['review'], {
+    exec: makeDualExec({ delayCheck: Infinity, openPr: false, pullsFail: true }),
+    timing: { now: () => clock, sleep: async (ms) => { clock += ms; }, sleepMs: 2000, appearWaitMs: 6000 },
+  });
+  assert.equal(rPullErr.code, 4);
+  assert.equal(dispatched, false, 'inconclusive PR check must fail closed and never double-dispatch');
+});
+
+test('LC1-NEW2: interrupting workflow dispatch reconciles against GitHub and never claims GitHub did not start it', async () => {
+  const pre = { nwo: 'acme/widget', defaultBranch: 'main', baseSha: B, headSha: H };
+  const title = `MegaLens standard ${B}..${H}`;
+
+  // 2a. Abort during dispatch when GitHub ALREADY accepted it and reconciliation finds the new run -> returns run id & bookmarks it
+  const acFound = new AbortController();
+  let listsFound = 0;
+  let accepted = false;
+  const execFound = async (cmd, args, opts) => {
+    if (args[0] === 'run' && args[1] === 'list') {
+      listsFound += 1;
+      assert.equal(opts?.signal?.aborted, false, 'reconciliation must use a fresh non-aborted signal');
+      return ok(JSON.stringify(accepted ? [{ databaseId: 9123, displayTitle: title, createdAt: '2026-11-23T10:00:00Z', url: 'https://github.com/acme/widget/actions/runs/9123' }] : []));
+    }
+    if (args[0] === 'workflow' && args[1] === 'run') {
+      accepted = true;
+      acFound.abort();
+      return { code: 4, stdout: '', stderr: '', aborted: true };
+    }
+    return bad(`unexpected ${cmd} ${args.join(' ')}`);
+  };
+  const started = await startRun({ exec: execFound, cwd: '/repo-a', env: {}, tier: 'standard', pre, signal: acFound.signal });
+  assert.equal(started.id, 'gh:9123');
+  assert.equal(started.aborted, true);
+  assert.equal(listsFound, 2, 'must run reconciliation lookup after aborted dispatch');
+
+  // End-to-end runnerReview saves bookmark and prints Still running line so /megalens:result retrieves it
+  const acE2e = new AbortController();
+  let e2eAccepted = false;
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'mlrec-'));
+  const execE2e = async (cmd, args) => {
+    if (cmd === 'git') {
+      if (args.includes('--show-toplevel')) return ok('/repo-a\n');
+      if (args[0] === 'rev-parse') return ok(`${H}\n`);
+      if (args[0] === 'merge-base') return ok(`${B}\n`);
+      if (args[0] === 'status') return ok('');
+      if (args[0] === 'branch') return ok('feature\n');
+    }
+    if (args[0] === '--version' || args[0] === 'auth') return ok('');
+    if (args[0] === 'repo') return ok(JSON.stringify({ nameWithOwner: 'acme/widget', defaultBranchRef: { name: 'main' } }));
+    if (args[0] === 'secret') return ok('[{"name":"MEGALENS_TOKEN"}]');
+    if (args[0] === 'api' && args.some((a) => a.includes('/contents/'))) return ok('file\n');
+    if (args[0] === 'api' && args.some((a) => a.includes('/commits/'))) return ok(`${H}\n`);
+    if (args[0] === 'run' && args[1] === 'list') {
+      return ok(JSON.stringify(e2eAccepted ? [{ databaseId: 9123, displayTitle: title, createdAt: '2026-11-23T10:00:00Z', url: 'https://github.com/acme/widget/actions/runs/9123' }] : []));
+    }
+    if (args[0] === 'workflow' && args[1] === 'run') {
+      e2eAccepted = true;
+      acE2e.abort();
+      return { code: 4, stdout: '', stderr: '', aborted: true };
+    }
+    return bad(`unexpected ${cmd} ${args.join(' ')}`);
+  };
+  let savedRec = null;
+  const rr = await runnerReview({ exec: execE2e, cwd: '/repo-a', env: { MEGALENS_STATE_DIR: stateDir }, tier: 'standard', signal: acE2e.signal, saveLatest: (rec) => { savedRec = rec; } });
+  assert.equal(rr.code, 0);
+  assert.equal(rr.aborted, true);
+  assert.equal(savedRec?.id, 'gh:9123', 'reconciled run must be bookmarked for /megalens:result');
+  assert.match(rr.text, /Still running\. Run \/megalens:result to see it\./);
+
+  // 2b. Abort during dispatch when reconciliation finds NO run yet -> warns do NOT start another (NEVER says "GitHub did not start")
+  const acMiss = new AbortController();
+  let listsMiss = 0;
+  const execMiss = async (cmd, args) => {
+    if (args[0] === 'run' && args[1] === 'list') { listsMiss += 1; return ok('[]'); }
+    if (args[0] === 'workflow' && args[1] === 'run') { acMiss.abort(); return { code: 4, stdout: '', stderr: '', aborted: true }; }
+    return bad(`unexpected ${cmd} ${args.join(' ')}`);
+  };
+  await assert.rejects(
+    () => startRun({ exec: execMiss, cwd: '/repo-a', env: {}, tier: 'standard', pre, signal: acMiss.signal }),
+    (e) => {
+      assert.match(e.message, /do NOT start another one/);
+      assert.match(e.message, /actions\/workflows\/megalens-dispatch\.yml/);
+      assert.equal(/GitHub did not start the workflow/i.test(e.message), false);
+      return true;
+    },
+  );
+  assert.equal(listsMiss, 2, 'must attempt reconciliation even when no run appears yet');
+
+  // 2c. Ambiguous transport error (non-4xx) also reconciles and warns do NOT start another
+  const execNet = async (cmd, args) => {
+    if (args[0] === 'run' && args[1] === 'list') return ok('[]');
+    if (args[0] === 'workflow' && args[1] === 'run') return bad('read tcp: connection reset by peer', 1);
+    return bad(`unexpected ${cmd} ${args.join(' ')}`);
+  };
+  await assert.rejects(
+    () => startRun({ exec: execNet, cwd: '/repo-a', env: {}, tier: 'standard', pre }),
+    /do NOT start another one/,
+  );
+});
+
+test('LC1-NEW3: interrupted or timed-out Local Standard stops honestly (exit 4, CANCELLED/NOT COMPLETED) and never leaves broken bookmark', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'mlstdhonest-'));
+  const bin = path.join(dir, 'fake-engine');
+  writeFileSync(bin, '#!/usr/bin/env node\nprocess.stderr.write("megalens-review: standard review rv_confirm123 (gateway)\\n");\nsetTimeout(() => {}, 5000);\n');
+  chmodSync(bin, 0o755);
+
+  const rCap = await runMain(['review', '--runner', 'local'], {
+    exec: async () => bad('no gh', 127),
+    stateDir: dir,
+    cwd: dir,
+    platform: 'linux',
+    env: { MEGALENS_TOKEN: TOKEN, MEGALENS_REVIEW_BIN: bin },
+    timing: { waitMs: 50 },
+  });
+  assert.equal(rCap.code, 4);
+  assert.match(rCap.text, /## MegaLens standard review: NOT COMPLETED/);
+  assert.match(rCap.text, /not a clean review/i);
+  assert.equal(rCap.text.includes(STILL_RUNNING_LINE), false, 'must not promise /megalens:result for a stopped foreground run');
+  assert.equal(existsSync(stateFilePath({ MEGALENS_STATE_DIR: dir })), false, 'must not write an unretrievable foreground review bookmark');
 });

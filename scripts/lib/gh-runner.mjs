@@ -93,24 +93,50 @@ export function ghEnv(env) {
   return out;
 }
 
-/** Real exec: spawn without a shell, capped output, kills child promptly on AbortSignal. Missing binary -> code 127. */
+const KILL_GRACE_MS = 150;
+const DEFINITIVE_DISPATCH_REFUSAL_RE = /\bHTTP 4(?:00|01|03|04|22)\b|could not find any workflows|does not have (?:a )?workflow_dispatch|workflow.*disabled|not enabled|invalid inputs|required input/i;
+
+function killChildTree(child, sig) {
+  if (process.platform !== 'win32' && Number.isInteger(child.pid) && child.pid > 0) {
+    try { process.kill(-child.pid, sig); } catch { /* process group may already be gone */ }
+  }
+  try { child.kill(sig); } catch { /* ignore */ }
+}
+
+/** Real exec: spawn without a shell, capped output, kills child (and its process group) promptly on AbortSignal with guaranteed SIGKILL fallback. Missing binary -> code 127. */
 export function realExec(cmd, args, { cwd, env, signal = null } = {}) {
   return new Promise((resolve) => {
     if (signal?.aborted) return resolve({ code: 4, stdout: '', stderr: '', aborted: true });
     let child;
-    try { child = spawn(cmd, args, { cwd, env: ghEnv(env ?? {}), stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }); } catch (e) { return resolve({ code: 127, stdout: '', stderr: String(e.message) }); }
-    let stdout = ''; let stderr = ''; let settled = false; let killTimer = null;
+    try {
+      child = spawn(cmd, args, {
+        cwd,
+        env: ghEnv(env ?? {}),
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: process.platform !== 'win32',
+        windowsHide: true,
+      });
+    } catch (e) { return resolve({ code: 127, stdout: '', stderr: String(e.message) }); }
+    let stdout = ''; let stderr = ''; let settled = false; let exited = false; let killTimer = null;
+    const clearKillTimer = () => {
+      if (killTimer !== null) { clearTimeout(killTimer); killTimer = null; }
+    };
     const finish = (res) => {
       if (settled) return;
       settled = true;
-      if (killTimer !== null) clearTimeout(killTimer);
       if (signal) signal.removeEventListener('abort', onAbort);
       resolve(res);
     };
     const onAbort = () => {
-      try { child.kill('SIGTERM'); } catch { /* ignore */ }
-      killTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* ignore */ } }, 250);
-      killTimer.unref?.();
+      if (!exited) {
+        killChildTree(child, 'SIGTERM');
+        // Keep killTimer ref'd until the child actually exits so SIGKILL always fires even if the parent is exiting.
+        killTimer = setTimeout(() => {
+          killTimer = null;
+          if (!exited) killChildTree(child, 'SIGKILL');
+          child.unref?.();
+        }, KILL_GRACE_MS);
+      }
       child.stdout?.destroy();
       child.stderr?.destroy();
       finish({ code: 4, stdout, stderr, aborted: true });
@@ -118,8 +144,20 @@ export function realExec(cmd, args, { cwd, env, signal = null } = {}) {
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
     child.stdout.on('data', (c) => { if (stdout.length < MAX_FINDINGS) stdout += c; });
     child.stderr.on('data', (c) => { if (stderr.length < MAX_FINDINGS) stderr += c; });
-    child.on('error', (e) => finish({ code: e.code === 'ENOENT' ? 127 : 4, stdout, stderr: String(e.message) }));
-    child.on('close', (code) => finish({ code: code ?? 4, stdout, stderr }));
+    child.on('error', (e) => {
+      exited = true;
+      clearKillTimer();
+      finish({ code: e.code === 'ENOENT' ? 127 : 4, stdout, stderr: String(e.message) });
+    });
+    child.on('exit', () => {
+      exited = true;
+      clearKillTimer();
+    });
+    child.on('close', (code) => {
+      exited = true;
+      clearKillTimer();
+      finish({ code: code ?? 4, stdout, stderr });
+    });
   });
 }
 
@@ -304,6 +342,18 @@ export async function checkAppInstallation({ exec, cwd, env, nwo, defaultBranch,
   }
 
   // 3. Check suites / check runs fallback when live installation endpoints are inaccessible to the token.
+  //    When `allowHistoryFallback` is false (a dispatch workflow is present), NEVER let historical completed
+  //    checks or check suites (on HEAD or defaultBranch) suppress the workflow fallback — only a currently
+  //    live (queued / in_progress) MegaLens check run on HEAD selects the App to attach instead of double-billing.
+  const hasActiveMegaLensOnRef = async (ref) => {
+    const cr = await run('gh', ['api', '-X', 'GET', `repos/${nwo}/commits/${ref}/check-runs`]);
+    if (cr.code !== 0) return false;
+    return parseCheckRuns(cr.stdout).some((c) => {
+      if (!c || c.name !== CHECK_NAME || !isMegaLensAppSlug(c.app?.slug, env)) return false;
+      const st = mapCheckState(c);
+      return st === 'queued' || st === 'running';
+    });
+  };
   const hasMegaLensOnRef = async (ref) => {
     const cs = await run('gh', ['api', '-X', 'GET', `repos/${nwo}/commits/${ref}/check-suites`, '--jq', '[.check_suites[]?.app?.slug]']);
     if (cs.code === 0 && parseAppSlugs(cs.stdout).some((s) => isMegaLensAppSlug(s, env))) return true;
@@ -312,10 +362,17 @@ export async function checkAppInstallation({ exec, cwd, env, nwo, defaultBranch,
     return false;
   };
 
+  if (!allowHistoryFallback) {
+    if (headSha && SHA_RE.test(headSha) && await hasActiveMegaLensOnRef(headSha)) {
+      return { installed: true, source: orgSelectedActive ? 'org-api' : 'head-active-check' };
+    }
+    return { installed: false, source: 'none' };
+  }
+
   if (headSha && SHA_RE.test(headSha)) {
     if (await hasMegaLensOnRef(headSha)) return { installed: true, source: orgSelectedActive ? 'org-api' : 'head-check' };
   }
-  if ((allowHistoryFallback || orgSelectedActive) && defaultBranch && defaultBranch !== headSha) {
+  if (defaultBranch && defaultBranch !== headSha) {
     if (await hasMegaLensOnRef(defaultBranch)) return { installed: true, source: orgSelectedActive ? 'org-api' : 'history-check' };
   }
   return { installed: false, source: 'none' };
@@ -420,16 +477,60 @@ const listRuns = async (run, nwo, limit = 50) => {
 
 /**
  * Start the workflow run and find the id it created. Run ids that exist before the dispatch are recorded; only a NEW run
- * whose title is exactly "MegaLens <tier> <base>..<head>" counts. If the match is not certain nothing is started again.
+ * whose title is exactly "MegaLens <tier> <base>..<head>" counts. If dispatch is interrupted or fails ambiguously (not a
+ * definitive GitHub 4xx refusal), reconciles against GitHub before reporting so a retry cannot double-charge.
  */
-export async function startRun({ exec, cwd, env, tier, pre, sleepMs = 2000, tries = 15, sleep = defaultSleep, signal = null }) {
+export async function startRun({ exec, cwd, env, tier, pre, sleepMs = 2000, tries = 15, sleep = defaultSleep, signal = null, reconcileTimeoutMs = 4000 }) {
   const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
   const before = await listRuns(run, pre.nwo);
+  if (signal?.aborted) throw new SetupError('Interrupted before starting the workflow. Nothing was started and no credit was used.');
   if (before === null) throw new SetupError('Could not list the existing workflow runs, so a new run could not be told apart. Nothing was started and no credit was used. Check `gh auth status` and your network, then run this again.');
   const seen = new Set(before.map((x) => x.databaseId));
   const title = runTitle(tier, pre.baseSha, pre.headSha);
+  const workflowUrl = `https://github.com/${pre.nwo}/actions/workflows/${WORKFLOW_FILE}`;
+
+  const reconcileOnce = async () => {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), reconcileTimeoutMs);
+    timer.unref?.();
+    try {
+      const freshRun = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal: ac.signal });
+      const rows = await listRuns(freshRun, pre.nwo);
+      if (!rows) return { status: 'error' };
+      const hits = rows.filter((x) => !seen.has(x.databaseId) && x.displayTitle === title);
+      if (hits.length === 1) {
+        const hit = hits[0];
+        return {
+          status: 'found',
+          run: {
+            id: `gh:${hit.databaseId}`,
+            url: typeof hit.url === 'string' ? hit.url : `https://github.com/${pre.nwo}/actions/runs/${hit.databaseId}`,
+            createdAt: typeof hit.createdAt === 'string' ? hit.createdAt : null,
+          },
+        };
+      }
+      if (hits.length > 1) return { status: 'ambiguous' };
+      return { status: 'none' };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
   const r = await run('gh', ['workflow', 'run', WORKFLOW_FILE, '--ref', pre.defaultBranch, '-f', `tier=${tier}`, '-f', `base_sha=${pre.baseSha}`, '-f', `head_sha=${pre.headSha}`, '-R', pre.nwo]);
-  if (r.code !== 0) throw new SetupError(`GitHub did not start the workflow: ${scrub(firstLine(r.stderr), env) || 'no reason given'}. Check that ${WORKFLOW_PATH} is on ${pre.defaultBranch} and that you can run workflows in this repository.`);
+  const wasAborted = Boolean(r.aborted || signal?.aborted);
+  if (r.code !== 0 || wasAborted) {
+    if (!wasAborted && DEFINITIVE_DISPATCH_REFUSAL_RE.test(r.stderr || '')) {
+      throw new SetupError(`GitHub did not start the workflow: ${scrub(firstLine(r.stderr), env) || 'no reason given'}. Check that ${WORKFLOW_PATH} is on ${pre.defaultBranch} and that you can run workflows in this repository.`);
+    }
+    const rec = await reconcileOnce();
+    if (rec.status === 'found') {
+      return { ...rec.run, aborted: wasAborted };
+    }
+    if (wasAborted) {
+      throw new SetupError(`Interrupted while starting the workflow on GitHub. A review may already have been started and charged: do NOT start another one. Open ${workflowUrl} to check for the run (or run /megalens:status in a moment).`);
+    }
+    throw new SetupError(`The workflow dispatch did not finish cleanly (${scrub(firstLine(r.stderr), env) || 'no reason given'}). A review may already have been started and charged: do NOT start another one. Open ${workflowUrl} to check before retrying.`);
+  }
   for (let i = 0; i < tries && !signal?.aborted; i++) {
     const rows = await listRuns(run, pre.nwo);
     if (rows) {
@@ -440,13 +541,18 @@ export async function startRun({ exec, cwd, env, tier, pre, sleepMs = 2000, trie
           id: `gh:${hit.databaseId}`,
           url: typeof hit.url === 'string' ? hit.url : `https://github.com/${pre.nwo}/actions/runs/${hit.databaseId}`,
           createdAt: typeof hit.createdAt === 'string' ? hit.createdAt : null,
+          aborted: false,
         };
       }
       if (hits.length > 1) break;
     }
     await sleep(sleepMs, signal);
   }
-  return { id: null, url: `https://github.com/${pre.nwo}/actions/workflows/${WORKFLOW_FILE}`, createdAt: null };
+  if (signal?.aborted) {
+    const rec = await reconcileOnce();
+    if (rec.status === 'found') return { ...rec.run, aborted: true };
+  }
+  return { id: null, url: workflowUrl, createdAt: null, aborted: Boolean(signal?.aborted) };
 }
 
 /** gh run state -> queued / running / done / failed. */
@@ -576,6 +682,10 @@ export async function runnerReview({
     return { text: acc, code: 4 };
   }
   saveLatest?.({ id: started.id, runner: 'github', nwo: pre.nwo, tier, startedAt: parseTs(started.createdAt) || undefined });
+  if (started.aborted || signal?.aborted) {
+    emit(`${STILL_RUNNING_LINE}\n`);
+    return { text: acc, code: 0, id: started.id, timedOut: false, aborted: true };
+  }
   if (!wait) {
     const noWaitMsg = showIdOnNoWait
       ? `Review of ${short(pre.baseSha)}..${short(pre.headSha)} in ${pre.nwo}, tier ${tier}, runs on your GitHub runner.\nReview started on GitHub: ${started.id}\nRun: ${started.url}\n${STILL_RUNNING_LINE}\n`
@@ -792,7 +902,7 @@ export async function appReview({
   now = () => Date.now(),
   sleep = defaultSleep,
   sleepMs = 2000,
-  appearTries = 4,
+  appearWaitMs = 60_000,
   signal = null,
   onLine = null,
   saveLatest = null,
@@ -811,35 +921,53 @@ export async function appReview({
 
   let cr = await findAppCheckRun({ exec, cwd, env, nwo: pre.nwo, headSha: pre.headSha, signal });
   if (!cr) {
-    // Check if commit is on default branch or has an open PR (webhook may still be arriving).
+    // Check if commit is on default branch or has an open PR (the App webhook may already have enqueued a review).
     const br = await exec('git', ['branch', '--show-current'], { cwd, env: ghEnv(env), signal });
-    const onDefault = br.code === 0 && br.stdout.trim() === pre.defaultBranch;
+    const onLocalDefault = br.code === 0 && br.stdout.trim() === pre.defaultBranch;
+    const bwh = await exec('gh', ['api', '-X', 'GET', `repos/${pre.nwo}/commits/${pre.headSha}/branches-where-head`, '--jq', '[.[]?.name]'], { cwd, env: ghEnv(env), signal });
+    const bwhList = bwh.code === 0 ? jsonOf(bwh.stdout) : null;
+    const onRemoteDefault = Array.isArray(bwhList) && bwhList.some((name) => name === pre.defaultBranch);
+    const onDefault = onLocalDefault || onRemoteDefault;
+
     const prRes = await exec('gh', ['api', '-X', 'GET', `repos/${pre.nwo}/commits/${pre.headSha}/pulls`, '--jq', '[.[] | select(.state == "open") | .number]'], { cwd, env: ghEnv(env), signal });
     const openPrs = prRes.code === 0 ? jsonOf(prRes.stdout) : null;
-    const hasOpenPr = Array.isArray(openPrs) && openPrs.length > 0;
-    if (onDefault || hasOpenPr) {
-      for (let i = 0; i < appearTries && !cr && !signal?.aborted; i++) {
-        const rem = waitMs - Math.max(0, now() - t0);
+    const prCheckOk = prRes.code === 0 && Array.isArray(openPrs);
+    const hasOpenPr = prCheckOk && openPrs.length > 0;
+    // Fail closed against double-billing: ONLY fall back to workflow_dispatch when we affirmatively confirmed
+    // zero open PRs AND the commit is not on the default branch (so the App webhook cannot fire for this commit).
+    const mayBeTriggeredByApp = onDefault || hasOpenPr || !prCheckOk;
+
+    if (mayBeTriggeredByApp) {
+      const capMs = Math.min(waitMs, appearWaitMs);
+      while (!cr && !signal?.aborted) {
+        const elapsed = Math.max(0, now() - t0);
+        const rem = capMs - elapsed;
         if (rem <= 0) break;
         await sleep(Math.min(sleepMs, rem), signal);
-        const remAfter = waitMs - Math.max(0, now() - t0);
+        const remAfter = capMs - Math.max(0, now() - t0);
         if (remAfter <= 0 || signal?.aborted) break;
         const found = await raceWithDeadline(
           (callSignal) => findAppCheckRun({ exec, cwd, env, nwo: pre.nwo, headSha: pre.headSha, signal: callSignal }),
-          { signal, remainingMs: remAfter, now, t0, waitMs },
+          { signal, remainingMs: remAfter, now, t0, waitMs: capMs },
         );
         if (found.interrupted) break;
         cr = found.value;
       }
     }
     if (!cr) {
-      if (allowNoCheckFallback) return { text: '', code: 4, noCheck: true };
+      if (allowNoCheckFallback && !mayBeTriggeredByApp) {
+        return { text: '', code: 4, noCheck: true, safeToFallback: true };
+      }
       if (pre.note) emit(pre.note);
-      const msg = (onDefault || hasOpenPr)
-        ? `No MegaLens review started for this commit yet. Check that reviews are turned on for ${pre.nwo} at ${APP_INSTALL_URL}.\n`
+      if (signal?.aborted) {
+        emit('Stopped waiting before a MegaLens review check appeared. If the GitHub App already queued one, run /megalens:result in a moment; do not start another review.\n');
+        return { text: acc, code: 4, aborted: true, noCheck: true, safeToFallback: false };
+      }
+      const msg = mayBeTriggeredByApp
+        ? `No MegaLens review check has appeared for this commit yet. The MegaLens GitHub App may still be queueing it, or reviews may be turned off for ${pre.nwo} at ${APP_INSTALL_URL}. Nothing else was started so you are not charged twice.\n`
         : `The MegaLens GitHub App reviews pull requests and pushes to ${pre.defaultBranch}. Open a pull request (e.g. \`gh pr create\`) or push to ${pre.defaultBranch}, then run /megalens:review again.\n`;
       emit(msg);
-      return { text: acc, code: 4, setup: true, noCheck: true };
+      return { text: acc, code: 4, setup: true, noCheck: true, safeToFallback: false };
     }
   }
 
@@ -885,23 +1013,55 @@ export async function appReview({
 
 /**
  * Fallback lookup when `/megalens:result` or `/megalens:status` is called with no id:
- * checks BOTH a MegaLens App check run on HEAD AND the latest MegaLens Dispatch workflow run,
- * returning whichever started more recently.
+ * checks BOTH MegaLens App check runs across HEAD, default branch, and recently updated PR heads,
+ * AND the latest MegaLens Dispatch workflow runs, returning whichever started more recently.
  */
 export async function findLatestRemoteReview({ exec, cwd, env, signal = null }) {
-  const nwo = await repoOf({ exec, cwd, env, signal });
+  const rv = await exec('gh', ['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef'], { cwd, env: ghEnv(env), signal });
+  const repo = rv.code === 0 ? jsonOf(rv.stdout) : null;
+  const nwo = typeof repo?.nameWithOwner === 'string' && /^[\w.-]+\/[\w.-]+$/.test(repo.nameWithOwner) ? repo.nameWithOwner : null;
   if (!nwo) return null;
-  let appCand = null;
+  const defaultBranch = typeof repo?.defaultBranchRef?.name === 'string' && /^[\w./-]{1,100}$/.test(repo.defaultBranchRef.name)
+    ? repo.defaultBranchRef.name
+    : null;
+
+  const refs = [];
+  const addRef = (ref) => { if (ref && !refs.includes(ref)) refs.push(ref); };
   const hs = await exec('git', ['rev-parse', '--verify', 'HEAD^{commit}'], { cwd, env: ghEnv(env), signal });
-  if (hs.code === 0 && SHA_RE.test(hs.stdout.trim())) {
-    const cr = await findAppCheckRun({ exec, cwd, env, nwo, headSha: hs.stdout.trim(), signal });
-    if (cr) appCand = { id: `app:${cr.id}`, runner: 'app', nwo, startedAt: checkRunTimestamp(cr) };
+  if (hs.code === 0 && SHA_RE.test(hs.stdout.trim())) addRef(hs.stdout.trim());
+
+  const prs = await exec('gh', [
+    'api', '-X', 'GET', `repos/${nwo}/pulls`,
+    '-f', 'state=all', '-f', 'sort=updated', '-f', 'direction=desc', '-f', 'per_page=5',
+    '--jq', '[.[]?.head?.sha // empty]',
+  ], { cwd, env: ghEnv(env), signal });
+  if (prs.code === 0) {
+    const parsed = jsonOf(prs.stdout);
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) {
+        const sha = typeof item === 'string' ? item.trim() : item?.head?.sha;
+        if (typeof sha === 'string' && SHA_RE.test(sha)) addRef(sha);
+      }
+    }
   }
+  if (defaultBranch) addRef(defaultBranch);
+
+  let appCand = null;
+  for (const ref of refs) {
+    const cr = await findAppCheckRun({ exec, cwd, env, nwo, headSha: ref, signal });
+    if (!cr) continue;
+    const cand = { id: `app:${cr.id}`, numId: cr.id, runner: 'app', nwo, startedAt: checkRunTimestamp(cr) };
+    if (!appCand || cand.startedAt > appCand.startedAt || (cand.startedAt === appCand.startedAt && cand.numId > appCand.numId)) {
+      appCand = cand;
+    }
+  }
+
   let ghCand = null;
   const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
-  const rows = await listRuns(run, nwo, 1);
+  const rows = await listRuns(run, nwo, 5);
   if (rows && rows.length > 0) {
-    ghCand = { id: `gh:${rows[0].databaseId}`, runner: 'github', nwo, startedAt: parseTs(rows[0].createdAt) };
+    const sorted = [...rows].sort((a, b) => (parseTs(b.createdAt) - parseTs(a.createdAt)) || (b.databaseId - a.databaseId));
+    ghCand = { id: `gh:${sorted[0].databaseId}`, runner: 'github', nwo, startedAt: parseTs(sorted[0].createdAt) };
   }
   if (appCand && ghCand) {
     if (ghCand.startedAt > 0 && appCand.startedAt > 0) {

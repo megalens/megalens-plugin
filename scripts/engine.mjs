@@ -78,23 +78,48 @@ async function showChange(rest, cwd, say) {
   return df.code === 0 ? 0 : 4;
 }
 
+const KILL_GRACE_MS = 150;
+
+function killChildTree(child, sig) {
+  if (process.platform !== 'win32' && Number.isInteger(child.pid) && child.pid > 0) {
+    try { process.kill(-child.pid, sig); } catch { /* process group may already be gone */ }
+  }
+  try { child.kill(sig); } catch { /* ignore */ }
+}
+
 function runBin(bin, args, { env, cwd, signal = null }) {
   return new Promise((resolve) => {
     if (signal?.aborted) return resolve({ code: 4, stdout: '', stderr: '', aborted: true });
     let child;
-    try { child = spawn(bin, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] }); } catch (e) { return resolve({ code: 127, stdout: '', stderr: String(e.message) }); }
-    let stdout = ''; let stderr = ''; let settled = false; let killTimer = null;
+    try {
+      child = spawn(bin, args, {
+        cwd,
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: process.platform !== 'win32',
+        windowsHide: true,
+      });
+    } catch (e) { return resolve({ code: 127, stdout: '', stderr: String(e.message) }); }
+    let stdout = ''; let stderr = ''; let settled = false; let exited = false; let killTimer = null;
+    const clearKillTimer = () => {
+      if (killTimer !== null) { clearTimeout(killTimer); killTimer = null; }
+    };
     const finish = (res) => {
       if (settled) return;
       settled = true;
-      if (killTimer !== null) clearTimeout(killTimer);
       if (signal) signal.removeEventListener('abort', onAbort);
       resolve(res);
     };
     const onAbort = () => {
-      try { child.kill('SIGTERM'); } catch { /* ignore */ }
-      killTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* ignore */ } }, 250);
-      killTimer.unref?.();
+      if (!exited) {
+        killChildTree(child, 'SIGTERM');
+        // Keep killTimer ref'd until the child actually exits so SIGKILL always fires even if the parent is exiting.
+        killTimer = setTimeout(() => {
+          killTimer = null;
+          if (!exited) killChildTree(child, 'SIGKILL');
+          child.unref?.();
+        }, KILL_GRACE_MS);
+      }
       child.stdout?.destroy();
       child.stderr?.destroy();
       finish({ code: 4, stdout, stderr, aborted: true });
@@ -102,8 +127,20 @@ function runBin(bin, args, { env, cwd, signal = null }) {
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
     child.stdout.on('data', (c) => { if (stdout.length < MAX_OUT) stdout += c; });
     child.stderr.on('data', (c) => { if (stderr.length < MAX_OUT) stderr += c; });
-    child.on('error', (e) => finish({ code: e.code === 'ENOENT' ? 127 : 4, stdout, stderr: e.code === 'ENOENT' ? 'engine binary not found' : String(e.message) }));
-    child.on('close', (code, sig) => finish({ code: code ?? (sig ? 4 : 0), stdout, stderr }));
+    child.on('error', (e) => {
+      exited = true;
+      clearKillTimer();
+      finish({ code: e.code === 'ENOENT' ? 127 : 4, stdout, stderr: e.code === 'ENOENT' ? 'engine binary not found' : String(e.message) });
+    });
+    child.on('exit', () => {
+      exited = true;
+      clearKillTimer();
+    });
+    child.on('close', (code, sig) => {
+      exited = true;
+      clearKillTimer();
+      finish({ code: code ?? (sig ? 4 : 0), stdout, stderr });
+    });
   });
 }
 
@@ -114,12 +151,16 @@ export function pickNewerReview(saved, remote) {
   if (saved.id === remote.id) return remote;
   const sTs = Number(saved.startedAt) || 0;
   const rTs = Number(remote.startedAt) || 0;
-  if (rTs > 0 && sTs > 0) return rTs > sTs ? remote : saved;
+  if (rTs > 0 && sTs > 0) {
+    if (rTs > sTs) return remote;
+    if (sTs > rTs) return saved;
+    // Equal-second timestamps (GitHub ISO-8601 has 1-second resolution): fall through to ID tie-breaker.
+  }
   if (rTs > 0 && sTs === 0) return remote;
-  if (saved.runner === remote.runner && saved.nwo && saved.nwo === remote.nwo) {
+  if (saved.runner === remote.runner && (!saved.nwo || !remote.nwo || saved.nwo === remote.nwo)) {
     const sNum = Number(String(saved.id).split(':')[1]);
     const rNum = Number(String(remote.id).split(':')[1]);
-    if (Number.isFinite(sNum) && Number.isFinite(rNum) && rNum > sNum) return remote;
+    if (Number.isFinite(sNum) && Number.isFinite(rNum) && rNum !== sNum) return rNum > sNum ? remote : saved;
   }
   return saved;
 }
@@ -229,9 +270,9 @@ export async function main(argv, {
         onLine: (s) => { streamed = true; sayExact(s); },
         saveLatest: (rec) => saveLatestReview({ env, repoKey, ...rec, now: nowFn }),
       });
-      if (r.noCheck && allowNoCheckFallback) return { code: r.code, noCheck: true };
+      if (r.safeToFallback && allowNoCheckFallback) return { code: r.code, safeToFallback: true };
       if (!streamed) sayExact(r.text);
-      return { code: r.code, noCheck: false };
+      return { code: r.code, safeToFallback: false };
     };
 
     const runViaGithub = async (note = '') => {
@@ -266,7 +307,7 @@ export async function main(argv, {
           return 4;
         }
         const appRes = await runViaApp({ nwo: detected.nwo, defaultBranch: detected.defaultBranch }, { allowNoCheckFallback: hasWf });
-        if (appRes.noCheck && hasWf) return await runViaGithub();
+        if (appRes.safeToFallback && hasWf) return await runViaGithub();
         return appRes.code;
       }
       if (detected.runner === 'github') {
@@ -386,16 +427,20 @@ export async function main(argv, {
         progressTimer.unref?.();
       }
       try {
+        // Local Standard/Double runs in the foreground (engine-v2 rejects --background for non-deep tiers
+        // and does not persist status/result state on disk). Interrupting or hitting the wait cap cancels the
+        // foreground run, so we report CANCELLED / NOT COMPLETED (exit 4) instead of claiming it is still running.
         const res = await raceWithDeadline(
-          (callSignal) => fetchAndRender(bin, args, { ...base, signal: callSignal }, say, env, probe, {
-            showId: false,
-            onDoc: async (doc) => { if (doc && REVIEW_ID(doc.review_id)) await recordLatest({ id: doc.review_id, runner: 'local', tier: o.tier }, false); },
-          }),
+          (callSignal) => fetchAndRender(bin, args, { ...base, signal: callSignal }, say, env, probe, { showId: false }),
           { signal, remainingMs: waitMs, now: nowFn, t0, waitMs },
         );
         if (res.interrupted) {
-          say(`${STILL_RUNNING_LINE}\n`);
-          return 0;
+          if (res.interrupted === 'aborted') {
+            say(`## MegaLens ${o.tier} review: CANCELLED\n\nThe local review was interrupted and stopped. This is not a clean review. Run /megalens:review to start a new review.\n`);
+          } else {
+            say(`## MegaLens ${o.tier} review: NOT COMPLETED\n\nThe local review hit the wait limit and was stopped. This is not a clean review. Run /megalens:review to try again.\n`);
+          }
+          return 4;
         }
         return res.value;
       } finally {
