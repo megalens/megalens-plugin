@@ -20,6 +20,8 @@ export const MEGALENS_APP_SLUGS = ['megalens', 'megalens-review', 'megalens-app'
 export const RUN_ID_RE = /^gh:([1-9][0-9]{0,17})$/;
 export const APP_ID_RE = /^app:([1-9][0-9]{0,17})$/;
 const MAX_FINDINGS = 1 << 22;
+const UNVERIFIED_APP_GRACE_MS = 2000;
+const RECENT_APP_SUITE_MS = 120_000;
 
 export const templatePath = () => path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'templates', WORKFLOW_FILE);
 export const workflowText = () => readFileSync(templatePath(), 'utf8');
@@ -767,15 +769,31 @@ async function findAppCheckRunWithStatus({ exec, cwd, env, nwo, headSha, signal 
   if (r.code !== 0) return { ok: false, cr: null, aborted: false };
   const parsed = parsePaginatedList(r.stdout, 'check_runs');
   if (!parsed) return { ok: false, cr: null, aborted: false };
-  const runs = parsed
+  return { ok: true, cr: newestMegaLensCheck(parsed, env), aborted: false };
+}
+
+function newestMegaLensCheck(runs, env) {
+  return runs
     .filter((c) => c && Number.isInteger(c.id) && c.name === CHECK_NAME && isMegaLensAppSlug(c.app?.slug, env))
-    .sort((a, b) => (checkRunTimestamp(b) - checkRunTimestamp(a)) || (b.id - a.id));
-  return { ok: true, cr: runs[0] ?? null, aborted: false };
+    .sort((a, b) => (checkRunTimestamp(b) - checkRunTimestamp(a)) || (b.id - a.id))[0] ?? null;
 }
 
 /** Find the newest MegaLens App check run on `headSha`. */
 export async function findAppCheckRun(opts) {
   return (await findAppCheckRunWithStatus(opts)).cr;
+}
+
+async function hasRecentAppSuite({ exec, cwd, env, nwo, headSha, now, signal }) {
+  const r = await exec('gh', [
+    'api', '-X', 'GET', `repos/${nwo}/commits/${headSha}/check-suites`, '-f', 'per_page=100',
+    '--jq', '[.check_suites[]? | {app: {slug: .app.slug}, status, created_at, updated_at}]',
+  ], { cwd, env: ghEnv(env), signal });
+  const suites = r.code === 0 ? parsePaginatedList(r.stdout, 'check_suites') : null;
+  return suites?.some((suite) => {
+    if (!isMegaLensAppSlug(suite?.app?.slug, env) || !['queued', 'running'].includes(mapCheckState(suite))) return false;
+    const updatedAt = parseTs(suite.updated_at) || parseTs(suite.created_at);
+    return updatedAt > 0 && Math.abs(now() - updatedAt) < RECENT_APP_SUITE_MS;
+  }) ?? false;
 }
 
 async function viewCheckRun({ exec, cwd, env, signal = null }, checkRunId, nwo) {
@@ -916,6 +934,7 @@ export async function appReview({
   saveLatest = null,
   preRepo = null,
   allowNoCheckFallback = false,
+  unverifiedApp = false,
 }) {
   if (tier !== 'standard') return { text: `${MSG.appDeepUnsupported}\n`, code: 4 };
   if (base !== null) return { text: `${MSG.appRangeUnsupported}\n`, code: 4 };
@@ -971,17 +990,31 @@ export async function appReview({
     }
 
     const prWrapped = await bounded((callSignal) => exec('gh', [
-      'api', '-X', 'GET', `repos/${pre.nwo}/commits/${pre.headSha}/pulls`, '-f', 'per_page=100', '--paginate', '--jq', '[.[]?.number]',
+      'api', '-X', 'GET', `repos/${pre.nwo}/commits/${pre.headSha}/pulls`, '-f', 'per_page=1', '--jq', '[.[]?.number]',
     ], { cwd, env: ghEnv(env), signal: callSignal }));
     if (prWrapped.interrupted) return stopBeforeCheck(prWrapped.interrupted);
     const prRes = prWrapped.value;
     const associatedPrs = prRes.code === 0 ? parsePaginatedList(prRes.stdout) : null;
-    // Fail closed against double-billing: ONLY fall back to workflow_dispatch when we affirmatively confirmed
-    // zero MegaLens check runs on headSha, zero associated PRs, AND the commit is not on the default branch
-    // (so the App webhook cannot fire for this commit).
+    // PR and branch data establish whether a webhook was possible, regardless of which apps are installed.
     const mayBeTriggeredByApp = defaultMayContainHead || associatedPrs?.length !== 0 || !initialCheckOk;
+    let canFallback = allowNoCheckFallback && !mayBeTriggeredByApp;
+    if (allowNoCheckFallback && unverifiedApp && initialCheckOk && mayBeTriggeredByApp) {
+      const suite = await bounded((callSignal) => hasRecentAppSuite({ exec, cwd, env, nwo: pre.nwo, headSha: pre.headSha, now, signal: callSignal }));
+      if (suite.interrupted) return stopBeforeCheck(suite.interrupted);
+      // GitHub can expose a new suite before the App publishes a run. Old suites survive app removal.
+      canFallback = !suite.value;
+      if (canFallback) {
+        const rechecked = await bounded(async (callSignal) => {
+          await sleep(Math.min(appearWaitMs, UNVERIFIED_APP_GRACE_MS), callSignal);
+          return findAppCheckRunWithStatus({ exec, cwd, env, nwo: pre.nwo, headSha: pre.headSha, signal: callSignal });
+        });
+        if (rechecked.interrupted) return stopBeforeCheck(rechecked.interrupted);
+        cr = rechecked.value.cr;
+        canFallback = rechecked.value.ok;
+      }
+    }
 
-    if (mayBeTriggeredByApp) {
+    if (!cr && !canFallback && mayBeTriggeredByApp) {
       const appearCapMs = Math.min(capMs, appearWaitMs);
       let appearTimedOut = false;
       while (!cr && !signal?.aborted) {
@@ -1014,7 +1047,7 @@ export async function appReview({
       }
     }
     if (!cr) {
-      if (allowNoCheckFallback && !mayBeTriggeredByApp) {
+      if (canFallback) {
         return { text: '', code: 4, noCheck: true, safeToFallback: true };
       }
       if (pre.note) emit(pre.note);
@@ -1070,10 +1103,20 @@ export async function appReview({
   return { text: acc, code: 0, id, timedOut: w.timedOut, aborted: w.aborted };
 }
 
-/**
- * Fallback lookup when `/megalens:result` or `/megalens:status` is called with no id:
- * Compare workflow runs with App checks on HEAD, PR heads, and commits visible on the default branch.
- */
+/** Read up to two recent pages without letting gh walk the repository's entire history. */
+async function listRecentPages(run, args, { perPage, key, signal }) {
+  const rows = [];
+  for (let page = 1; page <= 2 && !signal?.aborted; page++) {
+    const response = await run('gh', [...args, '-f', `per_page=${perPage}`, '-f', `page=${page}`]);
+    const items = response.code === 0 ? parsePaginatedList(response.stdout, key) : null;
+    if (!items) break;
+    rows.push(...items.slice(0, perPage));
+    if (items.length < perPage) break;
+  }
+  return rows;
+}
+
+/** Compare recent App and workflow reviews for no-id status and result. */
 export async function findLatestRemoteReview({ exec, cwd, env, signal = null }) {
   const rv = await exec('gh', ['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef'], { cwd, env: ghEnv(env), signal });
   const repo = rv.code === 0 ? jsonOf(rv.stdout) : null;
@@ -1086,36 +1129,41 @@ export async function findLatestRemoteReview({ exec, cwd, env, signal = null }) 
   const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
   const [head, prs, commits, rows] = await Promise.all([
     run('git', ['rev-parse', '--verify', 'HEAD^{commit}']),
-    run('gh', [
+    listRecentPages(run, [
       'api', '-X', 'GET', `repos/${nwo}/pulls`,
-      '-f', 'state=all', '-f', 'sort=updated', '-f', 'direction=desc', '-f', 'per_page=100', '--paginate',
-      '--jq', '[.[]?.head?.sha // empty]',
-    ]),
-    defaultBranch ? run('gh', [
+      '-f', 'state=all', '-f', 'sort=updated', '-f', 'direction=desc',
+      '--jq', '[.[]?.head?.sha]',
+    ], { perPage: 10, signal }),
+    defaultBranch ? listRecentPages(run, [
       'api', '-X', 'GET', `repos/${nwo}/commits`,
-      '-f', `sha=${defaultBranch}`, '-f', 'per_page=100', '--paginate',
-      '--jq', '[.[]?.sha // empty]',
-    ]) : null,
+      '-f', `sha=${defaultBranch}`,
+      '--jq', '[.[]?.sha]',
+    ], { perPage: 5, signal }) : [],
     listRuns(run, nwo, 5),
   ]);
   const validSha = (value) => typeof value === 'string' && SHA_RE.test(value);
-  const parseRefs = (response, shaOf) => response?.code === 0
-    ? (parsePaginatedList(response.stdout) ?? []).map((item) => typeof item === 'string' ? item.trim() : shaOf(item)).filter(validSha)
-    : [];
+  const parseRefs = (items, shaOf) => items.map((item) => typeof item === 'string' ? item.trim() : shaOf(item)).filter(validSha);
   const prRefs = parseRefs(prs, (item) => item?.head?.sha);
   const branchRefs = parseRefs(commits, (item) => item?.sha);
   const headSha = head.stdout.trim();
   const refs = [...new Set([
     ...(head.code === 0 && validSha(headSha) ? [headSha] : []),
     ...prRefs,
-    ...(branchRefs.length ? branchRefs : defaultBranch ? [defaultBranch] : []),
+    ...(branchRefs.length ? branchRefs : defaultBranch ? [encodeURIComponent(defaultBranch)] : []),
   ])];
 
   let appCand = null;
   const BATCH = 5;
   for (let i = 0; i < refs.length && !signal?.aborted; i += BATCH) {
     const batch = refs.slice(i, i + BATCH);
-    const crs = await Promise.all(batch.map((ref) => findAppCheckRun({ exec, cwd, env, nwo, headSha: ref, signal })));
+    const crs = await Promise.all(batch.map(async (ref) => {
+      const runs = await listRecentPages(run, [
+        'api', '-X', 'GET', `repos/${nwo}/commits/${ref}/check-runs`,
+        '-f', 'filter=all', '-f', `check_name=${CHECK_NAME}`,
+        '--jq', '[.check_runs[]? | {id, name, app: {slug: .app.slug}, started_at, completed_at, created_at}]',
+      ], { perPage: 30, key: 'check_runs', signal });
+      return newestMegaLensCheck(runs, env);
+    }));
     for (const cr of crs) {
       if (!cr) continue;
       const cand = { id: `app:${cr.id}`, numId: cr.id, runner: 'app', nwo, startedAt: checkRunTimestamp(cr) };

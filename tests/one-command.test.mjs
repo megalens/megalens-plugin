@@ -1307,8 +1307,9 @@ test('LC2-SOL5: findLatestRemoteReview checks paginated PRs and default-branch c
     if (args[0] === 'repo') return ok(JSON.stringify({ nameWithOwner: 'acme/widget', defaultBranchRef: { name: 'main' } }));
     if (args[0] === 'run') return ok(JSON.stringify([{ databaseId: 23, createdAt: '2026-11-23T10:00:00Z' }]));
     if (args[0] === 'api' && args.includes('repos/acme/widget/pulls')) {
-      if (args.includes('--paginate')) sawPagination = true;
-      return ok(JSON.stringify(prHeads));
+      if (args.includes('page=2')) sawPagination = true;
+      const start = args.includes('page=2') ? 10 : 0;
+      return ok(JSON.stringify(prHeads.slice(start, start + 10)));
     }
     if (args[0] === 'api' && args.includes('repos/acme/widget/commits')) return ok(JSON.stringify([]));
     if (args[0] === 'api' && args.some((a) => a === `repos/acme/widget/commits/${targetPrSha}/check-runs`)) {
@@ -1481,12 +1482,12 @@ test('LC3-SOL5: no-id status discovers App reviews on later pages of GitHub refs
   const viewed = [];
   const exec = (cmd, args, opts) => {
     if (args.includes('repos/acme/widget/pulls')) {
-      return ok(args.includes('--paginate') ? `["${H}"]\n["${otherHead}"]` : `["${H}"]`);
+      const page = args.includes('page=2') ? [otherHead] : Array(10).fill(H);
+      return ok(JSON.stringify(page));
     }
     if (args.includes(`repos/acme/widget/commits/${otherHead}/check-runs`)) {
-      return ok(args.includes('--paginate')
-        ? `${JSON.stringify({ check_runs: [older] })}\n${JSON.stringify({ check_runs: [newer] })}`
-        : JSON.stringify({ check_runs: [older] }));
+      const page = args.includes('page=2') ? [newer] : Array(30).fill(older);
+      return ok(JSON.stringify({ check_runs: page }));
     }
     const check = args.find((a) => a.startsWith('repos/acme/widget/check-runs/'));
     if (check) {
@@ -1511,6 +1512,126 @@ test('LC3-SOL5: completing an older local review after a newer one preserves the
   assert.equal(saveLatestReview({ ...state, id: 'rv_newer001', startedAt: 2000 }), true);
   saveLatestReview({ ...state, id: 'rv_older001', startedAt: 1000 });
   assert.equal(loadLatestReview(state).id, 'rv_newer001');
+});
+
+test('LC4 NEW #1: Standard dispatches once when a workflow is configured and App installation is unverified', async (t) => {
+  for (const { label, suiteSlug, suiteAge, ...fixture } of [
+    { label: 'personal repository with an open PR', nwo: 'alice/my-app', openPrs: [12] },
+    { label: 'non-admin organization repository with a draft PR', openPrs: [13], suiteSlug: 'another-app', suiteAge: 0 },
+    {
+      label: 'selected organization installation with a closed PR and inaccessible repo list',
+      orgInstallations: [{ id: 22, app_slug: 'megalens', repository_selection: 'selected' }],
+      openPrs: [14],
+      suiteSlug: 'megalens', suiteAge: 300_000,
+    },
+    { label: 'commit on the default branch with a nonempty workflow range', branch: 'main' },
+  ]) {
+    await t.test(label, async () => {
+      const sc = makeScenario({ ...fixture, workflowPresent: true });
+      const clock = fakeClock();
+      const startedAt = clock.now();
+      const exec = (cmd, args, opts) => {
+        if (suiteSlug && args.some((a) => a.endsWith('/check-suites'))) {
+          const suite = { app: { slug: suiteSlug }, status: 'queued', created_at: new Date(startedAt - suiteAge).toISOString() };
+          return ok(JSON.stringify({ check_suites: [suite] }));
+        }
+        return sc.exec(cmd, args, opts);
+      };
+      const result = await runMain(['review'], { exec, timing: { ...clock, sleepMs: 2000 } });
+      assert.equal(result.code, 0);
+      assert.match(result.text, /MegaLens standard review: complete/);
+      assert.doesNotMatch(result.text, /No MegaLens review check|Following the GitHub App review/);
+      assert.equal(sc.calls.filter(({ args }) => args[0] === 'workflow' && args[1] === 'run').length, 1);
+      assert.ok(clock.now() - startedAt <= 2000, 'a workflow-only review should dispatch after a short check');
+    });
+  }
+});
+
+test('LC4 NEW #1: an active MegaLens suite guards a slow App enqueue when installation cannot be verified', async () => {
+  const sc = makeScenario({ workflowPresent: true, openPrs: [12] });
+  const clock = fakeClock();
+  const startedAt = clock.now();
+  const exec = (cmd, args, opts) => {
+    if (args.some((a) => a.endsWith('/check-suites'))) {
+      return ok(JSON.stringify({ check_suites: [{ app: { slug: 'megalens' }, status: 'queued', created_at: new Date(startedAt).toISOString() }] }));
+    }
+    if (args.some((a) => a.endsWith('/check-runs')) && clock.now() - startedAt >= 9000) {
+      return ok(JSON.stringify({ check_runs: [makeAppCheckRun()] }));
+    }
+    return sc.exec(cmd, args, opts);
+  };
+  const result = await runMain(['review'], { exec, timing: { ...clock, sleepMs: 2000 } });
+  assert.equal(result.code, 0);
+  assert.match(result.text, /MegaLens standard review: complete/);
+  assert.equal(sc.calls.some(({ args }) => args[0] === 'workflow'), false);
+});
+
+test('LC4 NEW #2: no-id status and result bound GitHub discovery in large repositories', async (t) => {
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'ml-latest-bound-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const base = makeScenario({
+    existingRuns: [{ databaseId: 9100, createdAt: '2026-11-23T10:01:00Z' }],
+    ghRunSequence: [{ status: 'in_progress' }],
+  });
+  saveLatestReview({ env: { MEGALENS_STATE_DIR: stateDir }, repoKey: '/repo-a', id: 'gh:9099', runner: 'github', nwo: 'acme/widget', startedAt: Date.parse('2026-11-23T10:00:00Z') });
+  const shas = (length, start) => Array.from({ length }, (_, i) => (start + i).toString(16).padStart(40, '0'));
+  const refLists = { pulls: shas(150, 1), commits: shas(600, 151) };
+  const discovery = [];
+  const viewed = [];
+  const exec = (cmd, args, opts) => {
+    const endpoint = args.find((arg) => arg.startsWith('repos/acme/widget/'));
+    const list = refLists[endpoint?.split('/').at(-1)];
+    if (list) {
+      discovery.push(args);
+      const size = Number(args.find((a) => a.startsWith('per_page=')).split('=')[1]);
+      const page = Number(args.find((a) => a.startsWith('page='))?.split('=')[1] ?? 1);
+      if (args.includes('--paginate')) {
+        return ok(Array.from({ length: Math.ceil(list.length / size) }, (_, i) => JSON.stringify(list.slice(i * size, (i + 1) * size))).join('\n'));
+      }
+      return ok(JSON.stringify(list.slice((page - 1) * size, page * size)));
+    }
+    if (endpoint?.endsWith('/check-runs')) {
+      discovery.push(args);
+      const page = Number(args.find((a) => a.startsWith('page='))?.split('=')[1] ?? 1);
+      const size = Number(args.find((a) => a.startsWith('per_page=')).split('=')[1]);
+      const oldCheck = { id: 800, name: CHECK_NAME, started_at: '2026-11-23T09:00:00Z', app: { slug: 'megalens' } };
+      return ok(JSON.stringify({ check_runs: Array.from({ length: size }, (_, i) => ({ ...oldCheck, id: oldCheck.id + (page - 1) * size + i })) }));
+    }
+    if (args[0] === 'run' && args[1] === 'view') viewed.push(args[2]);
+    return base.exec(cmd, args, opts);
+  };
+  for (const [command, code] of [['status', 0], ['result', 4]]) {
+    discovery.length = 0;
+    const r = await runMain([command], { stateDir, exec });
+    assert.equal(r.code, code);
+    assert.match(r.text, /Still running/);
+    assert.ok(discovery.length <= 66, `bounded discovery made ${discovery.length} GitHub API calls`);
+    assert.equal(discovery.some((args) => args.includes('--paginate')), false);
+  }
+  assert.deepEqual(viewed, ['9100', '9100']);
+});
+
+test('LC4 NEW #2: a slow GitHub discovery is cancelled and a saved review remains usable', async (t) => {
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'ml-latest-timeout-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+  const sc = makeScenario();
+  saveLatestReview({ env: { MEGALENS_STATE_DIR: stateDir }, repoKey: '/repo-a', id: 'gh:9099', runner: 'github' });
+  let lookupSignal;
+  const exec = async (cmd, args, opts) => {
+    if (args.includes('repos/acme/widget/pulls')) {
+      lookupSignal = opts.signal;
+      return ok(await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve('[]'), 100);
+        lookupSignal.addEventListener('abort', () => { clearTimeout(timer); resolve('[]'); }, { once: true });
+      }));
+    }
+    return sc.exec(cmd, args, opts);
+  };
+  const result = await runMain(['status'], { stateDir, exec, timing: { latestLookupMs: 25 } });
+  assert.equal(result.code, 0);
+  assert.equal(lookupSignal?.aborted, true);
+  assert.match(result.text, /Showing the saved review\.\nFinished/);
+  assert.ok(sc.calls.some(({ args }) => args[0] === 'run' && args[1] === 'view' && args[2] === '9099'));
 });
 
 test('LC3-LC1-NEW3: a Local Standard review can be retrieved by a new command after the wait limit', async (t) => {

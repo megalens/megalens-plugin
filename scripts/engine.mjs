@@ -23,6 +23,7 @@ import { DEFAULT_POLL_MS, DEFAULT_PROGRESS_MS, DEFAULT_WAIT_MS, STILL_RUNNING_LI
 
 const MAX_OUT = 1 << 22; // bytes we keep from the engine's output streams
 const MAX_FIRST_REVIEW = 1 << 20;
+const LATEST_LOOKUP_MS = 10_000;
 const FIRST_REVIEW_NAME = 'first-review.json';
 const STATES = ['running', 'complete', 'partial', 'failed', 'cancelled'];
 const flat = (v, n) => String(v ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]+/g, ' ').trim().slice(0, n);
@@ -274,12 +275,13 @@ export async function main(argv, {
         const saved = loadLatestReview({ env, repoKey }) || loadLatestReview({ env, repoKey: await repoKeyPromise(true) });
         const remote = await raceWithDeadline(
           (callSignal) => findLatestRemoteReview({ exec, cwd, env, signal: callSignal }),
-          { signal, remainingMs: DEFAULT_WAIT_MS },
+          { signal, remainingMs: timing.latestLookupMs ?? LATEST_LOOKUP_MS },
         );
-        if (remote.interrupted) {
+        if (remote.interrupted === 'aborted' || (remote.interrupted && !saved)) {
           say('The latest review lookup did not finish. Try the command again or supply the review id.\n');
           return 4;
         }
+        if (remote.interrupted === 'timeout') say('GitHub lookup timed out. Showing the saved review.\n');
         const latest = pickNewerReview(saved, remote.value);
         if (!latest) {
           say('No recent MegaLens review found for this repository. Run /megalens:review to start one.\n');
@@ -340,12 +342,12 @@ export async function main(argv, {
       return r.value;
     };
 
-    const runViaApp = async (preRepo = null, { allowNoCheckFallback = false } = {}) => {
+    const runViaApp = async (preRepo = null, { allowNoCheckFallback = false, unverifiedApp = false } = {}) => {
       const repoKey = await prepare((callSignal) => repoKeyPromise(true, callSignal));
       let streamed = false;
       const r = await appReview({
         exec, cwd, env, tier: o.tier, base: o.base, head: o.head, wait: o.wait,
-        ...timing, t0, signal, preRepo, allowNoCheckFallback,
+        ...timing, t0, signal, preRepo, allowNoCheckFallback, unverifiedApp,
         onLine: (s) => { streamed = true; sayExact(s); },
         saveLatest: (rec) => saveLatestReview({ env, repoKey, ...rec, now: nowFn }),
       });
@@ -385,7 +387,10 @@ export async function main(argv, {
           sayExact(`${MSG.appRangeUnsupported}\n`);
           return 4;
         }
-        const appRes = await runViaApp({ nwo: detected.nwo, defaultBranch: detected.defaultBranch }, { allowNoCheckFallback: hasWf });
+        const appRes = await runViaApp({ nwo: detected.nwo, defaultBranch: detected.defaultBranch }, {
+          allowNoCheckFallback: hasWf,
+          unverifiedApp: detected.guardApp,
+        });
         if (appRes.safeToFallback && hasWf) return await runViaGithub();
         return appRes.code;
       }
