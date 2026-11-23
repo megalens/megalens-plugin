@@ -107,6 +107,7 @@ export async function waitForReview({
   progressMs = DEFAULT_PROGRESS_MS,
   now = () => Date.now(),
   t0 = null,
+  initialSleptMs = 0,
   sleep = defaultSleep,
   signal = null,
 }) {
@@ -115,9 +116,11 @@ export async function waitForReview({
   let last = null;
   let lastState = null;
   let lastBucket = 0;
+  let sleptMs = Math.max(0, Number(initialSleptMs) || 0);
+  const elapsedNow = () => Math.max(0, now() - start, sleptMs);
 
   while (!signal?.aborted) {
-    const remainingBeforePoll = waitMs - Math.max(0, now() - start);
+    const remainingBeforePoll = waitMs - elapsedNow();
     if (remainingBeforePoll <= 0) break;
 
     const polled = await raceWithDeadline((callSignal) => poll(callSignal), {
@@ -139,7 +142,7 @@ export async function waitForReview({
       else if (st === 'running' && runningLine) onLine(`${runningLine}\n`);
       lastState = st;
     }
-    const elapsed = Math.max(0, now() - start);
+    const elapsed = elapsedNow();
     if (progressMs > 0) {
       const bucket = Math.floor(elapsed / progressMs);
       if (bucket > lastBucket) {
@@ -152,10 +155,12 @@ export async function waitForReview({
     const delayMs = (st === 'retry' && Number.isFinite(last?.retryAfterMs) && last.retryAfterMs > 0)
       ? last.retryAfterMs
       : pollMs;
-    const slept = await raceWithDeadline((callSignal) => sleep(Math.min(delayMs, remaining), callSignal), {
+    const actualDelay = Math.min(delayMs, remaining);
+    const slept = await raceWithDeadline((callSignal) => sleep(actualDelay, callSignal), {
       signal, remainingMs: remaining, now, t0: start, waitMs,
     });
     if (slept.interrupted) break;
+    sleptMs += actualDelay;
   }
 
   onLine(`${stillRunningLine}\n`);

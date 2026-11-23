@@ -148,3 +148,41 @@ Addressed all nine findings from `FIRST.md` (8 fixed in plugin code + tests in `
 ### Verification
 
 - Ran `npm test && git diff --check`: **197 / 197 tests passed** (0 failed, 0 skipped), zero whitespace/patch errors.
+
+
+## Fix round (LOOP-CONFIRM1)
+
+Addressed every open/new finding from `/root/review-input/rv-plugin-app-path/LOOP-CONFIRM1.md` (5 fixed in plugin code + tests in `/root/review-input/ws-plugin-app-path`; #4 confirmed as an external server-side launch gate outside this plugin workspace with `file:line` evidence):
+
+1. **NEW High — `/megalens:review` could report a clean result for the wrong PR — Fixed.**
+   - `resolveMatchingAppBookmark` in [scripts/lib/gh-runner.mjs](scripts/lib/gh-runner.mjs) now discovers the repository (`ghRepoPreflight` / `gitRepoFallback`), validates `repo.isGithubCom` and `saved.nwo === repo.nwo`, and resolves the current open PR via `detectOpenPr` (`gh pr view`) **before** ever reading or reusing a saved App bookmark. When `(saved.prNumber ?? null) !== (currentPrNumber ?? null)` (e.g. switching from PR #41 to PR #42 at the exact same commit SHA, or switching between a PR and a non-PR ref), bookmark reuse is skipped and the requested target is reviewed. Both `resolveMatchingAppBookmark` and `appReview` Layer 1 dedupe also verify `jobMatchesTargetPr(job, nwo, prNumber)` against `job.pr_url`.
+   - Test: `tests/app-path.test.mjs` (`LOOP-CONFIRM1 NEW High + #7 + #9 + #2`) switches from PR #41 (clean) to PR #42 (finding) at the same SHA and verifies `gh pr view` runs, `{ repo, tier, pr: 42 }` is submitted, and PR #42's finding is returned.
+
+2. **Finding #7 (Medium — Reopened by LOOPFIX1: Enterprise checkout reused saved `github.com` job before host discovery) — Fixed.**
+   - `resolveMatchingAppBookmark` in [scripts/lib/gh-runner.mjs](scripts/lib/gh-runner.mjs) runs `ghRepoPreflight` (and `gitRepoFallback` when `gh` is unavailable) **before** touching any saved `github.com` App job. If `!repo.isGithubCom` (e.g. host switched to `github.enterprise.example` or `GH_HOST` is non-`github.com`), it immediately returns `{ action: 'continue', preRepo }` with zero App API calls, and [scripts/engine.mjs](scripts/engine.mjs) passes `preRepo` into `detectRemoteRunner`.
+   - Test: `tests/app-path.test.mjs` (`LOOP-CONFIRM1 NEW High + #7 + #9 + #2`) moves the same checkout to `github.enterprise.example` after a `github.com` App review and asserts `gh repo view` runs, zero requests reach `https://megalens.ai`, and the Enterprise message is printed.
+
+3. **Finding #2 (High — Moved PR with `--no-wait` rendered wrong-head findings on no-ID `/megalens:result` / `/megalens:status`) — Fixed.**
+   - Added `requestedHeadSha` routing metadata in [scripts/lib/latest-review.mjs](scripts/lib/latest-review.mjs) and `checkBookmarkHeadDrift` in [scripts/lib/gh-runner.mjs](scripts/lib/gh-runner.mjs), wired into no-ID `appResult` and `appStatus` from [scripts/engine.mjs](scripts/engine.mjs). When the server reviewed a moved head (`job.head_sha !== saved.headSha` or previously drifted `saved.requestedHeadSha`) and the local checkout (`HEAD`) is not at `job.head_sha`, no-ID `/megalens:result` and `/megalens:status` update the bookmark to record the actual `headSha` (retaining `requestedHeadSha`), refuse to render wrong-head findings, and exit 4 with the head-mismatch message. Once the user runs `git pull` so local `HEAD === job.head_sha`, no-ID `/megalens:result` clears `requestedHeadSha` and renders the findings cleanly (exit 0).
+   - Also updated `resolveMatchingAppBookmark` and `appReview` Layer 1 dedupe so re-running `/megalens:review` after `--no-wait` on a moved PR stops immediately with head mismatch (exit 4) instead of falling through to submit a second `POST`.
+   - Test: `tests/app-path.test.mjs` (`LOOP-CONFIRM1 NEW High + #7 + #9 + #2`) covers `review --no-wait` on a moved PR followed by direct no-ID `result`, repeated `result`/`status` before `git pull`, `review` rerun (zero second `POST`), and `result` after `git pull`.
+
+4. **Finding #5 (Medium — Relative `CLAUDE_CONFIG_DIR` resolved differently from `@megalens/mcp` browser setup) — Fixed.**
+   - Updated `resolveClaudeMcpConfigPath` in [scripts/lib/gh-runner.mjs](scripts/lib/gh-runner.mjs) to resolve any non-placeholder `CLAUDE_CONFIG_DIR` via `path.join(path.resolve(custom), '.claude.json')`, matching `/root/review-input/ws-ondemand-merge/packages/mcp/bin/host-setup.mjs:62-65` identically while still enforcing `https://megalens.ai` origin pinning on both the MCP entry URL and all App API calls.
+   - Test: `tests/app-path.test.mjs` (`Finding 5: ...`) verifies `resolveClaudeMcpConfigPath({ HOME, CLAUDE_CONFIG_DIR: './claude-profile' })` equals `path.join(path.resolve('./claude-profile'), '.claude.json')` and runs an end-to-end App review using a relative `CLAUDE_CONFIG_DIR` with an empty shell `MEGALENS_TOKEN`.
+
+5. **Finding #9 (Medium — First read of a saved job with `Retry-After: 60` / transient error exited 4 without waiting) — Fixed.**
+   - Added `fetchAppJobWithRetry` in [scripts/lib/gh-runner.mjs](scripts/lib/gh-runner.mjs) and wired it into both `resolveMatchingAppBookmark` and `appReview` Layer 1 dedupe, passing `wait`, `waitMs`, `pollMs`, `now`, `t0`, and `sleep` from [scripts/engine.mjs](scripts/engine.mjs). Retryable reads (`429 rate_limited` with `Retry-After: 60`, `5xx`, network errors) now sleep and retry across the full `waitMs` budget (carrying `initialSleptMs` into `waitForReview` in [scripts/lib/wait-loop.mjs](scripts/lib/wait-loop.mjs), which also tracks accumulated `sleptMs` so fixtures that mock `sleep` without mocking `now` cap cleanly at `waitMs`), never falling back to Actions or exposing internal IDs.
+   - Test: `tests/app-path.test.mjs` (`Finding 3c` and `LOOP-CONFIRM1 NEW High + #7 + #9 + #2`) verifies both recovery after `429 Retry-After: 60` (sleeping 60s with zero second `POST`) and full-budget waiting on persistent `429`/`503` (including mock-`sleep`-only fixtures).
+
+6. **Finding #4 (High — Server early settlement when `ONE_PATH_V1` is off) — Blocked outside this plugin workspace (server-side launch gate).**
+   - This workspace (`/root/review-input/ws-plugin-app-path`) contains only the Claude Code plugin; wallet hold/finalization and worker publish settlement live exclusively in the separate MegaLens server repository (`/root/review-input/ws-ondemand-merge`), which cannot be modified from this plugin-only workspace:
+     - `/root/review-input/ws-ondemand-merge/src/lib/github-setup/on-demand.ts:169-203` (`editorReviewNow` admits on-demand editor jobs under `GITHUB_APP_V1=on` without requiring `ONE_PATH_V1`).
+     - `/root/review-input/ws-ondemand-merge/supabase/migrations/20261123230000_github_app_on_demand.sql:137-142` (`shared` reuse attaches editor requests to in-flight jobs).
+     - `/root/review-input/ws-ondemand-merge/src/lib/github-setup/worker-api.ts:374,408,435` (`prepare` sets `defer_complete` solely from `isOnePathEnabled()`).
+     - `/root/review-input/ws-ondemand-merge/src/lib/github-setup/worker-api.ts:599-614,714-738` (when `!deferSettlement`, `resultHandler` calls `closeReview(job.reviewId, 'complete')` before GitHub publish and editor-result retention, so a permanent publish error marks the job `failed`/`publish_failed` with no editor findings after `/root/review-input/ws-ondemand-merge/src/lib/engine-v2/service.ts:338-347` has finalized the charge/free review).
+   - Remains documented as a mandatory server release gate in [PLUGIN-NEEDS.md](PLUGIN-NEEDS.md) (item 14), with client-side `publish_failed` failure handling tested in `tests/app-path.test.mjs`.
+
+### Verification
+
+- Ran `npm test && git diff --check`: **198 / 198 tests passed** (0 failed, 0 skipped), zero whitespace/patch errors.

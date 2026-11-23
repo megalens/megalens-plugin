@@ -81,6 +81,7 @@ export function saveLatestReview({
   nwo = null,
   tier = 'standard',
   headSha = null,
+  requestedHeadSha = null,
   prNumber = null,
   startedAt = null,
   now = () => Date.now(),
@@ -109,6 +110,8 @@ export function saveLatestReview({
     };
     const sha = cleanSha(headSha);
     if (sha) rec.headSha = sha;
+    const reqSha = cleanSha(requestedHeadSha);
+    if (reqSha && reqSha !== sha) rec.requestedHeadSha = reqSha;
     const pr = cleanPr(prNumber);
     if (pr !== null) rec.prNumber = pr;
     map[String(repoKey)] = rec;
@@ -138,6 +141,7 @@ export function loadLatestReview({ env = process.env, repoKey, nwo = null }) {
       nwo: typeof rec.nwo === 'string' && NWO_RE.test(rec.nwo) ? rec.nwo : null,
       tier: rec.tier ?? 'standard',
       headSha: cleanSha(rec.headSha),
+      requestedHeadSha: cleanSha(rec.requestedHeadSha),
       prNumber: cleanPr(rec.prNumber),
       startedAt: Number(rec.startedAt) || 0,
     };

@@ -273,9 +273,15 @@ export async function main(argv, {
       if (rest.length > 1) throw new UsageError('give at most one review id (or none to use the latest review for this repo)');
       const explicitId = rest.length === 1;
       let targetId = rest[0];
+      let savedAppBookmark = null;
+      let resolvedRepoKey = null;
       if (!explicitId) {
-        const repoKey = await repoKeyPromise(false);
-        let saved = loadLatestReview({ env, repoKey }) || loadLatestReview({ env, repoKey: await repoKeyPromise(true) });
+        resolvedRepoKey = await repoKeyPromise(false);
+        let saved = loadLatestReview({ env, repoKey: resolvedRepoKey });
+        if (!saved) {
+          resolvedRepoKey = await repoKeyPromise(true);
+          saved = loadLatestReview({ env, repoKey: resolvedRepoKey });
+        }
         if (!APP_PATH_ENABLED && isAppId(saved?.id)) saved = null;
         const remote = await raceWithDeadline(
           (callSignal) => findLatestRemoteReview({ exec, cwd, env, signal: callSignal }),
@@ -292,11 +298,18 @@ export async function main(argv, {
           return 4;
         }
         targetId = latest.id;
+        if (latest === saved && saved?.runner === 'app') savedAppBookmark = saved;
       }
       if (/^app:/.test(targetId)) {
         if (!isAppId(targetId)) throw new UsageError('that is not a MegaLens App review id (they look like app:00000000-0000-4000-8000-000000000001)');
         if (!APP_PATH_ENABLED) { sayExact(`${MSG.appDisabled}\n`); return 4; }
-        const r = await (cmd === 'status' ? appStatus : appResult)({ exec, fetch: fetchImpl, cwd, env, signal }, targetId, { showId: explicitId });
+        const r = await (cmd === 'status' ? appStatus : appResult)({ exec, fetch: fetchImpl, cwd, env, signal }, targetId, {
+          showId: explicitId,
+          savedBookmark: savedAppBookmark,
+          saveLatest: savedAppBookmark && resolvedRepoKey
+            ? (rec) => saveLatestReview({ env, repoKey: resolvedRepoKey, ...rec, now: nowFn })
+            : null,
+        });
         sayExact(r.text); return r.code;
       }
       if (/^gh:/.test(targetId)) {
@@ -381,6 +394,7 @@ export async function main(argv, {
     if (runnerFlag === 'github') return await runViaGithub();
     if (runnerFlag === null) {
       let knownRepoKey = null;
+      let checkedPreRepo = null;
       if (APP_PATH_ENABLED && o.base === null && extractAppToken(env)) {
         knownRepoKey = await prepare((callSignal) => repoKeyPromise(true, callSignal));
         const saved = loadLatestReview({ env, repoKey: knownRepoKey });
@@ -394,12 +408,18 @@ export async function main(argv, {
               saved,
               tier: o.tier,
               head: o.head,
+              wait: o.wait,
+              waitMs: capMs,
+              pollMs: timing.pollMs,
+              now: nowFn,
+              t0,
+              sleep: sleepFn,
               signal: callSignal,
               saveLatest: (rec) => saveLatestReview({ env, repoKey: knownRepoKey, ...rec, now: nowFn }),
             }),
             { signal, remainingMs: remaining(), now: nowFn, t0, waitMs: capMs },
           );
-          if (check.interrupted || check.value?.action === 'aborted') {
+          if (check.interrupted || check.value?.action === 'aborted' || check.value?.action === 'timed_out') {
             sayExact(`${STILL_RUNNING_LINE}\n`);
             return 0;
           }
@@ -414,9 +434,18 @@ export async function main(argv, {
           if (check.value?.action === 'resume') {
             return await runViaApp(null, { repoKey: knownRepoKey, resumeAttempt: check.value.resumeAttempt });
           }
+          if (check.value?.preRepo) checkedPreRepo = check.value.preRepo;
         }
       }
-      const detected = await prepare((callSignal) => detectRemoteRunner({ exec, fetch: fetchImpl, cwd, env, signal: callSignal, needWorkflow: o.base !== null }));
+      const detected = await prepare((callSignal) => detectRemoteRunner({
+        exec,
+        fetch: fetchImpl,
+        cwd,
+        env,
+        signal: callSignal,
+        needWorkflow: o.base !== null,
+        preRepo: checkedPreRepo,
+      }));
       if (detected.runner === 'none') {
         sayExact(`${detected.message}\n`);
         return 4;

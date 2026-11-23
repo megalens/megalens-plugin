@@ -180,7 +180,7 @@ const CLAUDE_BEARER_TOKEN_RE = /^Bearer\s+(ml_tok_[0-9a-f]{16,128})$/i;
  */
 export function resolveClaudeMcpConfigPath(env = {}) {
   const custom = typeof env?.CLAUDE_CONFIG_DIR === 'string' ? env.CLAUDE_CONFIG_DIR.trim() : '';
-  if (custom && !custom.startsWith('${') && path.isAbsolute(custom)) return path.join(path.resolve(custom), '.claude.json');
+  if (custom && !custom.startsWith('${')) return path.join(path.resolve(custom), '.claude.json');
   const home = (typeof env?.HOME === 'string' && env.HOME.trim())
     || (typeof env?.USERPROFILE === 'string' && env.USERPROFILE.trim())
     || (env === process.env ? homedir() : '');
@@ -530,14 +530,16 @@ export async function checkAppStatus({ env, nwo, fetch = globalThis.fetch, signa
  *   2. Else the user's GitHub Actions runner when `.github/workflows/megalens-dispatch.yml` is present;
  *   3. Else `none` with one clear setup line.
  */
-export async function detectRemoteRunner({ exec, cwd, env, fetch = globalThis.fetch, signal = null, needWorkflow = false }) {
-  let repo = null;
+export async function detectRemoteRunner({ exec, cwd, env, fetch = globalThis.fetch, signal = null, needWorkflow = false, preRepo = null }) {
+  let repo = preRepo ?? null;
   let ghErr = null;
-  try {
-    repo = await ghRepoPreflight({ exec, cwd, env, signal });
-  } catch (e) {
-    if (e instanceof SetupError) ghErr = e;
-    else throw e;
+  if (!repo) {
+    try {
+      repo = await ghRepoPreflight({ exec, cwd, env, signal });
+    } catch (e) {
+      if (e instanceof SetupError) ghErr = e;
+      else throw e;
+    }
   }
 
   // If `gh` is unavailable or not logged in, still let App-only setups work using the git origin remote.
@@ -1237,12 +1239,85 @@ async function fetchAppJob({ env, fetch = globalThis.fetch, signal = null }, job
   };
 }
 
-export async function appStatus(ctx, rawId, { showId = true } = {}) {
+async function currentLocalHeadSha({ exec = realExec, cwd, env, signal = null }) {
+  if (!exec || !cwd) return null;
+  try {
+    const hs = await exec('git', ['rev-parse', '--verify', 'HEAD^{commit}'], { cwd, env: ghEnv(env ?? {}), signal });
+    const sha = hs.code === 0 ? hs.stdout.trim().toLowerCase() : '';
+    return SHA_RE.test(sha) ? sha : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseJobPrUrl(url) {
+  if (typeof url !== 'string' || !url.trim()) return null;
+  const m = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/([1-9][0-9]*)$/i.exec(url.trim());
+  return m ? { nwo: m[1].toLowerCase(), prNumber: Number(m[2]) } : { invalid: true };
+}
+
+function jobMatchesTargetPr(job, nwo, prNumber) {
+  const parsed = parseJobPrUrl(job?.pr_url);
+  if (prNumber !== null) {
+    if (!parsed) return true;
+    return !parsed.invalid && parsed.nwo === nwo.toLowerCase() && parsed.prNumber === prNumber;
+  }
+  return parsed === null;
+}
+
+async function checkBookmarkHeadDrift(ctx, job, rawId, savedBookmark, saveLatest) {
+  if (!savedBookmark) return null;
+  const actualSha = normalizedJobHeadSha(job);
+  if (!actualSha) return null;
+  const driftedOnServer = Boolean(savedBookmark.headSha && actualSha !== savedBookmark.headSha);
+  const previouslyDrifted = Boolean(savedBookmark.requestedHeadSha && actualSha !== savedBookmark.requestedHeadSha);
+  if (!driftedOnServer && !previouslyDrifted) return null;
+  const expectedSha = savedBookmark.requestedHeadSha || savedBookmark.headSha;
+  const localHead = await currentLocalHeadSha(ctx);
+  if (localHead && localHead === actualSha) {
+    saveLatest?.({
+      id: rawId,
+      runner: 'app',
+      nwo: savedBookmark.nwo,
+      tier: job?.tier || savedBookmark.tier,
+      headSha: actualSha,
+      prNumber: savedBookmark.prNumber,
+    });
+    return null;
+  }
+  saveLatest?.({
+    id: rawId,
+    runner: 'app',
+    nwo: savedBookmark.nwo,
+    tier: job?.tier || savedBookmark.tier,
+    headSha: actualSha,
+    requestedHeadSha: expectedSha,
+    prNumber: savedBookmark.prNumber,
+  });
+  return {
+    text: describeHeadMismatch({
+      tier: job?.tier || savedBookmark.tier,
+      expectedSha: localHead || expectedSha,
+      actualSha,
+      nwo: savedBookmark.nwo,
+      prNumber: savedBookmark.prNumber,
+    }),
+    code: 4,
+    state: 'error',
+    headMismatch: true,
+  };
+}
+
+export async function appStatus(ctx, rawId, { showId = true, savedBookmark = null, saveLatest = null } = {}) {
   const id = appJobIdOf(rawId);
   if (ctx.signal?.aborted) return { text: '', code: 4, state: 'aborted' };
   const v = await fetchAppJob(ctx, id, { showId });
   if (v.aborted) return { text: '', code: 4, state: 'aborted' };
   if (v.error) return { text: v.error, code: 4, state: 'error', retryable: v.retryable, retryAfterSec: v.retryAfterSec, notFound: v.notFound };
+  if (!showId && savedBookmark) {
+    const mismatch = await checkBookmarkHeadDrift(ctx, v.job, `app:${id}`, savedBookmark, saveLatest);
+    if (mismatch) return mismatch;
+  }
   const state = mapAppJobState(v.job);
   const prUrl = validGithubUrl(v.job.pr_url, 'pull') ? scrubExact(v.job.pr_url, ctx.env) : '';
   const checkUrl = validGithubUrl(v.job.check_url, 'runs') ? scrubExact(v.job.check_url, ctx.env) : '';
@@ -1278,12 +1353,16 @@ export async function appStatus(ctx, rawId, { showId = true } = {}) {
   return { text: `${prefix}${words}${extraLinks}\n`, code: 0, state, job: v.job };
 }
 
-export async function appResult(ctx, rawId, { showId = true } = {}) {
+export async function appResult(ctx, rawId, { showId = true, savedBookmark = null, saveLatest = null } = {}) {
   const id = appJobIdOf(rawId);
   if (ctx.signal?.aborted) return { text: '', code: 4, aborted: true };
   const v = await fetchAppJob(ctx, id, { showId });
   if (v.aborted) return { text: '', code: 4, aborted: true };
   if (v.error) return { text: v.error, code: 4 };
+  if (!showId && savedBookmark) {
+    const mismatch = await checkBookmarkHeadDrift(ctx, v.job, `app:${id}`, savedBookmark, saveLatest);
+    if (mismatch) return { text: mismatch.text, code: 4 };
+  }
   return renderAppJob(v.job, `app:${id}`, { env: ctx.env, showId });
 }
 
@@ -1518,8 +1597,64 @@ function describeHeadMismatch({ tier, expectedSha, actualSha, nwo, prNumber }) {
 }
 
 /**
- * Resolve a saved App bookmark matching this repo, commit, and tier BEFORE runner selection
- * so a transient `/api/github-app/status` outage can never fall through and start a second review on Actions.
+ * Read a saved App job, honouring Retry-After and exponential backoff on retryable errors (429/5xx/network)
+ * across the active wait budget so a transient rate limit or gateway blip on the first read never exits 4 early.
+ */
+async function fetchAppJobWithRetry({
+  env,
+  fetch = globalThis.fetch,
+  jobId,
+  showId = false,
+  wait = true,
+  waitMs = DEFAULT_WAIT_MS,
+  pollMs = DEFAULT_POLL_MS,
+  now = () => Date.now(),
+  t0 = now(),
+  sleep = defaultSleep,
+  signal = null,
+}) {
+  const capMs = wait ? waitMs : Infinity;
+  let transientErrors = 0;
+  let sleptMs = 0;
+  const elapsed = () => Math.max(0, now() - t0, sleptMs);
+  const remaining = () => (Number.isFinite(capMs) ? Math.max(0, capMs - elapsed()) : Infinity);
+
+  for (;;) {
+    if (signal?.aborted) return { interrupted: 'aborted', sleptMs };
+    const remBefore = remaining();
+    if (remBefore <= 0) return { interrupted: 'timeout', sleptMs };
+
+    const res = await raceWithDeadline(
+      (callSignal) => fetchAppJob({ env, fetch, signal: callSignal }, jobId, { showId }),
+      { signal, remainingMs: remBefore, now, t0, waitMs: capMs },
+    );
+    if (res.interrupted) return { interrupted: res.interrupted, sleptMs };
+    const v = res.value;
+    if (v?.aborted) return { interrupted: 'aborted', sleptMs };
+    if (!v?.error || !v.retryable || !wait) return { interrupted: null, value: v, sleptMs };
+
+    transientErrors += 1;
+    const delayMs = (Number.isFinite(v.retryAfterSec) && v.retryAfterSec > 0)
+      ? v.retryAfterSec * 1000
+      : Math.min(pollMs * (2 ** Math.min(transientErrors - 1, 3)), Math.max(pollMs, 60_000));
+    const remAfter = remaining();
+    if (remAfter <= 0 || signal?.aborted) {
+      return { interrupted: signal?.aborted ? 'aborted' : 'timeout', sleptMs };
+    }
+    const actualDelay = Math.min(delayMs, remAfter);
+    const slept = await raceWithDeadline((callSignal) => sleep(actualDelay, callSignal), {
+      signal, remainingMs: remAfter, now, t0, waitMs: capMs,
+    });
+    if (slept.interrupted) return { interrupted: slept.interrupted, sleptMs };
+    sleptMs += actualDelay;
+  }
+}
+
+/**
+ * Resolve a saved App bookmark matching this exact github.com repo, commit, open PR (or ref), and tier
+ * BEFORE calling `/api/github-app/status` or checking Actions so a transient `/status` outage never falls
+ * through to dispatch Actions, while Enterprise checkouts or switched PRs at the same SHA never reuse a
+ * mismatched saved job.
  */
 export async function resolveMatchingAppBookmark({
   exec = realExec,
@@ -1529,20 +1664,53 @@ export async function resolveMatchingAppBookmark({
   saved,
   tier = 'standard',
   head = null,
+  wait = true,
+  waitMs = DEFAULT_WAIT_MS,
+  pollMs = DEFAULT_POLL_MS,
+  now = () => Date.now(),
+  t0 = now(),
+  sleep = defaultSleep,
   signal = null,
   saveLatest = null,
 }) {
-  if (!APP_PATH_ENABLED || !saved || saved.runner !== 'app' || !isAppId(saved.id) || saved.tier !== tier || !saved.headSha) {
+  if (!APP_PATH_ENABLED || !saved || saved.runner !== 'app' || !isAppId(saved.id) || saved.tier !== tier || !saved.headSha || !saved.nwo) {
     return { action: 'continue' };
   }
   if (!extractAppToken(env)) return { action: 'continue' };
+
+  // Verify repository host and owner/name BEFORE ever touching a saved github.com App job.
+  let repo = null;
+  try {
+    repo = await ghRepoPreflight({ exec, cwd, env, signal });
+  } catch (e) {
+    if (e instanceof SetupError) {
+      repo = await gitRepoFallback({ exec, cwd, env, signal });
+    } else {
+      throw e;
+    }
+  }
+  const reusablePreRepo = repo?.hasGh ? repo : null;
+  if (!repo || !repo.isGithubCom) {
+    return { action: 'continue', preRepo: reusablePreRepo };
+  }
+  if (saved.nwo.toLowerCase() !== repo.nwo.toLowerCase()) {
+    return { action: 'continue', preRepo: reusablePreRepo };
+  }
+
   const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
   const headRef = head ?? 'HEAD';
   const hs = await run('git', ['rev-parse', '--verify', `${headRef}^{commit}`]);
   const headSha = hs.stdout.trim().toLowerCase();
   if (hs.code !== 0 || !SHA_RE.test(headSha) || headSha !== saved.headSha) {
-    return { action: 'continue' };
+    return { action: 'continue', preRepo: reusablePreRepo };
   }
+
+  // Resolve the current open PR before reusing a bookmark: two PRs at the same SHA can target different bases.
+  const currentPrNumber = repo.hasGh ? await detectOpenPr({ run, nwo: repo.nwo, headSha }) : null;
+  if ((saved.prNumber ?? null) !== (currentPrNumber ?? null)) {
+    return { action: 'continue', preRepo: reusablePreRepo };
+  }
+
   let dirty;
   try {
     dirty = await worktreeDirty(run);
@@ -1554,36 +1722,66 @@ export async function resolveMatchingAppBookmark({
     return { action: 'stop', code: 4, text: `${MSG.dirtyStop}\n` };
   }
   const note = dirty ? `${MSG.uncommitted}\n` : '';
-  const v = await fetchAppJob({ env, fetch, signal }, appJobIdOf(saved.id), { showId: false });
-  if (v.aborted) return { action: 'aborted' };
+
+  const read = await fetchAppJobWithRetry({
+    env,
+    fetch,
+    jobId: appJobIdOf(saved.id),
+    showId: false,
+    wait,
+    waitMs,
+    pollMs: pollMs ?? DEFAULT_POLL_MS,
+    now,
+    t0,
+    sleep,
+    signal,
+  });
+  if (read.interrupted === 'aborted') return { action: 'aborted' };
+  if (read.interrupted === 'timeout') return { action: 'timed_out' };
+  const v = read.value;
   if (v.error) {
-    if (v.notFound) return { action: 'continue' };
-    // Non-404 error (503/502/429/network/401) while a matching App job exists: stop instead of dispatching Actions.
+    if (v.notFound) return { action: 'continue', preRepo: reusablePreRepo };
+    // Non-404 error (401 or retryable error with --no-wait) while a matching App job exists: stop instead of dispatching Actions.
     return { action: 'stop', code: 4, text: v.error };
   }
   const job = v.job;
+  if (!jobMatchesTargetPr(job, repo.nwo, currentPrNumber)) {
+    return { action: 'continue', preRepo: reusablePreRepo };
+  }
   const actualSha = normalizedJobHeadSha(job);
   if (actualSha && actualSha !== headSha) {
-    saveLatest?.({ id: saved.id, runner: 'app', nwo: saved.nwo, tier, headSha: actualSha, prNumber: saved.prNumber });
-    return { action: 'continue' };
+    saveLatest?.({
+      id: saved.id,
+      runner: 'app',
+      nwo: repo.nwo,
+      tier,
+      headSha: actualSha,
+      requestedHeadSha: headSha,
+      prNumber: currentPrNumber,
+    });
+    return {
+      action: 'stop',
+      code: 4,
+      text: `${note}${describeHeadMismatch({ tier, expectedSha: headSha, actualSha, nwo: repo.nwo, prNumber: currentPrNumber })}`,
+    };
   }
   const st = String(job.status ?? '');
   if (st === 'queued' || st === 'running') {
     return {
       action: 'resume',
-      resumeAttempt: { id: saved.id, job, headSha, nwo: saved.nwo, prNumber: saved.prNumber, note },
+      resumeAttempt: { id: saved.id, job, headSha, nwo: repo.nwo, prNumber: currentPrNumber, note, initialSleptMs: read.sleptMs },
     };
   }
   if (st === 'done' && job.findings && ['complete', 'partial', 'too_large'].includes(String(job.result_status ?? ''))) {
     const rendered = renderAppJob(job, saved.id, { env, showId: false });
     return { action: 'rendered', code: rendered.code, text: `${note}${rendered.text}`, id: saved.id };
   }
-  return { action: 'continue' };
+  return { action: 'continue', preRepo: reusablePreRepo };
 }
 
 /**
  * /megalens:review through the MegaLens GitHub App on-demand API:
- * Preflights repo/token/commit, reuses an existing in-flight or retained job for the same commit & tier when present,
+ * Preflights repo/token/commit, reuses an existing in-flight or retained job for the same commit, PR & tier when present,
  * otherwise verifies the bookmark can be written, submits via POST /api/github-app/review-now, bookmarks it,
  * waits up to 20 minutes with short progress lines (continuing across retryable poll errors with Retry-After backoff),
  * verifies the returned job's head_sha matches the local checkout, and prints findings inline in the same answer.
@@ -1623,10 +1821,12 @@ export async function appReview({
   let reused = false;
   let bookmarkSaved = true;
   let targetMeta = null;
+  let initialSleptMs = 0;
 
   if (resumeAttempt && isAppId(resumeAttempt.id)) {
     id = resumeAttempt.id;
     reused = true;
+    initialSleptMs = Math.max(0, Number(resumeAttempt.initialSleptMs) || 0);
     targetMeta = { nwo: resumeAttempt.nwo ?? null, headSha: resumeAttempt.headSha, prNumber: resumeAttempt.prNumber ?? null };
     if (resumeAttempt.note) emit(resumeAttempt.note);
   } else {
@@ -1661,7 +1861,20 @@ export async function appReview({
       && prev.headSha === pre.headSha
       && (prev.prNumber ?? null) === (pre.prNumber ?? null)
     ) {
-      const existing = await bounded((callSignal) => fetchAppJob({ env, fetch, signal: callSignal }, appJobIdOf(prev.id), { showId: false }));
+      const existing = await fetchAppJobWithRetry({
+        env,
+        fetch,
+        jobId: appJobIdOf(prev.id),
+        showId: false,
+        wait,
+        waitMs: capMs,
+        pollMs,
+        now,
+        t0,
+        sleep,
+        signal,
+      });
+      initialSleptMs = existing.sleptMs;
       if (existing.interrupted) {
         emit(`${STILL_RUNNING_LINE}\n`);
         return { text: acc, code: 0, id: prev.id, timedOut: existing.interrupted === 'timeout', aborted: existing.interrupted === 'aborted' };
@@ -1671,20 +1884,29 @@ export async function appReview({
         return { text: acc, code: 4, id: prev.id };
       }
       const job = existing.value?.job;
-      if (job) {
+      if (job && jobMatchesTargetPr(job, pre.nwo, pre.prNumber)) {
         const actualSha = normalizedJobHeadSha(job);
         if (actualSha && actualSha !== pre.headSha) {
-          saveLatest?.({ id: prev.id, runner: 'app', nwo: pre.nwo, tier, headSha: actualSha, prNumber: pre.prNumber });
-        } else {
-          const st = String(job.status ?? '');
-          if (st === 'queued' || st === 'running') {
-            id = prev.id;
-            reused = true;
-          } else if (st === 'done' && job.findings && ['complete', 'partial', 'too_large'].includes(String(job.result_status ?? ''))) {
-            const rendered = renderAppJob(job, prev.id, { env, showId: false });
-            emit(rendered.text);
-            return { text: acc, code: rendered.code, id: prev.id, reused: true };
-          }
+          saveLatest?.({
+            id: prev.id,
+            runner: 'app',
+            nwo: pre.nwo,
+            tier,
+            headSha: actualSha,
+            requestedHeadSha: pre.headSha,
+            prNumber: pre.prNumber,
+          });
+          emit(describeHeadMismatch({ tier, expectedSha: pre.headSha, actualSha, nwo: pre.nwo, prNumber: pre.prNumber }));
+          return { text: acc, code: 4, id: prev.id, reused: true };
+        }
+        const st = String(job.status ?? '');
+        if (st === 'queued' || st === 'running') {
+          id = prev.id;
+          reused = true;
+        } else if (st === 'done' && job.findings && ['complete', 'partial', 'too_large'].includes(String(job.result_status ?? ''))) {
+          const rendered = renderAppJob(job, prev.id, { env, showId: false });
+          emit(rendered.text);
+          return { text: acc, code: rendered.code, id: prev.id, reused: true };
         }
       }
     }
@@ -1754,13 +1976,22 @@ export async function appReview({
     progressMs,
     now,
     t0,
+    initialSleptMs,
     sleep,
     signal,
   });
 
   if (w.finished && w.last?.headMismatch) {
     if (saveLatest && targetMeta) {
-      saveLatest({ id, runner: 'app', nwo: targetMeta.nwo, tier, headSha: w.last.actualSha, prNumber: targetMeta.prNumber });
+      saveLatest({
+        id,
+        runner: 'app',
+        nwo: targetMeta.nwo,
+        tier,
+        headSha: w.last.actualSha,
+        requestedHeadSha: targetMeta.headSha,
+        prNumber: targetMeta.prNumber,
+      });
     }
     emit(describeHeadMismatch({
       tier,

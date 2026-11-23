@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   APP_BILLING_URL, APP_INSTALL_URL, APP_PATH_ENABLED, WORKFLOW_PATH,
-  appResult, appReview, appStatus, checkAppStatus, extractAppToken, isAppId, parseGitHubRemote, resolveAppApiBase,
+  appResult, appReview, appStatus, checkAppStatus, extractAppToken, isAppId, parseGitHubRemote, resolveAppApiBase, resolveClaudeMcpConfigPath,
 } from '../scripts/lib/gh-runner.mjs';
 import { canSaveLatestReview, loadLatestReview, saveLatestReview, stateFilePath } from '../scripts/lib/latest-review.mjs';
 import { DEFAULT_WAIT_MS, STILL_RUNNING_LINE } from '../scripts/lib/wait-loop.mjs';
@@ -771,18 +771,34 @@ test('Finding 3: App status 503 outage resumes matching App bookmark and never f
   assert.match(r3.text, /Could not reach MegaLens to check GitHub App status/);
   assert.equal(gh3.calls.some((c) => c.args[0] === 'workflow'), false, 'transient 503 is not a definitive fallback signal');
 
-  // 3c. Matching App bookmark exists AND GET /review-now/<id> returns 503 -> stops cleanly, ZERO workflow dispatch and ZERO POST
+  // 3c. Matching App bookmark exists AND GET /review-now/<id> returns 503 -> waits across retryable reads up to cap,
+  //     ZERO workflow dispatch, ZERO second POST, and hides UUID; non-retryable 401 stops immediately with exit 4 & zero Actions
+  const clk4 = fakeClock();
   const gh4 = makeGitGhExec({ workflowPresent: true });
   const srvJob503 = makeAppServer({
     statusHttp: 503,
     statusResp: { error: 'unavailable' },
     pollHandler: () => jsonResp(503, { error: 'unavailable' }),
   });
-  const r4 = await runCli(['review'], { exec: gh4.exec, fetch: srvJob503.fetch, stateDir: stateDir1 });
-  assert.equal(r4.code, 4);
+  const r4 = await runCli(['review'], { exec: gh4.exec, fetch: srvJob503.fetch, stateDir: stateDir1, timing: { now: clk4.now, sleep: clk4.sleep } });
+  assert.equal(r4.code, 0);
+  assert.equal(clk4.sleeps.reduce((a, b) => a + b, 0), DEFAULT_WAIT_MS);
+  assert.ok(r4.text.includes(STILL_RUNNING_LINE));
   assert.equal(gh4.calls.some((c) => c.args[0] === 'workflow'), false);
   assert.equal(srvJob503.requests.some((x) => x.method === 'POST'), false);
   assert.equal(r4.text.includes(JOB1), false);
+
+  const gh5 = makeGitGhExec({ workflowPresent: true });
+  const srvJob401 = makeAppServer({
+    statusHttp: 503,
+    statusResp: { error: 'unavailable' },
+    pollHandler: () => jsonResp(401, { error: 'unauthorized' }),
+  });
+  const r5 = await runCli(['review'], { exec: gh5.exec, fetch: srvJob401.fetch, stateDir: stateDir1 });
+  assert.equal(r5.code, 4);
+  assert.equal(gh5.calls.some((c) => c.args[0] === 'workflow'), false);
+  assert.equal(srvJob401.requests.some((x) => x.method === 'POST'), false);
+  assert.equal(r5.text.includes(JOB1), false);
 });
 
 test('Finding 5: browser sign-in credential in user ~/.claude.json connects /megalens:review with empty shell env', async (t) => {
@@ -830,8 +846,23 @@ test('Finding 5: browser sign-in credential in user ~/.claude.json connects /meg
     },
   }), { mode: 0o600 });
   assert.equal(extractAppToken({ HOME: homeDir, CLAUDE_CONFIG_DIR: customCfgDir }), customTok);
-  // Relative CLAUDE_CONFIG_DIR (which could point inside a repository) is ignored in favor of HOME
-  assert.equal(extractAppToken({ HOME: homeDir, CLAUDE_CONFIG_DIR: './.evil-claude' }), browserTok);
+  // Relative CLAUDE_CONFIG_DIR resolves via path.resolve(), matching @megalens/mcp browser setup
+  const relCfgDir = path.relative(process.cwd(), customCfgDir);
+  assert.equal(
+    resolveClaudeMcpConfigPath({ HOME: homeDir, CLAUDE_CONFIG_DIR: './claude-profile' }),
+    path.join(path.resolve('./claude-profile'), '.claude.json'),
+  );
+  assert.equal(extractAppToken({ HOME: homeDir, CLAUDE_CONFIG_DIR: relCfgDir }), customTok);
+  // End-to-end review with relative CLAUDE_CONFIG_DIR and empty shell env uses the browser sign-in token
+  const srvRel = makeAppServer();
+  const rRel = await runCli(['review'], {
+    exec: makeGitGhExec({ workflowPresent: true }).exec,
+    fetch: srvRel.fetch,
+    stateDir: customCfgDir,
+    env: { HOME: homeDir, CLAUDE_CONFIG_DIR: relCfgDir, MEGALENS_TOKEN: undefined },
+  });
+  assert.equal(rRel.code, 0, rRel.text);
+  assert.equal(srvRel.requests[0].headers.Authorization, `Bearer ${customTok}`);
   // Explicit env MEGALENS_TOKEN takes precedence
   assert.equal(extractAppToken({ HOME: homeDir, MEGALENS_TOKEN: TOKEN }), TOKEN);
 
@@ -969,4 +1000,223 @@ test('Finding 8: unwritable/symlinked state dir stops before POST, and post-acce
   });
   assert.equal(rNoWait.code, 0);
   assert.match(rNoWait.text, new RegExp(`/megalens:result app:${JOB1}`));
+});
+
+test('LOOP-CONFIRM1 NEW High + #7 + #9 + #2: PR switch at same SHA, Enterprise checkout move, saved-job Retry-After: 60, and --no-wait moved PR', async (t) => {
+  const H2 = 'd'.repeat(40);
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-loop2-'));
+  t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+
+  let currentPr = 41;
+  let host = 'github.com';
+  let localHead = H;
+  let rateLimitMode = null; // null | 'always' | 'once'
+  let rateLimitHits = 0;
+  const calls = [];
+  const requests = [];
+
+  const exec = async (cmd, args, opts) => {
+    calls.push([cmd, ...args].join(' '));
+    if (cmd === 'git' && args[0] === 'rev-parse' && args.includes('--show-toplevel')) return ok('/repo-loop2\n');
+    if (cmd === 'git' && args[0] === 'rev-parse') return ok(`${localHead}\n`);
+    if (cmd === 'git' && args[0] === 'status') return ok('');
+    if (cmd === 'git' && args[0] === 'branch') return ok(`feature-${currentPr ?? 'ref'}\n`);
+    if (cmd === 'gh' && ['--version', 'auth'].includes(args[0])) return ok('');
+    if (cmd === 'gh' && args[0] === 'repo') {
+      return ok(JSON.stringify({ nameWithOwner: 'acme/widget', defaultBranchRef: { name: 'main' }, url: `https://${host}/acme/widget` }));
+    }
+    if (cmd === 'gh' && args[0] === 'api' && args.some((a) => a.includes('/commits/'))) return ok(`${localHead}\n`);
+    if (cmd === 'gh' && args[0] === 'api' && args.some((a) => a.includes('/contents/'))) return bad('HTTP 404');
+    if (cmd === 'gh' && args[0] === 'pr') {
+      if (currentPr === null) return bad('no pull requests found for branch');
+      return ok(JSON.stringify({
+        number: currentPr,
+        state: 'OPEN',
+        isDraft: false,
+        headRefOid: localHead,
+        isCrossRepository: false,
+        url: `https://github.com/acme/widget/pull/${currentPr}`,
+      }));
+    }
+    return bad(`unexpected ${cmd} ${args.join(' ')}`);
+  };
+
+  const fetch = async (url, init = {}) => {
+    const u = new URL(String(url));
+    const method = (init.method || 'GET').toUpperCase();
+    const body = init.body ? JSON.parse(String(init.body)) : null;
+    requests.push([method, u.pathname, body]);
+    if (u.pathname === '/api/github-app/status') {
+      return jsonResp(200, { installed: true, linked: true, notice_accepted: true, suspended: false });
+    }
+    if (u.pathname === '/api/github-app/review-now' && method === 'POST') {
+      const jid = body.pr === 42 ? JOB2 : JOB1;
+      return jsonResp(202, { job_id: jid, status_url: `/api/github-app/review-now/${jid}` });
+    }
+    if (u.pathname.startsWith('/api/github-app/review-now/')) {
+      if (rateLimitMode === 'always' || (rateLimitMode === 'once' && rateLimitHits === 0)) {
+        rateLimitHits += 1;
+        return jsonResp(429, { error: 'rate_limited' }, { 'retry-after': '60' });
+      }
+      const isPr42 = u.pathname.endsWith(JOB2);
+      return jsonResp(200, makeJob({
+        job_id: isPr42 ? JOB2 : JOB1,
+        head_sha: H,
+        pr_url: `https://github.com/acme/widget/pull/${isPr42 ? 42 : 41}`,
+        findings: isPr42
+          ? makeDoc({ findings: [{ id: 'f42', file: 'sample.txt', line_start: 1, title: 'Only applies to PR 42', claim: 'PR 42 bug', priority: 'P1', strength: 'strong', found_by: ['codex-standard'] }] })
+          : makeDoc({ findings: [] }),
+      }));
+    }
+    return jsonResp(404, { error: 'not_found' });
+  };
+
+  // 1. Initial review on PR #41 -> clean result, bookmarks JOB1 for PR #41
+  const r41 = await runCli(['review'], { exec, fetch, stateDir, cwd: '/repo-loop2' });
+  assert.equal(r41.code, 0, r41.text);
+  assert.match(r41.text, /No findings were reported by a complete review/);
+
+  // 2. NEW High: Switch to PR #42 at the EXACT SAME SHA -> MUST resolve PR #42, submit PR #42, and report PR #42's finding!
+  currentPr = 42;
+  calls.length = 0;
+  requests.length = 0;
+  const r42 = await runCli(['review'], { exec, fetch, stateDir, cwd: '/repo-loop2' });
+  assert.equal(r42.code, 0, r42.text);
+  assert.equal(calls.some((c) => c.startsWith('gh pr ')), true, 'must resolve current PR before reusing bookmark');
+  assert.equal(requests.some(([m, p, b]) => m === 'POST' && p === '/api/github-app/review-now' && b?.pr === 42), true);
+  assert.match(r42.text, /Only applies to PR 42/);
+
+  // 3. Reopened #7: Move same checkout to GitHub Enterprise -> MUST run gh repo view and make ZERO App API calls!
+  host = 'github.enterprise.example';
+  calls.length = 0;
+  requests.length = 0;
+  const rGhe = await runCli(['review'], { exec, fetch, stateDir, cwd: '/repo-loop2' });
+  assert.equal(rGhe.code, 4);
+  assert.equal(calls.some((c) => c.startsWith('gh repo ')), true, 'must check repo host before reusing bookmark');
+  assert.equal(requests.length, 0, 'Enterprise checkout must make zero github.com App API calls');
+  assert.match(rGhe.text, /github\.enterprise\.example/);
+
+  // 4. #9: First read of a saved job gets 429 Retry-After: 60 -> waits 60s and recovers (and with persistent 429 + mock sleep without mock now, waits full waitMs budget!)
+  host = 'github.com';
+  rateLimitMode = 'once';
+  rateLimitHits = 0;
+  let sleptOnce = 0;
+  requests.length = 0;
+  const rRecover = await runCli(['review'], {
+    exec,
+    fetch,
+    stateDir,
+    cwd: '/repo-loop2',
+    timing: { waitMs: 120_000, sleep: async (ms) => { sleptOnce += ms; } },
+  });
+  assert.equal(rRecover.code, 0, rRecover.text);
+  assert.equal(sleptOnce, 60_000, 'must sleep Retry-After: 60 before retrying saved job read');
+  assert.equal(requests.some(([m]) => m === 'POST'), false, 'zero second POST when recovering saved job');
+  assert.match(rRecover.text, /Only applies to PR 42/);
+
+  rateLimitMode = 'always';
+  let sleptCap = 0;
+  requests.length = 0;
+  const rCap = await runCli(['review'], {
+    exec,
+    fetch,
+    stateDir,
+    cwd: '/repo-loop2',
+    timing: { waitMs: 120_000, sleep: async (ms) => { sleptCap += ms; } },
+  });
+  assert.equal(rCap.code, 0, rCap.text);
+  assert.equal(sleptCap, 120_000, 'must wait across full budget respecting Retry-After: 60 even when only sleep is mocked');
+  assert.ok(rCap.text.includes(STILL_RUNNING_LINE));
+  assert.equal(rCap.text.includes(JOB2), false);
+  assert.equal(requests.some(([m]) => m === 'POST'), false);
+
+  // 5. #2: Moved PR with --no-wait -> no-ID /megalens:result and /megalens:status MUST reject wrong-head findings until user pulls moved head!
+  const stateDirMoved = mkdtempSync(path.join(tmpdir(), 'mlapp-moved-'));
+  t.after(() => rmSync(stateDirMoved, { recursive: true, force: true }));
+  let movedHeadLocal = H;
+  let movedPosts = 0;
+  const execMoved = async (cmd, args) => {
+    if (cmd === 'git' && args[0] === 'rev-parse' && args.includes('--show-toplevel')) return ok('/repo-moved\n');
+    if (cmd === 'git' && args[0] === 'rev-parse') return ok(`${movedHeadLocal}\n`);
+    if (cmd === 'git' && args[0] === 'status') return ok('');
+    if (cmd === 'git' && args[0] === 'branch') return ok('feature-41\n');
+    if (cmd === 'gh' && ['--version', 'auth'].includes(args[0])) return ok('');
+    if (cmd === 'gh' && args[0] === 'repo') {
+      return ok(JSON.stringify({ nameWithOwner: 'acme/widget', defaultBranchRef: { name: 'main' }, url: 'https://github.com/acme/widget' }));
+    }
+    if (cmd === 'gh' && args[0] === 'api' && args.some((a) => a.includes('/commits/'))) return ok(`${movedHeadLocal}\n`);
+    if (cmd === 'gh' && args[0] === 'pr') {
+      return ok(JSON.stringify({
+        number: 41, state: 'OPEN', isDraft: false, headRefOid: movedHeadLocal, isCrossRepository: false,
+        url: 'https://github.com/acme/widget/pull/41',
+      }));
+    }
+    return bad(`unexpected ${cmd} ${args.join(' ')}`);
+  };
+  const fetchMoved = async (url, init = {}) => {
+    const u = new URL(String(url));
+    if (u.pathname === '/api/github-app/status') return jsonResp(200, { installed: true, linked: true, notice_accepted: true, suspended: false });
+    if (u.pathname === '/api/github-app/review-now' && init.method === 'POST') {
+      movedPosts += 1;
+      return jsonResp(202, { job_id: JOB1, status_url: `/api/github-app/review-now/${JOB1}` });
+    }
+    if (u.pathname === `/api/github-app/review-now/${JOB1}`) {
+      return jsonResp(200, makeJob({
+        job_id: JOB1,
+        head_sha: H2,
+        pr_url: 'https://github.com/acme/widget/pull/41',
+        findings: makeDoc({ findings: [{ id: 'fm', file: 'sample.txt', line_start: 1, title: 'Only applies to the moved head', claim: 'moved', priority: 'P1', strength: 'strong', found_by: ['codex-standard'] }] }),
+      }));
+    }
+    return jsonResp(404, { error: 'not_found' });
+  };
+
+  const accepted = await runCli(['review', '--no-wait'], { exec: execMoved, fetch: fetchMoved, stateDir: stateDirMoved, cwd: '/repo-moved' });
+  assert.equal(accepted.code, 0, accepted.text);
+  assert.equal(movedPosts, 1);
+
+  // Re-running /megalens:review before git pull stops with head mismatch and makes ZERO second POST
+  const rerunBeforePull = await runCli(['review'], { exec: execMoved, fetch: fetchMoved, stateDir: stateDirMoved, cwd: '/repo-moved' });
+  assert.equal(rerunBeforePull.code, 4);
+  assert.equal(movedPosts, 1, 'must NOT submit a second POST when PR moved on GitHub');
+  assert.match(rerunBeforePull.text, /Pull request #41 on GitHub moved to commit ddddddd/);
+  assert.equal(rerunBeforePull.text.includes('Only applies to the moved head'), false);
+
+  // No-ID result while still at old SHA H -> MUST refuse to render H2 findings and keep bookmark accurate
+  const resBeforePull1 = await runCli(['result'], { exec: execMoved, fetch: fetchMoved, stateDir: stateDirMoved, cwd: '/repo-moved' });
+  assert.equal(resBeforePull1.code, 4);
+  assert.match(resBeforePull1.text, /Pull request #41 on GitHub moved to commit ddddddd/);
+  assert.equal(resBeforePull1.text.includes('Only applies to the moved head'), false, 'must NOT render moved-head findings for old local SHA');
+  const bmAfter = loadLatestReview({ env: { MEGALENS_STATE_DIR: stateDirMoved }, repoKey: '/repo-moved' });
+  assert.equal(bmAfter?.headSha, H2);
+  assert.equal(bmAfter?.requestedHeadSha, H);
+
+  // Fresh --no-wait -> direct no-ID result (without intermediate /megalens:review) ALSO rejects wrong-head findings and fixes bookmark
+  const stateDirDirect = mkdtempSync(path.join(tmpdir(), 'mlapp-moved-direct-'));
+  t.after(() => rmSync(stateDirDirect, { recursive: true, force: true }));
+  const acceptedDirect = await runCli(['review', '--no-wait'], { exec: execMoved, fetch: fetchMoved, stateDir: stateDirDirect, cwd: '/repo-moved' });
+  assert.equal(acceptedDirect.code, 0, acceptedDirect.text);
+  const directRes = await runCli(['result'], { exec: execMoved, fetch: fetchMoved, stateDir: stateDirDirect, cwd: '/repo-moved' });
+  assert.equal(directRes.code, 4);
+  assert.match(directRes.text, /Pull request #41 on GitHub moved to commit ddddddd/);
+  assert.equal(directRes.text.includes('Only applies to the moved head'), false);
+  const bmDirect = loadLatestReview({ env: { MEGALENS_STATE_DIR: stateDirDirect }, repoKey: '/repo-moved' });
+  assert.equal(bmDirect?.headSha, H2);
+  assert.equal(bmDirect?.requestedHeadSha, H);
+
+  // Second no-ID result AND no-ID status BEFORE git pull -> STILL refuse to render wrong-head findings
+  const resBeforePull2 = await runCli(['result'], { exec: execMoved, fetch: fetchMoved, stateDir: stateDirMoved, cwd: '/repo-moved' });
+  assert.equal(resBeforePull2.code, 4);
+  assert.equal(resBeforePull2.text.includes('Only applies to the moved head'), false);
+
+  const stBeforePull = await runCli(['status'], { exec: execMoved, fetch: fetchMoved, stateDir: stateDirMoved, cwd: '/repo-moved' });
+  assert.equal(stBeforePull.code, 4);
+  assert.match(stBeforePull.text, /moved to commit ddddddd/);
+
+  // After user pulls H2 locally -> no-ID result renders H2 findings cleanly (exit 0) and clears requestedHeadSha
+  movedHeadLocal = H2;
+  const resAfterPull = await runCli(['result'], { exec: execMoved, fetch: fetchMoved, stateDir: stateDirMoved, cwd: '/repo-moved' });
+  assert.equal(resAfterPull.code, 0, resAfterPull.text);
+  assert.match(resAfterPull.text, /Only applies to the moved head/);
+  assert.equal(loadLatestReview({ env: { MEGALENS_STATE_DIR: stateDirMoved }, repoKey: '/repo-moved' })?.requestedHeadSha, null);
 });
