@@ -257,3 +257,20 @@ PR bookmarks continue to require a valid base SHA for reuse. The retained regres
 
 - Both new regressions failed against the prior runner and passed with the fix.
 - `npm test` passed all 205 tests. `git diff --check` passed. The suite required no Postgres instance.
+
+## Fix round
+
+The signed-out CLI case was the only plugin finding still open in the latest confirmation. [LOOP-CONFIRM2.md](/root/review-input/rv-plugin-app-path/LOOP-CONFIRM2.md)
+
+- **High — App review with `gh` signed out.** The plugin recognizes GitHub CLI’s explicit signed-out response and uses the existing App-only path. It resolves the repository from the GitHub.com origin and submits the checked-out commit SHA. Other preflight errors still allow PR discovery, and an inconclusive PR lookup stops before submission. The new regression covers automatic and explicit App selection on a branch and detached HEAD, with one App submission and zero authenticated `gh` calls in each case. It failed against the prior runner. The existing GitHub 502 regressions pass with the fix. [Auth detection](scripts/lib/gh-runner.mjs#L443) · [Regression](tests/app-path.test.mjs#L297) · [Outage regressions](tests/app-path.test.mjs#L422)
+
+### Server track
+
+Exclude both findings from the plugin confirmation count. They belong to `ondemand-server-fix`.
+
+- **FIRST #4.** Worker settlement before delivery when `ONE_PATH_V1` is off. [worker-api.ts:599](/root/review-input/ws-ondemand-merge/src/lib/github-setup/worker-api.ts:599)
+- **Earlier LOOP-CONFIRM2 new high #1.** On-demand queue matching after a PR base change. [20261123230000_github_app_on_demand.sql:113](/root/review-input/ws-ondemand-merge/supabase/migrations/20261123230000_github_app_on_demand.sql:113)
+
+### Verification
+
+`npm test` passed all 206 tests. `git diff --check` passed. The suite ran with disposable fixtures inside the workspace and required no Postgres instance.

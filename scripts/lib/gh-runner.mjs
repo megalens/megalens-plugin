@@ -440,7 +440,12 @@ async function ghRepoPreflight({ exec, cwd, env, signal = null }) {
   if (v.code === 127) throw new GhUnavailableError(MSG.noGh);
   let au = await run('gh', ['auth', 'status', '--active']);
   if (au.code !== 0 && /unknown flag/i.test(au.stderr)) au = await run('gh', ['auth', 'status']);
-  if (au.code !== 0) throw new SetupError(MSG.noLogin);
+  if (au.code !== 0) {
+    if (/^You are not logged into any GitHub hosts(?:\.|$)/im.test(`${au.stderr}\n${au.stdout}`)) {
+      throw new GhUnavailableError(MSG.noLogin);
+    }
+    throw new SetupError(MSG.noLogin);
+  }
   const rv = await run('gh', ['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef,url']);
   const repo = rv.code === 0 ? jsonOf(rv.stdout) : null;
   if (!repo || typeof repo.nameWithOwner !== 'string' || !NWO_RE.test(repo.nameWithOwner) || typeof repo.defaultBranchRef?.name !== 'string') throw new SetupError(MSG.noRemote);
@@ -469,7 +474,10 @@ async function ghRepoPreflight({ exec, cwd, env, signal = null }) {
   return { nwo, defaultBranch, host, isGithubCom, hasGh: true };
 }
 
-/** Resolve the App repository from origin. An installed gh can still look up PRs even if auth status fails for another host. */
+/**
+ * Resolve the App repository from origin. Missing or signed-out gh uses the App's commit lookup.
+ * Other preflight failures can still allow gh PR lookup.
+ */
 async function gitRepoFallback({ exec, cwd, env, signal = null, ghError }) {
   const envHost = typeof env?.GH_HOST === 'string' && env.GH_HOST.trim() ? env.GH_HOST.trim().toLowerCase() : '';
   if (envHost && envHost !== 'github.com') return null;

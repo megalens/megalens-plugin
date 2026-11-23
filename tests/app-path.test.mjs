@@ -294,6 +294,36 @@ test('App installed without gh CLI installed: resolves owner/repo from git origi
   assert.equal(parseGitHubRemote('https://gitlab.com/acme/widget.git'), null);
 });
 
+test('App reviews pushed commits when gh is installed without a GitHub login', async (t) => {
+  for (const runnerArgs of [[], ['--runner', 'app']]) {
+    for (const detached of [false, true]) {
+      const stateDir = mkdtempSync(path.join(tmpdir(), 'mlapp-gh-logged-out-'));
+      t.after(() => rmSync(stateDir, { recursive: true, force: true }));
+      const gh = makeGitGhExec({ authError: 'You are not logged into any GitHub hosts. To log in, run: gh auth login' });
+      const authenticatedCalls = [];
+      const exec = (cmd, args, opts) => {
+        if (cmd === 'git' && detached && args.join(' ') === 'branch --show-current') return ok('');
+        if (cmd === 'gh' && !['--version', 'auth'].includes(args[0])) {
+          authenticatedCalls.push(args[0]);
+          return bad('To get started with GitHub CLI, please run: gh auth login', 4);
+        }
+        return gh.exec(cmd, args, opts);
+      };
+      const srv = makeAppServer();
+
+      const result = await runCli(['review', ...runnerArgs], {
+        exec, fetch: srv.fetch, stateDir, env: { GH_TOKEN: undefined },
+      });
+      assert.equal(result.code, 0, result.text);
+      assert.match(result.text, /## MegaLens standard review: complete/);
+      assert.deepEqual(srv.requests.filter((r) => r.method === 'POST').map((r) => r.body), [
+        { repo: 'acme/widget', tier: 'standard', ref: H },
+      ]);
+      assert.deepEqual(authenticatedCalls, []);
+    }
+  }
+});
+
 const openPaymentPr = {
   number: 42,
   state: 'OPEN',
