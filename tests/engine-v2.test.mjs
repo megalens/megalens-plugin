@@ -37,14 +37,15 @@ process.exit(s.exit || 0);
 async function run(argv, { scenario = {}, env = {}, flags: fl = {}, stdin, cwd } = {}) {
   const flags = { double: true, ...fl };
   const f = fake(scenario); let text = ''; let errText = '';
-  const code = await main(argv, { env: { PATH: process.env.PATH, HOME: tmpdir(), MEGALENS_TOKEN: TOKEN, MEGALENS_REVIEW_BIN: f.bin, ...env }, cwd: cwd ?? tmpdir(), out: (s) => { text += s; }, err: (s) => { errText += s; }, flags, exec: async () => ({ code: 127, stdout: '', stderr: 'gh not found' }), ...(stdin !== undefined ? { stdin: async () => stdin } : {}) });
+  const code = await main(argv, { env: { PATH: process.env.PATH, HOME: f.dir, MEGALENS_TOKEN: TOKEN, MEGALENS_REVIEW_BIN: f.bin, ...env }, cwd: cwd ?? f.dir, out: (s) => { text += s; }, err: (s) => { errText += s; }, flags, exec: async () => ({ code: 127, stdout: '', stderr: 'gh not found' }), ...(stdin !== undefined ? { stdin: async () => stdin } : {}) });
   return { code, text, errText, calls: f.calls(), f };
 }
 const finding = (o) => ({ id: 'f1', file: 'src/a.js', line_start: 3, line_end: 4, title: 'Null deref', claim: 'x is null', failure_scenario: 'call with no args', priority: 'P1', strength: 'strong', found_by: ['codex-standard'], ...o });
 const doc = (o) => ({ schema: 'megalens.findings/v1', review_id: 'rv_abc12345', tier: 'standard', status: 'complete', passes: [{ name: 'codex-standard', model: 'gpt-6.2-sol', effort: 'medium', status: 'ok' }], findings: [], ...o });
 
 test('command parsing: tiers, quiet, range, rejects junk', () => {
-  assert.deepEqual(parseReviewArgs([]), { tier: 'standard', quiet: false, firstReview: null, base: null, head: null, wait: false });
+  assert.deepEqual(parseReviewArgs([]), { tier: 'standard', quiet: false, firstReview: null, base: null, head: null, wait: true });
+  assert.equal(parseReviewArgs(['--no-wait']).wait, false);
   assert.equal(parseReviewArgs(['deep', '--quiet']).tier, 'deep');
   assert.equal(parseReviewArgs(['deep', '--quiet']).quiet, true);
   assert.equal(parseReviewArgs(['double', '--first-review', '/t/x.json'], { double: true }).firstReview, '/t/x.json');
@@ -163,11 +164,22 @@ test('no credentials: nothing runs, message names the fallback', async () => {
   assert.equal(r.code, 4); assert.equal(r.calls.length, 0); assert.match(r.text, /MEGALENS_TOKEN/); assert.match(r.text, /megalens-review/);
 });
 
-test('deep: starts in the background and returns the id, claims nothing about the change', async () => {
-  const r = await run(['review', 'deep'], { scenario: { run: { stdout: '{"review_id":"rv_deep12345","state":"running"}\n' } } });
-  assert.equal(r.code, 0); assert.ok(r.calls[0].a.includes('--background')); assert.ok(!r.calls[0].a.includes('--out'));
-  assert.match(r.text, /rv_deep12345/); assert.match(r.text, /\/megalens:status rv_deep12345/); assert.match(r.text, /\/megalens:result rv_deep12345/); assert.match(r.text, /Nothing has been reviewed yet/);
-  assert.ok(!/no issues|clean/i.test(r.text.replace(/not .*clean/i, '')));
+test('deep: waits by default and prints inline with no id; --no-wait prints still-running line and saves latest', async () => {
+  const r = await run(['review', 'deep'], {
+    scenario: {
+      run: { stdout: '{"review_id":"rv_deep12345","state":"running"}\n' },
+      status: { stdout: '{"review_id":"rv_deep12345","state":"complete","tier":"deep"}\n' },
+      result: { doc: doc({ tier: 'deep', review_id: 'rv_deep12345', findings: [finding({ strength: 'normal', priority: 'P2' })] }) },
+    },
+  });
+  assert.equal(r.code, 0); assert.ok(r.calls[0].a.includes('--background'));
+  assert.match(r.text, /Review started/); assert.match(r.text, /deep review: complete/); assert.match(r.text, /Other findings \(1\)/);
+  assert.equal(r.text.includes('rv_deep12345'), false, 'no id shown on clean completion');
+  const nw = await run(['review', 'deep', '--no-wait'], { scenario: { run: { stdout: '{"review_id":"rv_deep12345","state":"running"}\n' } } });
+  assert.equal(nw.code, 0); assert.ok(nw.calls[0].a.includes('--background')); assert.ok(!nw.calls[0].a.includes('--out'));
+  assert.match(nw.text, /Still running\. Run \/megalens:result to see it\./);
+  assert.equal(nw.text.includes('rv_deep12345'), false);
+  assert.ok(!/no issues|clean/i.test(nw.text.replace(/not .*clean/i, '')));
 });
 
 test('status and result: running, finished, unknown, bad ids never reach the engine', async () => {
@@ -407,12 +419,12 @@ test('Double is OFF by constant: refused by default, engine never called, no env
   // a ref that is merely named double is not mistaken for the tier
   const r = await run(['review', 'standard', '--base', 'double', '--head', 'main'], { flags: { double: false }, scenario: { run: { doc: doc() } } }); assert.equal(r.code, 0);
   const s = await run(['review', 'standard'], { flags: { double: false }, scenario: { run: { doc: doc() } } }); assert.equal(s.code, 0);
-  const dp = await run(['review', 'deep'], { flags: { double: false }, scenario: { run: { stdout: '{"review_id":"rv_deep12345","state":"running"}' } } }); assert.equal(dp.code, 0);
+  const dp = await run(['review', 'deep', '--no-wait'], { flags: { double: false }, scenario: { run: { stdout: '{"review_id":"rv_deep12345","state":"running"}' } } }); assert.equal(dp.code, 0);
   const x = await run(['review', 'double'], { flags: { double: false } }); assert.equal(x.calls.length, 0); assert.equal(x.text.trim(), MSG);
 });
 
 test('Double usage text is gone from the command, the README launch section keeps a later note', () => {
   const rc = readFileSync(new URL('../commands/review.md', import.meta.url), 'utf8'); const head = rc.split('\n').slice(0, 4).join('\n');
-  assert.ok(!/double/i.test(head)); assert.match(head, /\[standard\|deep\]/);
+  assert.ok(!/double/i.test(head)); assert.match(head, /\[deep\]/);
   const rm = readFileSync(new URL('../README.md', import.meta.url), 'utf8'); assert.ok(!/\| `\/megalens:review double`/.test(rm)); assert.match(rm, /Double[^.\n]*later/i);
 });

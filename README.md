@@ -1,260 +1,107 @@
 # MegaLens for Claude Code
 
-This plugin sends your current git change to MegaLens, which has models from different companies review it. The standard panel currently uses models from Anthropic, Google and OpenAI. A script collects the diff, the changed files and some related code, so the model does not choose what to send. The bundle is 200 KB by default and 700 KB at most.
+Independent code review for your changes inside Claude Code. One command starts the review, waits while it runs, and shows the findings inline in the same answer.
 
-Claude writes its own review first. The result then shows what the panel raised that Claude's review did not.
+## Quick start (2 steps)
 
-## Install
+Needs Node 18+, `git`, and the GitHub CLI (`gh auth login`). If MegaLens is not installed on your repository yet, install the MegaLens GitHub App once at https://megalens.ai/app/start (no workflow file or token needed).
 
-From this folder, without a marketplace:
+1. **Install the plugin:**
 
-    claude --plugin-dir /path/to/megalens-claude-plugin
+   ```sh
+   claude --plugin-dir /path/to/megalens-claude-plugin
+   ```
 
-Needs Node 18+ and git. The plugin adds two commands and two MCP servers:
+2. **Run a review:**
 
-| | `/megalens:megalens-review` (recommended) | `/megalens:megalens-review-remote` (fallback) |
-|---|---|---|
-| Needs | `MEGALENS_TOKEN` in the environment | OAuth sign-in (`/mcp`, pick `megalens`) |
-| Who sends the code | a local tool (`megalens-local`, `scripts/mcp-server.mjs`) | Claude copies the bundle into the tool call |
-| Bundle limit | 200 KB default, 700 KB maximum | 90 KB |
+   ```text
+   /megalens:review
+   ```
 
-Set the token before starting Claude Code: `export MEGALENS_TOKEN=...`, then restart. Never commit it. If it is missing, the local tool says so and points to the fallback.
+That's it. MegaLens picks the runner automatically (our review machine via the GitHub App when installed for your repository, otherwise your own GitHub Actions runner if its workflow is present), starts the review, prints short progress lines (`Review started`, `Running on GitHub...`, `About 2 minutes so far`), and prints the findings inline when it finishes.
 
-**About the fallback.** Claude has to retype the whole bundle into the `megalens_debate` call. Nothing checks that the copy matches what the collector produced, so a review can rest on code that differs from yours. Use a token when you can.
-
-### Why both servers are declared
-
-`.mcp.json` declares `megalens-local` (stdio, the review tool) and `megalens` (remote, OAuth). The local server can only reach MegaLens with a bearer token. The remote server is the only route for OAuth users, and it also has `megalens_status`, `megalens_history` and `megalens_scope`. If you only use a token you can delete the `megalens` entry. If you only use OAuth, `megalens-local` does nothing except report that no token is set.
-
-**Paid runs you did not ask for.** The remote `megalens` server sends its own usage instructions to the host. They tell the model to offer a MegaLens check after it finishes a change, and to run `megalens_debate` itself if you already agreed to automatic checks. A run costs credits. To avoid this, do not agree to automatic checks while that server is loaded, or delete the `megalens` entry from `.mcp.json`. The local server sends no usage instructions, and its tool description tells the model to call it only for `/megalens:megalens-review` or an explicit MegaLens request.
-
-### Environment variables read by the local server
-
-1. `MEGALENS_TOKEN`: the bearer token.
-2. `MEGALENS_URL`: default `https://megalens.ai/api/mcp?ide=claude-code`. Only https is accepted, or http to `127.0.0.1`, `localhost` or `::1`.
-3. `MEGALENS_MAX_BYTES`: default bundle limit in bytes, 200000 if unset, 700000 at most.
-4. `MEGALENS_AUDIT_LOG`: path of a JSONL file. After a review finishes, the tool appends one record with the bundle sha256, bundle and request sizes, run id and budget.
-5. `MEGALENS_REQUEST_TIMEOUT_MS` (default 90 s per request) and `MEGALENS_POLL_TIMEOUT_MS` (default 25 min).
-6. `MEGALENS_PROJECT_DIR`: the folder to review, for hosts that do not start the server in your project.
-
-### Token for the remote server too (CI, headless)
-
-Copy `.mcp.bearer.example.json` over `.mcp.json` only if you want the remote server on a bearer header as well. A static header is never replaced by OAuth, so a rejected token fails the connection, and Claude Code may cache that as "needs auth" for a while. For `claude -p` also set `MCP_CONNECTION_NONBLOCKING=false`, otherwise the first turn can start before the servers have connected.
-
-## Other hosts: Codex, Cursor, GitHub Copilot
-
-Codex was tested live on 17 November 2026. The Cursor and GitHub Copilot configs follow those products' documentation and have not been tested live.
-
-The same local tool (`scripts/mcp-server.mjs`, tool `megalens_review_change`) is used in every host. Only the packaging differs. Keep this folder where it is after installing, because the configs point at its absolute path. Needs Node 18+, git and a MegaLens token in `MEGALENS_TOKEN`.
-
-    node scripts/install.mjs --host codex|cursor|copilot [--project|--global] [--dir REPO] [--dry-run]
-
-`--project` (default) writes into the repo given by `--dir` (default: the current folder). `--global` writes into your home folder. The installer:
-
-1. merges into existing files and keeps your other servers;
-2. saves a copy of every file it changes under `~/.megalens/backups/<host>/<time>/`, owner-only and never inside your repo, and prints the path;
-3. checks every file it will write before writing any of them, and writes nothing if one fails;
-4. refuses to read or write through symlinks (a symlinked `AGENTS.md` is skipped);
-5. for Codex, checks that the result is valid TOML with no duplicate `megalens-local` entry;
-6. leaves a file unchanged if it already has the right content, and prints every file it touched.
-
-It does not write your token. The configs only name the variable, or ask for it. `--token-file FILE` (first line is the token) is the exception: it copies the token into the config files with mode 600. Do not commit them. If a JSON file you already had contained comments, they are dropped from the new file and the backup keeps them. Restart the host after installing.
-
-The local tool refuses to collect when the project folder is your home folder or `/`, when it is not inside a git repository, or when the repository's top level is your home folder. Set `MEGALENS_ALLOW_HOME=1` only if you keep your home folder in git. It also refuses when `MEGALENS_PROJECT_DIR` arrives unexpanded (for example `${workspaceFolder}`).
-
-Cursor and VS Code may not start the server in your project folder, so project installs set `MEGALENS_PROJECT_DIR` to the workspace. Prefer `--project` for them, and confirm the review is of the repository you meant.
-
-### Codex (CLI and IDE extension)
-
-1. Install: `node scripts/install.mjs --host codex --global` adds a block to `~/.codex/config.toml`, the skill `~/.agents/skills/megalens-review/` and the older style prompt `~/.codex/prompts/megalens-review.md`. With `--project` it writes `.codex/config.toml`, `.agents/skills/megalens-review/` and a MegaLens section in `AGENTS.md`.
-2. Trust the project (needed for `--project`): Codex ignores a project's `.codex/config.toml`, and so the MegaLens tool, until you trust the folder. Approve the trust prompt, or run `codex exec --trust` once there. Without it Codex says "Untrusted project-local configuration is disabled" and the tool is missing.
-3. Token: `export MEGALENS_TOKEN=...` before starting Codex. The config uses `env_vars = ["MEGALENS_TOKEN"]`, which forwards the variable by name.
-4. Run: type `$megalens-review` (or `/skills`), optionally naming a ref, `A..B` or `--staged`. Older Codex: `/prompts:megalens-review`.
-5. Approvals: Codex asks before calling the tool unless your approval mode allows it. The tool needs network access to megalens.ai and read access to the repo. The installer sets `tool_timeout_sec = 1800`, because the default of 60 seconds would cut a review off.
-6. The skill sets `allow_implicit_invocation: false`. That stops Codex from choosing the skill by itself. It does not control tool approval, which is a separate Codex setting.
-7. Codex marks custom prompts as deprecated in favour of skills. Use the skill, and the prompt only on older versions.
-8. Docs: https://learn.chatgpt.com/docs/extend/mcp?surface=cli, https://learn.chatgpt.com/docs/build-skills, https://learn.chatgpt.com/docs/custom-prompts
-
-### Cursor
-
-1. Install: `node scripts/install.mjs --host cursor --project` writes `.cursor/mcp.json`, the command `.cursor/commands/megalens-review.md` and the rule `.cursor/rules/megalens-review.mdc` (not always on). `--global` writes `~/.cursor/mcp.json` and `~/.cursor/commands/`.
-2. Token: `export MEGALENS_TOKEN=...` and start Cursor from that shell. The config uses `${env:MEGALENS_TOKEN}`.
-3. Run: type `/megalens-review` in Agent chat, or mention `@megalens-review`.
-4. Approvals: by default Cursor asks before running an MCP tool. What happens depends on your Run Mode.
-5. Docs: https://cursor.com/docs/mcp, https://cursor.com/docs/context/rules, https://cursor.com/docs/agent/chat/commands. Custom commands are only mentioned in passing in the last one, so check that `/megalens-review` shows up when you type `/`. The rule can be used either way.
-
-### GitHub Copilot (VS Code and Copilot CLI)
-
-1. Install: `node scripts/install.mjs --host copilot --project` writes `.vscode/mcp.json` (key `servers`, token asked through a hidden `promptString` input, nothing stored in the file), the prompt `.github/prompts/megalens-review.prompt.md`, and `.github/mcp.json` for Copilot CLI. `--global` writes only the CLI file `~/.copilot/mcp-config.json`. The prompt has no `tools:` line, because the VS Code docs say that line limits which tools the prompt can use.
-2. VS Code: per the current docs, prompt files run only in the Local harness in the Chat view, so select Local before typing `/megalens-review`. The docs say the Local harness is deprecated and will be removed by February 2027. VS Code asks you to trust the server on first start, and asks for the token once.
-3. Copilot CLI: export `MEGALENS_TOKEN`, start `copilot` in the repo and ask it to review your change with MegaLens. The CLI has no prompt files, so you type the request. The config writes `"${MEGALENS_TOKEN}"` for the CLI to expand. If the server reports that the token is not set, update the CLI or use `--token-file`.
-4. Docs: https://code.visualstudio.com/docs/agents/reference/mcp-configuration, https://code.visualstudio.com/docs/agent-customization/prompt-files, https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers, https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference
-
-## Use
-
-    /megalens-review                 your change vs the merge base with main (committed branch work, staged, unstaged and new files)
-    /megalens-review main            the same, against another base ref
-    /megalens-review abc123..def456  a commit range (file contents are read at the end commit)
-    /megalens-review --staged        staged changes only
-
-1. Claude reads the change and writes its own review.
-2. Claude calls `megalens_review_change` with that review. The tool collects the bundle, sends it as one `megalens_debate` call, polls until the run finishes and returns the MegaLens result, followed by a line with the bundle size and sha256.
-3. Claude shows what the panel found that its own review did not, then the findings. Check each finding against your code before changing anything.
-4. If the result lists files the panel wanted, Claude is told to read them and call the tool one more time with them added. That second call is a second review run and is charged again. The tool does not enforce the limit of two calls. The instruction text does.
-
-**Comparing hashes.** The tool reports `bundle_sha256`, the hash of the exact `fileContext` it sent. It is also written to the audit log and put in the request prompt as `[megalens-plugin bundle sha256=...]`. To check that a bundle matches, run `node scripts/collect.mjs --json --max-bytes N` and hash its `bundle` field, using the same repository state, the same range and the same N as the `budget=` value in the tool's last line. Files you add after a result (`extraContext`) are part of the sent bundle, so a review that used them will not match.
-
-## What is sent
-
-One `megalens_debate` call with these fields, plus `tier: standard`:
-
-1. `fileContext`, built by `scripts/collect.mjs` in this order:
-   1. `=== DIFF ===`, the unified diff, at most 45% of the budget. If it is larger, long sections are cut with a note, and some may be left out.
-   2. `=== FILE: path ===` for every changed file, largest change first. A file over 60 KB, or a set that does not fit, is cut to windows around the changed lines, with line numbers, at the widest radius that fits all of them (40, 10, 3 or 0 lines). As a last resort each file gets an equal share of the budget. The manifest says what was cut. With `--staged`, content comes from the index, not the working tree. If nothing reviewable is left, nothing is sent and the tool says why.
-   3. Context tests: tests named for a changed file or that use a changed symbol.
-   4. Other context, by score: files that call a changed symbol, files that define a symbol the change calls, and config files the change names or whose environment variables it reads. At most 40 context files. A context file over 14 KB is cut to the lines around the matches.
-2. `prompt`: the review request, the contents of `.megalens/rules` if present, and the bundle sha256.
-3. `yourAssessment`: Claude's own findings, each with the line it concerns.
-
-To see what would be sent, run `node scripts/collect.mjs --max-bytes 200000`. It prints a manifest and then the bundle, and sends nothing. `--json` prints JSON. Without `--max-bytes` the collector uses 90 KB (the fallback command's limit), not the tool's 200 KB.
-
-What the collector leaves out (rules in `scripts/lib/safety.mjs`):
-
-1. Lockfiles, binaries, build output, vendored code and generated files (`*.min.js`, `*.pb.go`, files with an `@generated` style header, snapshots, SVG).
-2. Files with secret-looking names, such as `.env` (but not `.env.example`), `*.pem`, `*.key`, `id_rsa`, `credentials`, `.npmrc` style files with an auth token, and `terraform.tfstate`.
-3. Any file, diff section, `.megalens/rules` or `extraContext` whose content looks like a credential: private keys, AWS key ids, GitHub, GitLab, Slack, Stripe, Google and MegaLens tokens, `sk-` keys, and JWTs. This check has false positives, and a test fixture with a fake key is skipped too. It is a safety net. Do not rely on it for a file that should never be in the repo.
-4. Config files that often hold credentials, when they are only context and you did not change them (for example `database.yml`, `settings*.py`, `wp-config*.php`, `*.ini`, `*.conf`, `*.toml`, `docker-compose*.yml`, `Dockerfile*`). If your change touches one, it is sent as a changed file with the redaction below.
-5. Symlinks, and anything whose real path is outside the repository.
-6. Diff sections whose file name cannot be parsed.
-
-**Redaction.** In every diff and every file the collector sends, values of keys whose names contain `pass`, `secret`, `token`, `api_key`, `private_key`, `access_key` or `credential` are replaced with `***REDACTED***`. Quoted values are handled in any file. Unquoted values are handled in config style files (yaml, ini, env, properties, shell and similar). Line counts do not change, and the manifest gives the count per file. Values such as `${VAR}`, empty values and booleans are kept. This is pattern matching and can miss a secret. Redaction does not apply to `extraContext` from the model or to the text of `yourAssessment`, which are only checked as described in item 3 above.
-
-The manifest lists every file that was skipped, redacted or left out for space.
-
-The range argument must be `--staged`, a ref, `A..B` or `A...B`, with no options, spaces or shell characters. The fallback command passes it to the collector on stdin, through a quoted heredoc.
-
-## Failures and retries
-
-1. Each network request times out after 90 seconds.
-2. While polling, timeouts, HTTP 5xx and 429 responses and unreadable replies are retried until the poll deadline (25 minutes by default). Other errors stop the poll.
-3. The `megalens_debate` call is never repeated by the tool. If it times out or fails with a transient error, a run may already have started and may be charged. The tool then tells the model not to call again and to check `megalens_history` on the remote server, or your MegaLens dashboard, before doing anything else. Do the same: do not start a second review for the same change until you have checked.
-4. If the poll deadline passes, the tool returns the run id so the result can be fetched with `megalens_poll`.
-
-## Size limits and cost
-
-The default bundle limit is 200 KB and the maximum is 700 KB. Set `MEGALENS_MAX_BYTES`, or `maxBytes` in the tool call. The tool keeps the whole request under 950 KB. If JSON escaping pushes it over, it collects again with a smaller budget, up to five times, and then reports an error. The fallback command stays at 90 KB. `MEGALENS_MAX_BYTES` raises it, but a larger copy by hand gives more room for errors.
-
-The plugin requests the `standard` tier. The server uses `free` for a first free review, and for an account that uses its own key without Pro. A typical paid review is charged by the amount of code sent, and a repeated call (see Use, step 4) is charged again.
-
-## Privacy
-
-The bundle goes to megalens.ai and the model providers it uses. Read https://megalens.ai/privacy before sending code you do not own or that is under NDA. The exclusions above reduce what is sent. They do not guarantee that no secret is sent, so run `node scripts/collect.mjs --max-bytes 200000` and read the output before reviewing sensitive code.
+- **Deeper pass:** run `/megalens:review deep` (Standard is the default).
+- **Stopped early or hit the 20-minute wait limit?** MegaLens prints `Still running. Run /megalens:result to see it.` Run `/megalens:result` later to see the latest review for this repository, or `/megalens:status` to check progress.
+- **Safety:** MegaLens never pushes your commits without asking, never calls a partial or failed review clean, and never prints tokens.
 
 ## `.megalens/rules`
 
-A plain text file in the repository, shared by the team. Up to 8 KB is sent with each review inside the prompt, as the repository's review instructions. If the file is longer, it is cut at 8 KB with a note. If it looks like it holds a credential, it is not sent. One rule per line, in plain words. Lines starting with `#` are comments for people, but they are sent too, so keep them short. Example:
+Add an optional `.megalens/rules` file in your repository with one plain-English review rule per line (up to 8 KB). Example:
 
-    # Rules for this repo
-    Money is stored as integer cents; flag any float arithmetic on prices.
-    Every route under src/api/ must check the session before reading the body.
-    Ignore anything under legacy/; it is scheduled for deletion.
-    Do not suggest new dependencies.
-
-Rules guide the review. They do not verify a finding, and they do not keep anything out of the upload. Never put secrets in this file.
-
-## Review on your own GitHub runner (macOS, Windows, Linux)
-
-`/megalens:review standard` and `/megalens:review deep` can run the review in **your own GitHub Actions runner** instead of on your machine. Nothing is kept on our side. The code goes only where the MegaLens Action already sends it (the diff and the code excerpts the reviewer reads go through the MegaLens gateway), and it costs the same credits as the Action.
-
-**When this route is used.** On macOS and Windows always. On Linux when the local engine is missing, has no working sandbox, or no local `MEGALENS_TOKEN` is set. `--runner github` forces it, `--runner local` forces the local engine (no fallback).
-
-**Setup, once per repository (3 steps).**
-
-1. Install the GitHub CLI and sign in: `gh auth login`. The folder must be a git repository with a GitHub remote.
-2. Add the workflow file `.github/workflows/megalens-dispatch.yml` to your **default branch** and push it. The file is `templates/megalens-dispatch.yml` in this plugin; if it is missing, the command prints it. GitHub starts a manually triggered workflow only from the default branch.
-3. Store your MegaLens token as a repository secret: `gh secret set MEGALENS_TOKEN` (gh asks for the value; the plugin never reads or prints it).
-
-**What you type.**
-
-| Command | What it does |
-|---|---|
-| `/megalens:review standard` or `deep` | Checks the setup, starts the run and prints an id like `gh:44863951033`. Both tiers are background runs: nothing has been reviewed when it returns. |
-| `/megalens:status gh:<id>` | `queued`, `running`, `done` or `failed`, with the run URL. |
-| `/megalens:result gh:<id>` | Downloads the findings artifact, shows it, and deletes the temporary folder. |
-
-The change reviewed is your latest commit against the merge base with the default branch (or `--base REF --head REF`). **Only commits that are on GitHub are reviewed.** If your latest commit is not pushed, nothing is pushed for you: Claude asks, and only your yes runs `git push`. Uncommitted changes are not reviewed on this route, and the command says so. A `partial` or `failed` review is never described as clean.
-
-**What you see** (real output from the test repository, a completed Standard review):
-
-```
-> /megalens:review standard
-Review of 71f8628..b326c97 in megalens/ml-e2e-review-test, tier standard, runs on your GitHub runner.
-Review started on GitHub: gh:44867820388
-Run: https://github.com/megalens/ml-e2e-review-test/actions/runs/44867820388
-A standard review usually takes a few minutes. Check with /megalens:status gh:44867820388, then fetch with /megalens:result gh:44867820388. Nothing has been reviewed yet.
-
-> /megalens:status gh:44867820388
-Review gh:44867820388: running. Running. Check again with /megalens:status gh:44867820388.
-(a few minutes later)
-Review gh:44867820388: done. Done. Fetch it with /megalens:result gh:44867820388.
-
-> /megalens:result gh:44867820388
-## MegaLens standard review: complete
-
-### Strong findings (1)
-
-- **P1** `.github/workflows/plugin-b1-matrix.yml:62`: Use a review base available in the checkout
-  - Problem: ...
-
-### Other findings (3)
-...
+```text
+# Rules for this repo
+Money is stored as integer cents; flag any float arithmetic on prices.
+Every route under src/api/ must check the session before reading the body.
+Ignore anything under legacy/; it is scheduled for deletion.
+Do not suggest new dependencies.
 ```
 
-If a run fails (for example the account has no credits), `status` says `failed ... It is not a clean review` and `result` says `NOT COMPLETED`.
+Rules guide the review; never put secrets in this file.
 
-The workflow file uses the MegaLens Action with the `workflow_dispatch` trigger. It has three jobs, as for pull requests: `create` (holds the token, no checkout), `review` (reads your code, `contents: read`, no token) and `publish` (checks the findings file, no write access, posts nothing because there is no pull request). Dispatch can only be started by someone with write access to the repository.
+## Privacy
 
-### Action version
-
-`templates/megalens-dispatch.yml` pins `megalens/review-action@950eb5f1eeff21008fcf585587b88fc83546cdcf` (tag `v1.2.0`) in all three jobs. The Action uses `megalens-review` version `0.1.3`. If you already set up a dispatch workflow, update the copy on your repository's default branch from this template.
+Read https://megalens.ai/privacy before reviewing code you do not own or that is under NDA. Finding text comes from a model: check each finding against your code before acting on it.
 
 ## Tests
 
-    npm test
+```sh
+npm test
+```
 
-The tests cover the installer, collector, local server, engine commands and GitHub runner commands. They use temporary repositories and mock services, so they make no calls to MegaLens or GitHub Actions.
+The tests cover runner auto-pick, the wait loop (with a fake clock), no-id status/result, the 20-minute wait cap, the installer, the collector, the local MCP server, the engine front end and the GitHub runner. They use temporary repositories and fakes, so they make no network or model calls.
 
-## Engine v2 commands (draft)
+---
 
-Alongside the bundle route above, the plugin can run the MegaLens review engine (`megalens-review`) on your repository. The engine reviews a sandboxed copy of your change and returns findings in the `megalens.findings/v1` format. The commands below do not replace `/megalens:megalens-review`, which stays for setups with no repo or no engine installed.
+## Advanced
 
-| Command | What it does |
-|---|---|
-| `/megalens:review [standard]` | One engine pass over the uncommitted change (staged, unstaged and untracked files). |
-| `/megalens:review deep` | Starts a longer review in the background and prints a review id. Nothing is reviewed until it finishes. Add `--wait` to the script to run it in the foreground. |
-| `/megalens:status <id>` | Says whether a background review is still running. |
-| `/megalens:result <id>` | Fetches and shows the finished review. |
+Nothing below is required for the main `/megalens:review` path above.
 
-**Later:** a Double tier (Claude reviews first, the engine's pass then gets that review as context) is built but not available at launch; `/megalens:review double` answers "The Double tier is not available yet; use standard or deep." and does not call the engine. Its steps are kept in `docs/double-tier-later.md`.
+### Flags and explicit review ids
 
-Options: `--quiet` turns on the engine's optional filter (off by default); the tier word (standard or deep) is the first argument; `--base REF --head REF` reviews a commit range instead of the uncommitted change.
+- `/megalens:review --runner app|github|local` forces a specific runner instead of auto-picking.
+- `/megalens:review --base REF --head REF` reviews an explicit commit range.
+- `/megalens:review --quiet` enables the engine's optional filter (off by default).
+- `/megalens:review --no-wait` starts the review without waiting in the same command.
+- `/megalens:status <id>` and `/megalens:result <id>` look up a specific review (`app:<check-id>`, `gh:<run-id>`, or `rv_<id>`) instead of the latest review for this repository.
 
-**Local runner requirements.** Use Git and Node 20 or later. Run `npm install -g megalens-review@0.1.3` to install the engine separately. Keep `megalens-review` on your PATH or set `MEGALENS_REVIEW_BIN` to its path. See `PLUGIN-NEEDS.md`.
+### Running on your own GitHub Actions runner
 
-**First-time setup:** run `node scripts/engine.mjs install` once. It calls the engine's own `install`, which downloads the pinned Codex CLI and refuses unless its hashes match; `node scripts/engine.mjs verify` re-checks it. Claude is told never to run `install` by itself. The engine needs Linux with bubblewrap, and refuses to run as root, so on a root shell every review ends "NOT COMPLETED".
+If you prefer reviews to run inside your own GitHub Actions runner instead of the MegaLens GitHub App:
 
-`/megalens:review` pre-approves only `node scripts/engine.mjs ...`. To show Claude the change it uses `engine.mjs show-change`, which runs fixed git commands itself (with the repository's own git config, external diff and file-watcher settings switched off) and does not list credential-named files.
+1. Copy `templates/megalens-dispatch.yml` to `.github/workflows/megalens-dispatch.yml` on your repository's **default branch** and push it.
+2. Store your MegaLens token as a repository secret: `gh secret set MEGALENS_TOKEN` (the plugin never reads or prints the value).
+3. Run `/megalens:review` (or `/megalens:review deep`). When the GitHub App is not installed on the repo, MegaLens picks this workflow automatically.
 
-**Sign-in:**
+`templates/megalens-dispatch.yml` pins `megalens/review-action@950eb5f1eeff21008fcf585587b88fc83546cdcf` (tag `v1.2.0`, engine `megalens-review` `0.1.3`) in all three jobs (`create`, `review`, `publish`). Only commits on GitHub are reviewed; uncommitted changes are never silently skipped.
 
-1. Token: `MEGALENS_TOKEN`, set before starting Claude Code, as for the bundle route. This is the only mode available now.
-2. Your own OpenAI key (`MEGALENS_BYO=1`) is switched off in this build ("BYO OpenAI key mode is not available yet; use your MegaLens token"). The code path is kept, but no setting turns it on, and it never falls back to the token.
-3. Your own ChatGPT/Codex login (`MEGALENS_BYO=login`) is switched off in the same way.
+### Local engine on Linux
 
-The engine receives only a short list of environment variables for the mode in use (the token and API URL for the token mode), not your whole environment.
+On Linux with bubblewrap, if `megalens-review` (`npm install -g megalens-review@0.1.3`) is on `PATH` (or `MEGALENS_REVIEW_BIN`) and `MEGALENS_TOKEN` is set in your shell, `/megalens:review` can run locally over uncommitted changes as well. Run `node scripts/engine.mjs install` once to install and hash-verify the pinned Codex CLI (`node scripts/engine.mjs verify` re-checks it). The engine refuses to run as root, and BYO OpenAI key / login modes are switched off in this build. See `PLUGIN-NEEDS.md`.
 
-**What the plugin does with results.** A partial, failed or refused review is reported as such, in the first line, and is never described as having no issues. If the engine writes no result at all, the output says the review did not complete. Finding text comes from a model: Claude is told to treat it as data and check it against your code. The plugin never prints your token, removes it (and key-shaped strings) from anything it shows, and gives the engine only an allowlisted environment. A review document that claims `complete` but ran no engine pass, or came with a failing exit code, is shown as failed or partial.
+**Later:** a Double tier (Claude reviews first, then the engine uses that review as context) is built behind a constant and not available at launch; `/megalens:review double` answers "The Double tier is not available yet; use standard or deep." Its steps are kept in `docs/double-tier-later.md`.
 
-**Files.** The engine writes its result to a private temp folder that is deleted after the result is shown. (The later Double tier also uses an owner-only temp file for Claude's own review, checked, capped at 60 findings, and deleted.)
+### Bundle MCP route (`/megalens:megalens-review`)
 
-The commands run `node scripts/engine.mjs`, which can be tested without the engine: `npm test` uses a fake `megalens-review` and makes no network or model calls.
+For setups without a GitHub repository or engine, the plugin also ships the legacy MCP bundle route:
+
+| | `/megalens:megalens-review` (token) | `/megalens:megalens-review-remote` (OAuth fallback) |
+|---|---|---|
+| Needs | `MEGALENS_TOKEN` in the environment | OAuth sign-in (`/mcp`, pick `megalens`) |
+| Who sends the code | local stdio tool (`megalens-local`, `scripts/mcp-server.mjs`) | Claude copies the bundle into the tool call |
+| Bundle limit | 200 KB default, 700 KB max (`MEGALENS_MAX_BYTES`) | 90 KB |
+
+Environment variables for `scripts/mcp-server.mjs`: `MEGALENS_TOKEN`, `MEGALENS_URL` (default `https://megalens.ai/api/mcp?ide=claude-code`), `MEGALENS_MAX_BYTES`, `MEGALENS_AUDIT_LOG`, `MEGALENS_REQUEST_TIMEOUT_MS` (default 90 s), `MEGALENS_POLL_TIMEOUT_MS` (default 25 min), `MEGALENS_PROJECT_DIR`.
+
+Preview what the collector would send with `node scripts/collect.mjs --max-bytes 200000`. Lockfiles, binaries, generated/vendored files, credential-named files, symlinks outside the repo, and secret-shaped content are skipped or redacted (`scripts/lib/safety.mjs`).
+
+`.mcp.json` declares both `megalens-local` (token) and `megalens` (OAuth). Copy `.mcp.bearer.example.json` over `.mcp.json` only for headless bearer auth on the remote server (with `MCP_CONNECTION_NONBLOCKING=false` for `claude -p`).
+
+### Other hosts: Codex, Cursor, GitHub Copilot
+
+The local MCP bundle tool (`scripts/mcp-server.mjs`) can also be installed into Codex, Cursor, or GitHub Copilot:
+
+```sh
+node scripts/install.mjs --host codex|cursor|copilot [--project|--global] [--dir REPO] [--dry-run]
+```
+
+The installer merges into existing configs, writes owner-only backups under `~/.megalens/backups/<host>/<time>/`, validates before writing, refuses symlinks, and never writes your token unless `--token-file FILE` (mode 0600) is passed.

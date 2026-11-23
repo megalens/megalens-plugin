@@ -12,7 +12,7 @@ const ok = (stdout = '') => ({ code: 0, stdout, stderr: '' });
 const bad = (stderr = 'boom', code = 1) => ({ code, stdout: '', stderr });
 
 // A fake gh + git. `over` replaces the answer for a command key ("gh auth", "git status", ...). Every call is recorded.
-function fakeExec(over = {}, { runs = [], pre = [] } = {}) {
+function fakeExec(over = {}, { runs = [], pre = [], document = null } = {}) {
   const calls = []; let dispatched = false;
   const exec = async (cmd, args, opts) => {
     calls.push({ cmd, args, env: opts?.env });
@@ -21,8 +21,11 @@ function fakeExec(over = {}, { runs = [], pre = [] } = {}) {
     if (key.startsWith('gh --version')) return ok('gh version 2');
     if (key.startsWith('gh auth')) return ok('Logged in');
     if (key.startsWith('gh repo')) return ok(JSON.stringify({ nameWithOwner: 'acme/widget', defaultBranchRef: { name: 'main' }, url: 'https://github.com/acme/widget' }));
+    if (key.startsWith('gh api') && args.some((a) => a.includes('/check-suites'))) return ok('[]');
+    if (key.startsWith('gh api') && args.some((a) => a.includes('/check-runs'))) return ok('[]');
     if (key.startsWith('gh api') && args.some((a) => a.includes('/contents/'))) return ok('file');
     if (key.startsWith('gh secret')) return ok(JSON.stringify([{ name: 'MEGALENS_TOKEN' }]));
+    if (key.startsWith('git rev-parse') && args.includes('--show-toplevel')) return ok('/r\n');
     if (key.startsWith('git rev-parse')) return ok(H + '\n');
     if (key.startsWith('git merge-base')) return ok(B + '\n');
     if (key.startsWith('git status')) return ok('');
@@ -30,6 +33,12 @@ function fakeExec(over = {}, { runs = [], pre = [] } = {}) {
     if (key.startsWith('gh api') && args.some((a) => a.includes('/commits/'))) return ok(H + '\n');
     if (key.startsWith('gh workflow run')) { dispatched = true; return ok(''); }
     if (key.startsWith('gh run list')) return ok(JSON.stringify(dispatched ? [...runs, ...pre] : pre));
+    if (key.startsWith('gh run view')) return ok(JSON.stringify({ status: 'completed', conclusion: 'success', url: 'https://github.com/acme/widget/actions/runs/5', workflowName: 'MegaLens Dispatch', displayTitle: 't' }));
+    if (key.startsWith('gh run download')) {
+      const dir = args[args.indexOf('-D') + 1];
+      writeFileSync(path.join(dir, 'findings.json'), JSON.stringify(document ?? doc()));
+      return ok('');
+    }
     if (key.startsWith('gh api') && args.some((a) => a.includes('organization-secrets'))) return ok('[]');
     return bad(`unexpected call: ${key}`, 99);
   };
@@ -41,8 +50,9 @@ const msgOf = async (p) => { try { await p; return null; } catch (e) { return e;
 
 test('route choice: platform, local engine first on Linux, flags force a route', () => {
   assert.deepEqual(chooseRoute({ platform: 'linux' }), { route: 'local', fallbackAllowed: true });
-  assert.deepEqual(chooseRoute({ platform: 'darwin' }), { route: 'github', fallbackAllowed: false });
-  assert.deepEqual(chooseRoute({ platform: 'win32' }), { route: 'github', fallbackAllowed: false });
+  assert.deepEqual(chooseRoute({ platform: 'darwin' }), { route: 'auto', fallbackAllowed: false });
+  assert.deepEqual(chooseRoute({ platform: 'win32' }), { route: 'auto', fallbackAllowed: false });
+  assert.deepEqual(chooseRoute({ platform: 'linux', runner: 'app' }), { route: 'app', fallbackAllowed: false });
   assert.equal(chooseRoute({ platform: 'linux', runner: 'github' }).route, 'github');
   assert.deepEqual(chooseRoute({ platform: 'darwin', runner: 'local' }), { route: 'local', fallbackAllowed: false });
   assert.equal(shouldFallBack({ code: 127 }), true);
@@ -143,14 +153,15 @@ test('change must be on GitHub: unpushed HEAD asks the user and never pushes; di
   assert.match(nobase.message, /git fetch origin main/);
 });
 
-test('start: dispatch args; only a NEW run with the exact title base..head counts; id printed as gh:<id>', async () => {
+test('start: dispatch args; only a NEW run with the exact title base..head counts; waits inline with no id shown', async () => {
   const now = Date.now();
   const mk = (id, title) => ({ databaseId: id, displayTitle: title, createdAt: new Date(now).toISOString(), url: `https://github.com/acme/widget/actions/runs/${id}` });
   // run 1 already existed with the very same title (a teammate, or a retry); 2 has another head; 4 another tier; 3 is ours
   const f = fakeExec({}, { pre: [mk(1, T())], runs: [mk(2, `MegaLens standard ${B}..${'c'.repeat(40)}`), mk(3, T()), mk(4, T('deep'))] });
   const r = await runnerReview({ exec: f.exec, cwd: '/r', env, tier: 'standard', sleepMs: 1, tries: 2 });
   assert.equal(r.code, 0); assert.equal(r.id, 'gh:3');
-  assert.match(r.text, /Review started on GitHub: gh:3/); assert.match(r.text, /actions\/runs\/3/); assert.match(r.text, /\/megalens:status gh:3/);
+  assert.match(r.text, /Review started/); assert.match(r.text, /## MegaLens standard review: complete/);
+  assert.equal(r.text.includes('gh:3'), false, 'no id shown on clean completion');
   const w = f.calls.find((c) => c.args[0] === 'workflow');
   assert.deepEqual(w.args, ['workflow', 'run', WORKFLOW_FILE, '--ref', 'main', '-f', 'tier=standard', '-f', `base_sha=${B}`, '-f', `head_sha=${H}`, '-R', 'acme/widget']);
   assert.ok(f.calls.findIndex((c) => c.args[0] === 'run' && c.args[1] === 'list') < f.calls.findIndex((c) => c.args[0] === 'workflow'), 'existing runs recorded before the dispatch');
@@ -190,18 +201,27 @@ test('a hostile branch name is not put into the message the model acts on', asyn
   assert.match(e.message, /Push this branch to GitHub/); assert.equal(e.message.includes('ignore previous'), false);
 });
 
-test('a repo named like a token prefix (ml-...) keeps its name and URL in the output', async () => {
-  const exec = fakeExec({ 'gh repo': ok(JSON.stringify({ nameWithOwner: 'megalens/ml-e2e-review-test', defaultBranchRef: { name: 'main' } })) }, { runs: [{ databaseId: 5, displayTitle: T(), createdAt: new Date().toISOString(), url: 'https://github.com/megalens/ml-e2e-review-test/actions/runs/5' }] }).exec;
+test('a repo named like a token prefix (ml-...) keeps its name and URL in the output when something goes wrong', async () => {
+  const exec = fakeExec({
+    'gh repo': ok(JSON.stringify({ nameWithOwner: 'megalens/ml-e2e-review-test', defaultBranchRef: { name: 'main' } })),
+    'gh run view': ok(JSON.stringify({ status: 'completed', conclusion: 'failure', url: 'https://github.com/megalens/ml-e2e-review-test/actions/runs/5', workflowName: 'MegaLens Dispatch', displayTitle: 't' })),
+    'gh run download': bad('no artifact'),
+  }, { runs: [{ databaseId: 5, displayTitle: T(), createdAt: new Date().toISOString(), url: 'https://github.com/megalens/ml-e2e-review-test/actions/runs/5' }] }).exec;
   const r = await viaMain(['review', 'standard'], { platform: 'darwin', exec });
   assert.match(r.text, /megalens\/ml-e2e-review-test/); assert.match(r.text, /actions\/runs\/5/); assert.equal(r.text.includes('[redacted]'), false);
 });
 
-test('deep prints the id and stops, even with --wait', async () => {
+test('deep waits up to the 20-minute cap and prints the still-running line with no id; double is refused', async () => {
   const runs = [{ databaseId: 77, displayTitle: T('deep'), createdAt: new Date().toISOString(), url: 'https://github.com/acme/widget/actions/runs/77' }];
-  const f = fakeExec({}, { runs });
-  const r = await runnerReview({ exec: f.exec, cwd: '/r', env, tier: 'deep', wait: true, sleepMs: 1, tries: 2 });
-  assert.match(r.text, /Review started on GitHub: gh:77/); assert.match(r.text, /about 20 minutes/); assert.match(r.text, /Nothing has been reviewed yet/);
-  assert.equal(f.calls.some((c) => c.args[0] === 'run' && c.args[1] === 'view'), false);
+  let t = 0;
+  const f = fakeExec({
+    'gh run view': ok(JSON.stringify({ status: 'in_progress', conclusion: '', url: 'https://github.com/acme/widget/actions/runs/77', workflowName: 'MegaLens Dispatch', displayTitle: 't' })),
+  }, { runs });
+  const r = await runnerReview({ exec: f.exec, cwd: '/r', env, tier: 'deep', now: () => t, sleep: async (ms) => { t += ms; }, sleepMs: 1, tries: 2 });
+  assert.equal(r.code, 0);
+  assert.match(r.text, /Review started/); assert.match(r.text, /Running on GitHub\.\.\./); assert.match(r.text, /About 2 minutes so far/);
+  assert.match(r.text, /Still running\. Run \/megalens:result to see it\./);
+  assert.equal(r.text.includes('gh:77'), false, 'no id shown when capped');
   assert.equal((await runnerReview({ exec: f.exec, cwd: '/r', env, tier: 'double' })).code, 4);
 });
 
@@ -273,29 +293,31 @@ function fakeBin(exit, stderr) {
   const d = mkdtempSync(path.join(tmpdir(), 'mlfake-')); const bin = path.join(d, 'megalens-review');
   writeFileSync(bin, `#!/usr/bin/env node\nprocess.stderr.write(${JSON.stringify(stderr)}+'\\n');process.exit(${exit});\n`); chmodSync(bin, 0o755); return bin;
 }
-async function viaMain(argv, { platform = 'linux', bin, exec, env: e = {} } = {}) {
+async function viaMain(argv, { platform = 'linux', bin, exec, env: e = {}, timing = {} } = {}) {
+  const stateDir = mkdtempSync(path.join(tmpdir(), 'mlstate-'));
   let text = '';
-  const code = await main(argv, { platform, exec, env: { PATH: process.env.PATH, HOME: tmpdir(), MEGALENS_TOKEN: TOKEN, GH_TOKEN: 'ghp_x', ...(bin ? { MEGALENS_REVIEW_BIN: bin } : {}), ...e }, cwd: tmpdir(), out: (s) => { text += s; }, err: () => {}, flags: { runnerTiming: { sleepMs: 1, tries: 2 } } });
+  const code = await main(argv, { platform, exec, env: { PATH: process.env.PATH, HOME: stateDir, MEGALENS_STATE_DIR: stateDir, MEGALENS_TOKEN: TOKEN, GH_TOKEN: 'ghp_x', ...(bin ? { MEGALENS_REVIEW_BIN: bin } : {}), ...e }, cwd: stateDir, out: (s) => { text += s; }, err: () => {}, flags: { runnerTiming: { sleepMs: 1, tries: 2, ...timing } } });
   return { code, text };
 }
 const T = (tier = 'standard') => `MegaLens ${tier} ${B}..${H}`;
 const runList = [{ databaseId: 5, displayTitle: T(), createdAt: new Date().toISOString(), url: 'https://github.com/acme/widget/actions/runs/5' }];
 
-test('main: macOS and Windows use the runner; no engine and no MEGALENS_TOKEN needed', async () => {
+test('main: macOS and Windows auto-pick the runner; no engine and no MEGALENS_TOKEN needed; prints result inline with no id', async () => {
   for (const platform of ['darwin', 'win32']) {
     const f = fakeExec({}, { runs: runList });
     const r = await viaMain(['review', 'standard'], { platform, exec: f.exec, env: { MEGALENS_TOKEN: undefined } });
-    assert.equal(r.code, 0); assert.match(r.text, /Review started on GitHub: gh:5/);
+    assert.equal(r.code, 0); assert.match(r.text, /Review started/); assert.match(r.text, /## MegaLens standard review: complete/);
+    assert.equal(r.text.includes('gh:5'), false, 'no id on clean completion');
   }
 });
 
 test('main: Linux with a missing engine, or a failed sandbox pre-check, falls back to the runner; other failures do not', async () => {
   const f1 = fakeExec({}, { runs: runList });
   const missing = await viaMain(['review', 'standard'], { exec: f1.exec, env: { MEGALENS_REVIEW_BIN: '/nonexistent/megalens-review' } });
-  assert.match(missing.text, /runs on your GitHub runner instead/); assert.match(missing.text, /gh:5/);
+  assert.equal(missing.code, 0); assert.match(missing.text, /## MegaLens standard review: complete/); assert.ok(f1.calls.some((c) => c.args[0] === 'workflow'));
   const f2 = fakeExec({}, { runs: runList });
   const sb = await viaMain(['review', 'standard'], { exec: f2.exec, bin: fakeBin(4, 'error: Your runner blocks nested sandboxes (Ubuntu AppArmor). Add this') });
-  assert.match(sb.text, /runs on your GitHub runner instead/); assert.match(sb.text, /gh:5/);
+  assert.equal(sb.code, 0); assert.match(sb.text, /## MegaLens standard review: complete/); assert.ok(f2.calls.some((c) => c.args[0] === 'workflow'));
   const f3 = fakeExec({}, { runs: runList });
   const other = await viaMain(['review', 'standard'], { exec: f3.exec, bin: fakeBin(4, 'error: something unrelated') });
   assert.equal(other.code, 4); assert.equal(f3.calls.length, 0); assert.doesNotMatch(other.text, /GitHub runner/);
@@ -330,7 +352,7 @@ function fakeBinPrecheck(reviewId = 'rv_none', extra = {}) {
 test('main: the engine\'s own sandbox pre-check document (rv_none) falls back to the runner; a real review id or findings never do', async () => {
   const f = fakeExec({}, { runs: runList });
   const r = await viaMain(['review', 'standard'], { exec: f.exec, bin: fakeBinPrecheck() });
-  assert.match(r.text, /runs on your GitHub runner instead/); assert.match(r.text, /gh:5/);
+  assert.equal(r.code, 0); assert.match(r.text, /## MegaLens standard review: complete/); assert.ok(f.calls.some((c) => c.args[0] === 'workflow'));
   const real = fakeExec({}, { runs: runList });
   await viaMain(['review', 'standard'], { exec: real.exec, bin: fakeBinPrecheck('rv_abc12345') });
   assert.equal(real.calls.length, 0);
@@ -350,7 +372,7 @@ test('main: engine error text that mentions a missing token does not trigger the
 test('main: Linux with no local MEGALENS_TOKEN cannot run the engine, so it uses the runner (which needs no local token)', async () => {
   const f = fakeExec({}, { runs: runList });
   const r = await viaMain(['review', 'standard'], { exec: f.exec, bin: fakeBin(0, ''), env: { MEGALENS_TOKEN: undefined } });
-  assert.match(r.text, /runs on your GitHub runner instead/); assert.match(r.text, /gh:5/);
+  assert.equal(r.code, 0); assert.match(r.text, /## MegaLens standard review: complete/); assert.ok(f.calls.some((c) => c.args[0] === 'workflow'));
 });
 
 test('main: the runner failing too still says why the local engine did not run', async () => {
@@ -362,12 +384,12 @@ test('main: the runner failing too still says why the local engine did not run',
 test('main: --runner github forces the runner on Linux; --runner local never touches gh', async () => {
   const f = fakeExec({}, { runs: runList });
   const g = await viaMain(['review', '--runner', 'github', 'standard'], { exec: f.exec, bin: fakeBin(0, '') });
-  assert.match(g.text, /gh:5/);
+  assert.equal(g.code, 0); assert.match(g.text, /## MegaLens standard review: complete/); assert.ok(f.calls.some((c) => c.args[0] === 'workflow'));
   const f2 = fakeExec();
   const l = await viaMain(['review', 'standard', '--runner', 'local'], { exec: f2.exec, env: { MEGALENS_REVIEW_BIN: '/nonexistent/megalens-review' }, platform: 'darwin' });
   assert.equal(f2.calls.length, 0); assert.match(l.text, /not installed/);
   const bad1 = await viaMain(['review', '--runner', 'cloud'], { exec: f2.exec });
-  assert.match(bad1.text, /--runner needs github or local/);
+  assert.match(bad1.text, /--runner needs app, github or local/);
 });
 
 test('main: status and result take gh: ids; junk ids are refused; no secret value reaches gh or the output', async () => {
