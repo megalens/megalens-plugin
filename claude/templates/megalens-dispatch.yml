@@ -49,7 +49,7 @@ jobs:
             exit 1
           fi
       - id: create
-        uses: megalens/review-action@38aae94fbc4f4bdb05964c249d106c1c13cb632c # v1.3.0
+        uses: megalens/review-action@3adef5e41760c99d9d52f96a7b3c0decdea24a5f # v1.3.1
         with:
           mode: create
           tier: ${{ inputs.tier }}
@@ -80,13 +80,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: megalens/review-action@38aae94fbc4f4bdb05964c249d106c1c13cb632c # v1.3.0
+      - uses: megalens/review-action@3adef5e41760c99d9d52f96a7b3c0decdea24a5f # v1.3.1
         env:
           MEGALENS_REVIEW_ID: ${{ needs.create.outputs.review_id }}
           MEGALENS_REVIEW_KEY: ${{ needs.create.outputs.review_key }}
         with:
           mode: review
-          engine-version: '0.1.5'
+          engine-version: '0.1.8'
           tier: ${{ inputs.tier }}
           head-sha: ${{ needs.create.outputs.head_sha }}
           base-sha: ${{ needs.create.outputs.base_sha }}
@@ -123,7 +123,7 @@ jobs:
           name: ${{ needs.review.outputs.artifact_name }}
           path: ${{ runner.temp }}
 
-      - uses: megalens/review-action@38aae94fbc4f4bdb05964c249d106c1c13cb632c # v1.3.0
+      - uses: megalens/review-action@3adef5e41760c99d9d52f96a7b3c0decdea24a5f # v1.3.1
         with:
           mode: publish
           tier: ${{ inputs.tier }}

@@ -1,10 +1,10 @@
 {
   "version": "0.2.0",
-  "engine": "0.1.5",
+  "engine": "0.1.8",
   "actions": {
     "MEGALENS": {
-      "tag": "v1.3.0",
-      "sha": "38aae94fbc4f4bdb05964c249d106c1c13cb632c"
+      "tag": "v1.3.1",
+      "sha": "3adef5e41760c99d9d52f96a7b3c0decdea24a5f"
     },
     "CHECKOUT": {
       "tag": "v4.2.2",
