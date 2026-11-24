@@ -392,7 +392,7 @@ export async function main(argv, {
       const repoKey = existingKey ?? await prepare((callSignal) => repoKeyPromise(true, callSignal));
       let streamed = false;
       const r = await runnerReview({
-        exec, cwd, env, tier: o.tier, base: o.base, head: o.head, wait: o.wait,
+        exec, cwd, env, tier: o.tier, base: o.base, head: o.head, wait: o.wait, allowGateway: o.allowGateway,
         ...timing, t0, signal, preRepo,
         onLine: (s) => { streamed = true; sayExact(s); },
         saveLatest: (rec) => saveLatestReview({ env, repoKey, ...rec, now: nowFn }),

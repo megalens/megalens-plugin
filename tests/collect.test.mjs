@@ -63,15 +63,15 @@ test('lockfiles, binaries, generated, vendored and secret files are skipped and 
   put(d, 'dist/app.js', 'var a=1;\n');
   put(d, 'src/api.generated.ts', '// @generated\nexport const g = 1;\n');
   put(d, 'node_modules/x/index.js', 'x\n');
-  put(d, '.env', 'SECRET_KEY=abc123\n');
+  put(d, '.netrc', 'SECRET_KEY=abc123\n');
   put(d, 'blob.dat', 'ab\0cd\0');
   put(d, 'src/pricing.js', 'export function price(q) {\n  return q * 12;\n}\n');
   const r = collect(d);
   const b = bundleOf(r.out);
-  for (const bad of ['package-lock.json', 'logo.png', 'dist/app.js', 'api.generated.ts', 'node_modules', '.env', 'blob.dat', 'abc123']) assert.ok(!b.includes(bad), `${bad} must not be in the bundle`);
+  for (const bad of ['package-lock.json', 'logo.png', 'dist/app.js', 'api.generated.ts', 'node_modules', '.netrc', 'blob.dat', 'abc123']) assert.ok(!b.includes(bad), `${bad} must not be in the bundle`);
   const manifest = r.out.split('<<<BUNDLE START')[0];
   assert.match(manifest, /package-lock\.json: .*lockfile/);
-  assert.match(manifest, /\.env: .*secret/);
+  assert.match(manifest, /\.netrc: .*secret/);
   assert.match(manifest, /logo\.png: .*binary/);
   assert.match(manifest, /api\.generated\.ts: .*generated/);
   rmSync(d, { recursive: true });

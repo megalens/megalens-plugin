@@ -1,0 +1,28 @@
+{
+  "name": "megalens-cursor-plugin",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "GUIDE.md",
+    ".cursor-plugin/plugin.json",
+    "assets/logo.svg",
+    "commands/megalens-fix-prompt.md",
+    "commands/megalens-login.md",
+    "commands/megalens-result.md",
+    "commands/megalens-review.md",
+    "commands/megalens-status.md",
+    "mcp.json",
+    "rules/megalens.mdc",
+    "scripts/cursor-cli.mjs",
+    "scripts/cursor-mcp-server.mjs",
+    "scripts/lib/browser-auth.mjs",
+    "scripts/lib/cursor-commands.mjs",
+    "scripts/lib/cursor-deeplink.mjs",
+    "scripts/lib/engine-core.mjs",
+    "scripts/lib/gh-runner.mjs",
+    "skills/megalens-code-review/SKILL.md",
+    "templates/megalens-dispatch.yml"
+  ]
+}

@@ -4,7 +4,7 @@
 // MEGALENS_TOKEN is sent only in the Authorization: Bearer header to a validated MegaLens API origin; it is never
 // passed to `gh`/`git` subprocesses, never put in CLI args or URLs, never stored in bookmarks, and never printed.
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,12 +15,15 @@ export const WORKFLOW_FILE = 'megalens-dispatch.yml';
 export const WORKFLOW_PATH = `.github/workflows/${WORKFLOW_FILE}`;
 export const WORKFLOW_NAME = 'MegaLens Dispatch';
 export const ARTIFACT_NAME = 'megalens-findings';
+const RETRY_ARTIFACT_NAME = 'megalens-findings-retry';
 export const SECRET_NAME = 'MEGALENS_TOKEN';
 export const CHECK_NAME = 'MegaLens review';
 export const APP_INSTALL_URL = 'https://megalens.ai/app/start';
 export const APP_BILLING_URL = 'https://megalens.ai/app/settings/billing';
 export const DEFAULT_APP_ORIGIN = 'https://megalens.ai';
 export const APP_PATH_ENABLED = true;
+export const ACTION_GATEWAY_NOTICE = 'The diff and code excerpts pass through the MegaLens gateway to OpenAI. MegaLens does not keep your code; it passes through our gateway to the AI provider for the review and is not stored.';
+export const ACTION_TOKEN_SETUP = `Run \`npx megalens-review init\` in your repository and sign in through your browser. It passes the token to \`gh\` on stdin to set the \`${SECRET_NAME}\` repository secret without asking you to paste it. Decline the separate pull request for automatic PR reviews. If browser setup is unavailable, create an Action token at https://megalens.ai/app/settings/mcp and enter it at the private terminal prompt from \`gh secret set ${SECRET_NAME}\`.`;
 export const RUN_ID_RE = /^gh:([1-9][0-9]{0,17})$/;
 export const APP_JOB_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 export const APP_ID_RE = /^app:([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
@@ -404,7 +407,7 @@ export const MSG = {
   noGh: 'GitHub CLI (`gh`) is not installed. Install it from https://cli.github.com, then run `gh auth login`, then run this again.',
   noLogin: 'GitHub CLI (`gh`) is not logged in. Run `gh auth login`, then run this again.',
   noRemote: 'This folder has no GitHub remote, so the review cannot run on GitHub. Create or connect the repository: `gh repo create` (new) or `git remote add origin https://github.com/OWNER/REPO.git` (existing), push, then run this again.',
-  noSecret: `The repository secret ${SECRET_NAME} is missing. Set it once with \`gh secret set ${SECRET_NAME}\` (gh asks for the value; paste your MegaLens token there, not into the chat), then run this again.`,
+  noSecret: `The repository secret ${SECRET_NAME} is missing. ${ACTION_TOKEN_SETUP} Then run this again.`,
   secretUnknown: `Could not check the repository secret ${SECRET_NAME} (no permission to list secrets). Going on; if it is missing the run fails at its first job and no review is charged.`,
   uncommitted: 'Note: uncommitted changes are not reviewable on GitHub. Only commits that are on GitHub are reviewed. Commit and push them first if you want them reviewed.',
   dirtyStop: 'You have uncommitted changes, and GitHub can only review commits that are on GitHub, so it would review a different change than the one you are editing. Nothing was started and no credit was used. Commit and push your changes, then run this again. (On Linux with the local engine, `--runner local` reviews uncommitted changes. To review only the commits already on GitHub, name the range: `--base <ref> --head HEAD`.)',
@@ -455,7 +458,7 @@ async function ghRepoPreflight({ exec, cwd, env, signal = null }) {
     if (ghIsSignedOut(au)) throw new GhUnavailableError(MSG.noLogin);
     throw new SetupError(MSG.noLogin);
   }
-  const rv = await run('gh', ['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef,url']);
+  const rv = await run('gh', ['repo', 'view', '--json', 'nameWithOwner,defaultBranchRef,url,isInOrganization']);
   const repo = rv.code === 0 ? jsonOf(rv.stdout) : null;
   if (!repo || typeof repo.nameWithOwner !== 'string' || !NWO_RE.test(repo.nameWithOwner) || typeof repo.defaultBranchRef?.name !== 'string') throw new SetupError(MSG.noRemote);
   const nwo = repo.nameWithOwner; const defaultBranch = repo.defaultBranchRef.name;
@@ -480,7 +483,7 @@ async function ghRepoPreflight({ exec, cwd, env, signal = null }) {
     host = envHost;
     isGithubCom = false;
   }
-  return { nwo, defaultBranch, host, isGithubCom, hasGh: true };
+  return { nwo, defaultBranch, isInOrganization: repo.isInOrganization, host, isGithubCom, hasGh: true };
 }
 
 /**
@@ -524,11 +527,19 @@ export async function verifyAppBookmarkRepo({ exec = realExec, cwd, env, saved, 
   return { valid: true, repo };
 }
 
-/** True when the dispatch workflow file is present on the default branch. */
-export async function hasDispatchWorkflow({ exec, cwd, env, nwo, defaultBranch, signal = null }) {
-  if (!defaultBranch) return false;
-  const wf = await exec('gh', ['api', '-X', 'GET', `repos/${nwo}/contents/${WORKFLOW_PATH}`, '-f', `ref=${defaultBranch}`, '--jq', '.type'], { cwd, env: ghEnv(env), signal });
-  return wf.code === 0 && wf.stdout.trim() === 'file';
+/** Read the dispatch inputs from the workflow installed on the default branch. */
+async function dispatchWorkflow({ exec, cwd, env, nwo, defaultBranch, signal = null }) {
+  if (!defaultBranch) return null;
+  const fields = '[.type, (.content // "" | gsub("[\\r\\n]"; ""))] | @tsv';
+  const wf = await exec('gh', ['api', '-X', 'GET', `repos/${nwo}/contents/${WORKFLOW_PATH}`, '-f', `ref=${defaultBranch}`, '--jq', fields], { cwd, env: ghEnv(env), signal });
+  const [type, encoded = ''] = wf.stdout.trimEnd().split('\t');
+  if (wf.code !== 0 || type !== 'file') return null;
+  const yaml = Buffer.from(encoded, 'base64').toString('utf8');
+  return { hasGatewayInput: /^ {6}allow_gateway:[ \t]*(?:#.*)?\r?$/m.test(yaml) };
+}
+
+export async function hasDispatchWorkflow(opts) {
+  return (await dispatchWorkflow(opts)) !== null;
 }
 
 /**
@@ -622,10 +633,8 @@ export async function detectRemoteRunner({ exec, cwd, env, fetch = globalThis.fe
       return { runner: 'none', message: 'Interrupted before starting a review. Nothing was started by this command.' };
     }
     if (appSt.ready) {
-      const hasWorkflow = needWorkflow
-        ? await hasDispatchWorkflow({ exec, cwd, env, nwo, defaultBranch, signal })
-        : false;
-      return { runner: 'app', nwo, defaultBranch, host, isGithubCom, hasGh: true, hasWorkflow };
+      const workflow = needWorkflow ? await dispatchWorkflow({ exec, cwd, env, ...repo, signal }) : null;
+      return { runner: 'app', ...repo, hasWorkflow: Boolean(workflow), ...workflow };
     }
     // Require a definitive fallback signal (App uninstalled/unlinked or feature flag off/404) before checking Actions.
     // A transient 503/429/network outage or auth/setup block on a linked repo must NEVER fall through to dispatch Actions.
@@ -639,8 +648,8 @@ export async function detectRemoteRunner({ exec, cwd, env, fetch = globalThis.fe
     }
   }
 
-  const hasWorkflow = await hasDispatchWorkflow({ exec, cwd, env, nwo, defaultBranch, signal });
-  if (hasWorkflow) return { runner: 'github', nwo, defaultBranch, host, isGithubCom, hasGh: true, hasWorkflow: true };
+  const workflow = await dispatchWorkflow({ exec, cwd, env, ...repo, signal });
+  if (workflow) return { runner: 'github', ...repo, hasWorkflow: true, ...workflow };
 
   if (!isGithubCom && host && host !== 'github.com') {
     return { runner: 'none', message: MSG.appEnterpriseUnsupported(host) };
@@ -654,32 +663,39 @@ async function worktreeDirty(run) {
   return Boolean(status.stdout.trim());
 }
 
+/** Check secret names only. GitHub can return 404 when the caller lacks access to an organization's secrets. */
+export async function actionSecretStatus(run, nwo, isInOrganization) {
+  const sl = await run('gh', ['secret', 'list', '--json', 'name', '-R', nwo]);
+  const names = sl.code === 0 ? jsonOf(sl.stdout) : null;
+  if (!Array.isArray(names)) {
+    const noPermission = /HTTP 403|HTTP 404|Resource not accessible|not accessible by integration|must have admin/i;
+    if (noPermission.test(sl.stderr)) return { present: 'unknown', note: MSG.secretUnknown };
+    return { present: 'unknown', error: firstLine(sl.stderr) };
+  }
+  if (names.some((s) => s?.name === SECRET_NAME)) return { present: true };
+  if (isInOrganization === false) return { present: false };
+
+  // gh secret list shows repository secrets only. An organization secret shared with this repository also works.
+  const og = await run('gh', ['api', '-X', 'GET', `repos/${nwo}/actions/organization-secrets`, '-f', 'per_page=100', '--paginate', '--jq', '[.secrets[].name]']);
+  if (og.code === 0) {
+    const pages = og.stdout.split('\n').map((l) => l.trim()).filter(Boolean).map(jsonOf);
+    if (pages.length && pages.every(Array.isArray)) return { present: pages.some((page) => page.includes(SECRET_NAME)) };
+  }
+  return { present: 'unknown', note: MSG.orgSecretUnknown };
+}
+
 /** Everything the GitHub Actions runner needs before it starts. Throws SetupError with a message naming the exact fix. */
 export async function preflight({ exec, cwd, env, base = null, head = null, preRepo = null, signal = null }) {
   const run = (cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal });
-  const { nwo, defaultBranch } = preRepo ?? await ghRepoPreflight({ exec, cwd, env, signal });
+  const repo = preRepo ?? await ghRepoPreflight({ exec, cwd, env, signal });
+  const { nwo, defaultBranch } = repo;
+  const workflow = typeof repo.hasGatewayInput === 'boolean' ? repo : await dispatchWorkflow({ exec, cwd, env, ...repo, signal });
+  if (!workflow) throw new SetupError(workflowMissingMessage(defaultBranch));
 
-  if (!preRepo && !(await hasDispatchWorkflow({ exec, cwd, env, nwo, defaultBranch, signal }))) throw new SetupError(workflowMissingMessage(defaultBranch));
-
-  let note = '';
-  const sl = await run('gh', ['secret', 'list', '--json', 'name', '-R', nwo]);
-  const names = sl.code === 0 ? jsonOf(sl.stdout) : null;
-  const NO_PERMISSION = /HTTP 403|HTTP 404|Resource not accessible|not accessible by integration|must have admin/i;
-  if (Array.isArray(names)) {
-    if (!names.some((s) => s?.name === SECRET_NAME)) {
-      const og = await run('gh', ['api', '-X', 'GET', `repos/${nwo}/actions/organization-secrets`, '-f', 'per_page=100', '--paginate', '--jq', '[.secrets[].name]']);
-      let onames = null;
-      if (og.code === 0) {
-        const pages = og.stdout.split('\n').map((l) => l.trim()).filter(Boolean).map(jsonOf);
-        if (pages.length && pages.every(Array.isArray)) onames = pages.flat();
-      }
-      if (Array.isArray(onames)) { if (!onames.includes(SECRET_NAME)) throw new SetupError(MSG.noSecret); }
-      else if (og.code !== 0 && /HTTP 404|not an organization|not found/i.test(og.stderr)) throw new SetupError(MSG.noSecret);
-      else note = `${MSG.orgSecretUnknown}\n`;
-    }
-  }
-  else if (NO_PERMISSION.test(sl.stderr)) note = `${MSG.secretUnknown}\n`;
-  else throw new SetupError(MSG.secretCheckFailed(scrub(firstLine(sl.stderr), env)));
+  const secret = await actionSecretStatus(run, nwo, repo.isInOrganization);
+  if (secret.present === false) throw new SetupError(MSG.noSecret);
+  if (secret.error !== undefined) throw new SetupError(MSG.secretCheckFailed(scrub(secret.error, env)));
+  let note = secret.note ? `${secret.note}\n` : '';
 
   const headRef = head ?? 'HEAD';
   const hs = await run('git', ['rev-parse', '--verify', `${headRef}^{commit}`]);
@@ -704,7 +720,7 @@ export async function preflight({ exec, cwd, env, base = null, head = null, preR
     const bn = br.stdout.trim();
     throw new SetupError(notPushedMessage(headSha, /^[\w./-]{1,100}$/.test(bn) ? bn : ''), { needsUser: true });
   }
-  return { nwo, defaultBranch, baseSha, headSha, note };
+  return { nwo, defaultBranch, baseSha, headSha, note, hasGatewayInput: workflow.hasGatewayInput };
 }
 
 export const runTitle = (tier, baseSha, headSha) => `MegaLens ${tier} ${baseSha}..${headSha}`;
@@ -736,6 +752,7 @@ export async function startRun({
   env,
   tier,
   pre,
+  allowGateway,
   sleepMs = 2000,
   tries = 15,
   sleep = defaultSleep,
@@ -745,6 +762,9 @@ export async function startRun({
   t0 = now(),
   waitMs = Infinity,
 }) {
+  if (pre.hasGatewayInput && allowGateway !== true) {
+    throw new SetupError(`${ACTION_GATEWAY_NOTICE} Nothing was started. To approve this transfer for this review, run it again with --allow-gateway.`);
+  }
   const remaining = () => (Number.isFinite(waitMs) ? Math.max(0, waitMs - Math.max(0, now() - t0)) : Infinity);
   const preList = await raceWithDeadline(
     (callSignal) => listRuns((cmd, args) => exec(cmd, args, { cwd, env: ghEnv(env), signal: callSignal }), pre.nwo),
@@ -785,8 +805,10 @@ export async function startRun({
     return { status: 'none' };
   };
 
+  const dispatchArgs = ['workflow', 'run', WORKFLOW_FILE, '--ref', pre.defaultBranch, '-f', `tier=${tier}`, '-f', `base_sha=${pre.baseSha}`, '-f', `head_sha=${pre.headSha}`, '-R', pre.nwo];
+  if (pre.hasGatewayInput) dispatchArgs.push('-f', 'allow_gateway=true');
   const dispatchRes = await raceWithDeadline(
-    (callSignal) => exec('gh', ['workflow', 'run', WORKFLOW_FILE, '--ref', pre.defaultBranch, '-f', `tier=${tier}`, '-f', `base_sha=${pre.baseSha}`, '-f', `head_sha=${pre.headSha}`, '-R', pre.nwo], { cwd, env: ghEnv(env), signal: callSignal }),
+    (callSignal) => exec('gh', dispatchArgs, { cwd, env: ghEnv(env), signal: callSignal }),
     { signal, remainingMs: remaining(), now, t0, waitMs },
   );
   const r = dispatchRes.interrupted ? { code: 4, stdout: '', stderr: '', aborted: true } : dispatchRes.value;
@@ -915,24 +937,42 @@ export async function runnerResult(ctx, rawId, { showId = true, showRange = fals
   }
   const dir = mkdtempSync(path.join(tmpdir(), 'megalens-'), { mode: 0o700 });
   try {
-    const d = await ctx.exec('gh', scoped(['run', 'download', id, '-n', ARTIFACT_NAME, '-D', dir], nwo), { cwd: ctx.cwd, env: ghEnv(ctx.env), signal: ctx.signal ?? null });
-    if (d.aborted || ctx.signal?.aborted) return { text: '', code: 4, aborted: true };
     let doc = null;
-    const file = path.join(dir, 'findings.json');
-    if (d.code === 0) { try { if (statSync(file).size <= MAX_FINDINGS) doc = JSON.parse(readFileSync(file, 'utf8')); } catch { doc = null; } }
-    const valid = doc && typeof doc === 'object' && doc.schema === 'megalens.findings/v1' && Array.isArray(doc.findings);
-    const passes = valid && Array.isArray(doc.passes) ? doc.passes : [];
-    const eff = valid ? effectiveStatus(doc, passes, passes.filter((p) => p && p.status === 'failed'), state === 'done' ? 0 : 4) : 'failed';
-    const ok = state === 'done' && valid && eff !== 'failed';
+    let stderrText = '';
+    for (const artifact of [ARTIFACT_NAME, RETRY_ARTIFACT_NAME]) {
+      if (ctx.signal?.aborted) return { text: '', code: 4, aborted: true };
+      const dest = path.join(dir, artifact);
+      mkdirSync(dest);
+      const result = await ctx.exec('gh', scoped(['run', 'download', id, '-n', artifact, '-D', dest], nwo), {
+        cwd: ctx.cwd, env: ghEnv(ctx.env), signal: ctx.signal ?? null,
+      });
+      if (result.aborted || ctx.signal?.aborted) return { text: '', code: 4, aborted: true };
+      stderrText ||= firstLine(result.stderr);
+      if (result.code !== 0) continue;
+      const file = path.join(dest, 'findings.json');
+      try {
+        const artifactFile = lstatSync(file);
+        if (!artifactFile.isFile() || artifactFile.size > MAX_FINDINGS) continue;
+        const candidate = JSON.parse(readFileSync(file, 'utf8'));
+        if (candidate?.schema === 'megalens.findings/v1' && Array.isArray(candidate.findings)) {
+          doc = candidate;
+          break;
+        }
+      } catch { /* Try the other artifact if this file is unavailable or invalid. */ }
+    }
+    const passes = Array.isArray(doc?.passes) ? doc.passes : [];
+    const eff = doc ? effectiveStatus(doc, passes, passes.filter((p) => p && p.status === 'failed'), state === 'done' ? 0 : 4) : 'failed';
+    const ok = state === 'done' && eff !== 'failed';
     const somethingWrong = !ok || eff !== 'complete';
     const text = scrub(renderResult(doc, {
       exit: state === 'done' ? 0 : 4,
-      stderrText: doc ? '' : firstLine(d.stderr) || `no ${ARTIFACT_NAME} artifact on that run (it may have expired or never been written)`,
+      stderrText: doc ? '' : stderrText || 'no readable MegaLens findings artifact on that run',
       showId: showId || somethingWrong,
     }), ctx.env);
     const url = String(v.j.url ?? '').slice(0, 300);
     const trailer = (showId || somethingWrong) ? `${somethingWrong && !showId ? `Review id: gh:${id}\n` : ''}Run: ${url}\n` : '';
-    return { text: `${text}${trailer}${rangeLine}`, code: ok ? 0 : 4, doc };
+    const recovery = doc ? '' : 'Check the same run for delivery errors. Avoid starting a new review to retrieve these findings because that can incur another charge.\n';
+    return { text: `${text}${trailer}${rangeLine}${recovery}`, code: ok ? 0 : 4, doc };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
@@ -948,6 +988,7 @@ export async function runnerReview({
   tier,
   base = null,
   head = null,
+  allowGateway,
   wait = true,
   waitMs = DEFAULT_WAIT_MS,
   pollMs = DEFAULT_POLL_MS,
@@ -977,7 +1018,7 @@ export async function runnerReview({
     pre = preRes.value;
   } catch (e) { if (e instanceof SetupError) return { text: e.message.endsWith('\n') ? e.message : `${e.message}\n`, code: 4, setup: true, needsUser: e.needsUser }; throw e; }
   let started;
-  try { started = await startRun({ exec, cwd, env, tier, pre, sleepMs, tries, sleep, signal, now, t0, waitMs: capMs }); } catch (e) { if (e instanceof SetupError) return { text: `${e.message}\n`, code: 4, setup: true }; throw e; }
+  try { started = await startRun({ exec, cwd, env, tier, pre, allowGateway, sleepMs, tries, sleep, signal, now, t0, waitMs: capMs }); } catch (e) { if (e instanceof SetupError) return { text: `${e.message}\n`, code: 4, setup: true }; throw e; }
   let acc = '';
   const emit = (s) => { acc += s; onLine?.(s); };
   if (pre.note) emit(pre.note);

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "megalens": {
+      "url": "https://megalens.ai/api/mcp?ide=cursor"
+    },
+    "megalens-runner": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${CURSOR_PLUGIN_ROOT}/scripts/cursor-mcp-server.mjs"]
+    }
+  }
+}

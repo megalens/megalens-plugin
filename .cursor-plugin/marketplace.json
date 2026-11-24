@@ -1,0 +1,30 @@
+{
+  "name": "megalens",
+  "owner": {
+    "name": "MegaLens",
+    "email": "support@megalens.ai"
+  },
+  "metadata": {
+    "description": "Official MegaLens code review plugin for Cursor (GitHub Actions runner path, cross-platform).",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "megalens",
+      "source": "cursor",
+      "description": "Independent code review on your own GitHub Actions runner: review your current branch or PR, view the latest result, and copy a fix prompt for any finding.",
+      "version": "0.2.0",
+      "license": "MIT",
+      "logo": "assets/logo.svg",
+      "category": "Code Review",
+      "keywords": [
+        "code-review",
+        "github-actions",
+        "pull-request",
+        "security",
+        "mcp",
+        "megalens"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "name": "megalens",
+  "version": "0.2.0",
+  "description": "Independent multi-company code review for Codex CLI and the Codex desktop app. One command starts the review, waits up to 20 minutes, and shows findings inline.",
+  "author": {
+    "name": "MegaLens",
+    "url": "https://megalens.ai"
+  },
+  "homepage": "https://megalens.ai",
+  "license": "MIT",
+  "keywords": [
+    "code-review",
+    "megalens",
+    "mcp",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./mcp.json",
+  "interface": {
+    "displayName": "MegaLens",
+    "shortDescription": "Independent code review right inside Codex",
+    "longDescription": "Start a MegaLens code review with one command ($megalens-review, $megalens:megalens-review, or /prompts:megalens-review). Waits up to 20 minutes and shows findings inline using the same runner order as MegaLens for Claude Code.",
+    "developerName": "MegaLens",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read"
+    ],
+    "websiteURL": "https://megalens.ai",
+    "privacyPolicyURL": "https://megalens.ai/privacy",
+    "termsOfServiceURL": "https://megalens.ai/terms",
+    "defaultPrompt": [
+      "$megalens-review",
+      "$megalens-review deep"
+    ],
+    "brandColor": "#2563EB"
+  }
+}

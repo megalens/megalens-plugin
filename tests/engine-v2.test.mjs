@@ -372,11 +372,11 @@ test('F3: the only pre-approved tool is the script; no raw git rules in any comm
 test('F3: show-change prints staged, unstaged and untracked names; hides secret-named files; ignores repo fsmonitor and external diff', async () => {
   const d = mkrepo(); const marker = path.join(d, 'PWNED');
   writeFileSync(path.join(d, 'a.js'), 'two\n'); sh(d, 'add', 'a.js'); writeFileSync(path.join(d, 'staged-new.js'), 'new\n'); sh(d, 'add', 'staged-new.js');
-  writeFileSync(path.join(d, 'a.js'), 'three\n'); writeFileSync(path.join(d, 'fresh.js'), 'x'); writeFileSync(path.join(d, '.env'), 'SECRET=1'); writeFileSync(path.join(d, 'k.pem'), 'x');
+  writeFileSync(path.join(d, 'a.js'), 'three\n'); writeFileSync(path.join(d, 'fresh.js'), 'x'); writeFileSync(path.join(d, '.netrc'), 'SECRET=1'); writeFileSync(path.join(d, 'k.pem'), 'x');
   sh(d, 'config', 'core.fsmonitor', `touch ${marker}; echo`); sh(d, 'config', 'diff.external', `touch ${marker}; true`); sh(d, 'config', 'core.pager', `touch ${marker}; cat`);
   const r = await run(['show-change'], { cwd: d });
   assert.equal(r.code, 0); assert.match(r.text, /\+three/); assert.match(r.text, /-one/); assert.match(r.text, /staged-new\.js/); assert.match(r.text, /fresh\.js/);
-  assert.ok(!/\.env\b|k\.pem/.test(r.text.replace(/\[\d+ [^\]]*\]/g, ''))); assert.match(r.text, /2 untracked file\(s\) with credential-like names/); assert.match(r.text, /2 credential-like path\(s\) not shown/);
+  assert.ok(!/\.netrc\b|k\.pem/.test(r.text.replace(/\[\d+ [^\]]*\]/g, ''))); assert.match(r.text, /2 untracked file\(s\) with credential-like names/); assert.match(r.text, /2 credential-like path\(s\) not shown/);
   assert.ok(!existsSync(marker), 'repo config must not run anything'); assert.equal(r.calls.length, 0, 'does not call the engine');
   rmSync(d, { recursive: true, force: true });
 });

@@ -1,0 +1,22 @@
+{
+  "version": "0.2.0",
+  "engine": "0.1.5",
+  "actions": {
+    "MEGALENS": {
+      "tag": "v1.3.0",
+      "sha": "38aae94fbc4f4bdb05964c249d106c1c13cb632c"
+    },
+    "CHECKOUT": {
+      "tag": "v4.2.2",
+      "sha": "11bd71901bbe5b1630ceea73d27597364c9af683"
+    },
+    "UPLOAD": {
+      "tag": "v4.6.2",
+      "sha": "ea165f8d65b6e75b540449e92b4886f43607fa02"
+    },
+    "DOWNLOAD": {
+      "tag": "v4.3.0",
+      "sha": "d3f86a106a0bac45b974a628896c90dbdf5c8093"
+    }
+  }
+}

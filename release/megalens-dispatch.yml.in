@@ -1,0 +1,133 @@
+# MegaLens review on your own GitHub runner, started by /megalens:review (no pull request needed).
+# Add this file once, on your default branch: .github/workflows/megalens-dispatch.yml
+# Set up the MEGALENS_TOKEN repository secret with npx megalens-review init.
+name: MegaLens Dispatch
+run-name: MegaLens ${{ inputs.tier }} ${{ inputs.base_sha }}..${{ inputs.head_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: 'standard or deep'
+        required: true
+        default: 'standard'
+      base_sha:
+        description: 'Base commit (40 hex characters)'
+        required: true
+      head_sha:
+        description: 'Head commit (40 hex characters)'
+        required: true
+      allow_gateway:
+        description: 'Approve sending the diff and code excerpts through the MegaLens gateway to OpenAI'
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      review_id: ${{ steps.create.outputs.review_id }}
+      review_key: ${{ steps.create.outputs.review_key }}
+      head_sha: ${{ steps.create.outputs.head_sha }}
+      base_sha: ${{ steps.create.outputs.base_sha }}
+    steps:
+      - name: Check review prerequisites
+        env:
+          GATEWAY_APPROVED: ${{ inputs.allow_gateway }}
+          ACTION_TOKEN_CONFIGURED: ${{ secrets.MEGALENS_TOKEN != '' }}
+        run: |
+          if [ "$GATEWAY_APPROVED" != true ]; then
+            echo "::error::Approve the gateway transfer before starting a MegaLens review."
+            exit 1
+          fi
+          if [ "$ACTION_TOKEN_CONFIGURED" != true ]; then
+            echo "::error::The MEGALENS_TOKEN repository or organization secret is missing. Run npx megalens-review init in your repository to set it up through your browser."
+            exit 1
+          fi
+      - id: create
+        uses: megalens/review-action@@MEGALENS_SHA@ # @MEGALENS_TAG@
+        with:
+          mode: create
+          tier: ${{ inputs.tier }}
+          head-sha: ${{ inputs.head_sha }}
+          base-sha: ${{ inputs.base_sha }}
+          megalens-token: ${{ secrets.MEGALENS_TOKEN }}
+
+  review:
+    needs: create
+    if: ${{ needs.create.outputs.review_id != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      artifact_name: ${{ steps.retry-findings.outputs.artifact-id != '' && 'megalens-findings-retry' || 'megalens-findings' }}
+    steps:
+      - name: Mask review key
+        env:
+          REVIEW_KEY: ${{ needs.create.outputs.review_key }}
+        run: echo "::add-mask::$REVIEW_KEY"
+
+      - name: Install bubblewrap for engine isolation
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap && (sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true) && for p in /etc/apparmor.d/bwrap-userns-restrict /etc/apparmor.d/unprivileged_userns; do [ -f $p ] && sudo apparmor_parser -R $p || true; done
+
+      - uses: actions/checkout@@CHECKOUT_SHA@ # @CHECKOUT_TAG@
+        with:
+          ref: ${{ needs.create.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: megalens/review-action@@MEGALENS_SHA@ # @MEGALENS_TAG@
+        env:
+          MEGALENS_REVIEW_ID: ${{ needs.create.outputs.review_id }}
+          MEGALENS_REVIEW_KEY: ${{ needs.create.outputs.review_key }}
+        with:
+          mode: review
+          engine-version: '@ENGINE_VERSION@'
+          tier: ${{ inputs.tier }}
+          head-sha: ${{ needs.create.outputs.head_sha }}
+          base-sha: ${{ needs.create.outputs.base_sha }}
+          artifact-name: megalens-findings
+          findings-path: ${{ runner.temp }}/findings.json
+
+      - id: upload-findings
+        uses: actions/upload-artifact@@UPLOAD_SHA@ # @UPLOAD_TAG@
+        if: always()
+        continue-on-error: true
+        with:
+          name: megalens-findings
+          path: ${{ runner.temp }}/findings.json
+          if-no-files-found: error
+
+      - id: retry-findings
+        name: Retry artifact upload under a separate name
+        uses: actions/upload-artifact@@UPLOAD_SHA@ # @UPLOAD_TAG@
+        if: always() && steps.upload-findings.outcome == 'failure'
+        with:
+          name: megalens-findings-retry
+          path: ${{ runner.temp }}/findings.json
+          if-no-files-found: error
+
+  publish:
+    needs: [create, review]
+    if: always() && needs.review.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@@DOWNLOAD_SHA@ # @DOWNLOAD_TAG@
+        with:
+          name: ${{ needs.review.outputs.artifact_name }}
+          path: ${{ runner.temp }}
+
+      - uses: megalens/review-action@@MEGALENS_SHA@ # @MEGALENS_TAG@
+        with:
+          mode: publish
+          tier: ${{ inputs.tier }}
+          head-sha: ${{ needs.create.outputs.head_sha }}
+          base-sha: ${{ needs.create.outputs.base_sha }}
+          artifact-name: ${{ needs.review.outputs.artifact_name }}
+          findings-path: ${{ runner.temp }}/findings.json
+          fail-on: none

@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "megalens-local": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/mcp-server.mjs"],
+      "env": {
+        "MEGALENS_TOKEN": "${MEGALENS_TOKEN}",
+        "MEGALENS_URL": "${MEGALENS_URL:-https://megalens.ai/api/mcp?ide=claude-code}",
+        "MEGALENS_AUDIT_LOG": "${MEGALENS_AUDIT_LOG:-}"
+      }
+    },
+    "megalens": {
+      "type": "http",
+      "url": "https://megalens.ai/api/mcp?ide=claude-code"
+    }
+  }
+}

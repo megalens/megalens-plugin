@@ -1,0 +1,8 @@
+interface:
+  display_name: "MegaLens Status"
+  short_description: "Check status of the latest MegaLens review for this repo"
+  brand_color: "#2563EB"
+  default_prompt: "Run $megalens-status for the current repository."
+
+policy:
+  allow_implicit_invocation: false

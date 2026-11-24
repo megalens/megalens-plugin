@@ -1,0 +1,20 @@
+{
+  "name": "megalens",
+  "interface": {
+    "displayName": "MegaLens"
+  },
+  "plugins": [
+    {
+      "name": "megalens",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "NOT_AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

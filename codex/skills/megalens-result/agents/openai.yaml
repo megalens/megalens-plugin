@@ -1,0 +1,8 @@
+interface:
+  display_name: "MegaLens Result"
+  short_description: "Show findings from the latest MegaLens review for this repo"
+  brand_color: "#2563EB"
+  default_prompt: "Run $megalens-result for the current repository."
+
+policy:
+  allow_implicit_invocation: false

@@ -5,14 +5,15 @@
 // The model never handles the bundle, so it cannot corrupt it. Nothing is written to stdout except MCP messages.
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendFileSync, realpathSync } from 'node:fs';
+import { appendFileSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
-import { secretPath, secretContent, validateRange } from './lib/safety.mjs';
+import { secretPath, secretContent, validateRange, redactSecrets } from './lib/safety.mjs';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+const { version } = JSON.parse(readFileSync(new URL('../.claude-plugin/plugin.json', import.meta.url), 'utf8'));
 const COLLECT = path.join(HERE, 'collect.mjs');
 const DEFAULT_URL = 'https://megalens.ai/api/mcp?ide=claude-code';
 const BUDGET_MAX = 700_000; // collector hard limit
@@ -50,7 +51,7 @@ export const TOOL = {
         type: 'array', description: 'Your own findings before the call, one per point.',
         items: { type: 'object', properties: { claim: { type: 'string', description: '"file:line - what is wrong"' }, quote: { type: 'string', description: 'That line of code, verbatim.' } }, required: ['claim'] },
       },
-      extraContext: { type: 'array', description: 'Only for the one follow-up call after the result carried needed_context: files you read because it asked, appended to the bundle (max 100 KB in total). Never send secrets.', items: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } },
+      extraContext: { type: 'array', description: 'Only after explicit user confirmation for a follow-up billable review when a previous result carried needed_context: files you read because it asked, appended to the bundle (max 100 KB in total). Never send secrets.', items: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } },
       maxBytes: { type: 'number', description: 'Optional bundle budget in bytes (default 200000, or MEGALENS_MAX_BYTES; maximum 700000). Larger bundles cost more per review.' },
     },
   },
@@ -124,9 +125,12 @@ export async function reviewChange(args, ctx = {}) {
     for (const f of args.extraContext) {
       if (!f || typeof f.path !== 'string' || typeof f.content !== 'string') continue;
       const rel = f.path.replace(/\\/g, '/');
-      const why = secretPath(rel) ? 'secret-looking file name' : (() => { const c = secretContent(f.content, rel); return c ? `secret-looking content (${c})` : null; })();
+      const norm = path.posix.normalize(rel).replace(/^\.\//, '');
+      const outside = rel.startsWith('/') || /^[A-Za-z]:/.test(rel) || norm === '..' || norm.startsWith('../');
+      const why = outside ? 'outside the workspace' : secretPath(norm) ? 'secret-looking file name' : (() => { const c = secretContent(f.content, norm); return c ? `secret-looking content (${c})` : null; })();
       if (why) { refused.push(`${f.path}: ${why}`); continue; }
-      extra += `\n=== FILE: ${f.path.replace(/[\r\n]/g, ' ')} ===\n${f.content}\n`;
+      const red = redactSecrets(f.content, norm);
+      extra += `\n=== FILE: ${f.path.replace(/[\r\n]/g, ' ')} ===\n${red.text}\n`;
     }
     if (Buffer.byteLength(extra) > 100_000) return fail('extraContext is over 100 KB; send fewer or shorter excerpts.');
   }
@@ -166,6 +170,7 @@ export async function reviewChange(args, ctx = {}) {
     let firstJson = null; try { firstJson = JSON.parse(textOf(first)); } catch { /* not JSON: returned as is */ }
     if (first.isError) return { ...first, content: [...first.content, note(col, bundleSha, sentSha, requestBytes, null, budget)] };
     runId = firstJson?.run_id || null;
+    let finalJson = firstJson;
     if (runId && firstJson?.terminal !== true) {
       const end = Date.now() + POLL_TIMEOUT_MS;
       for (let n = 3; ; n++) {
@@ -174,6 +179,7 @@ export async function reviewChange(args, ctx = {}) {
           r = await rpc(url, token, 'tools/call', { name: 'megalens_poll', arguments: { run_id: runId } }, n);
           try { j = JSON.parse(textOf(r)); } catch { /* odd text: keep polling until the deadline */ }
           final = r;
+          finalJson = j;
           if (j?.terminal === true || r.isError) break;
         } catch (e) {
           if (!e.transient) throw e; // 401/403/4xx and protocol errors are final; the debate call is never repeated
@@ -183,15 +189,23 @@ export async function reviewChange(args, ctx = {}) {
         await new Promise((res) => setTimeout(res, Math.min(Math.max(Number(j?.poll_after_ms) || 8000, POLL_MIN_MS), 15000)));
       }
     }
+    const neededCtx = Array.isArray(finalJson?.needed_context) && finalJson.needed_context.length > 0
+      ? finalJson.needed_context
+      : (Array.isArray(finalJson?.result?.needed_context) && finalJson.result.needed_context.length > 0 ? finalJson.result.needed_context : null);
+    const neededNote = neededCtx
+      ? (finalJson?.status === 'MCP_APPROVED' || finalJson?.result?.status === 'MCP_APPROVED'
+        ? '\nNOTE: needed_context was returned on an approved (charged) review. Do NOT auto-resubmit; ask the user before starting another billable review.'
+        : `\nNOTE: needed_context was returned on a halted review (${finalJson?.status || finalJson?.result?.status || 'halted'}). Do NOT auto-resubmit; ask the user before starting a new review.`)
+      : '';
     audit({ bundle_sha256: bundleSha, filecontext_sha256_sent: sentSha, bundle_bytes: col.bundleBytes, request_bytes: requestBytes, run_id: runId, budget, change: col.change });
-    return { ...final, content: [...(final.content || []), note(col, bundleSha, sentSha, requestBytes, runId, budget)] };
+    return { ...final, content: [...(final.content || []), note(col, bundleSha, sentSha, requestBytes, runId, budget, neededNote)] };
   } catch (e) {
     if (debateSent) return fail(`MegaLens call failed after the review was submitted (${e.message}). The run ${runId ? `is ${runId}; call megalens_poll with it` : 'has no known id; check megalens_history on the remote megalens server'}. DO NOT call this tool again for this change: it would start a second paid run.`);
     return fail(`MegaLens call failed: ${e.message}`);
   }
 }
-function note(col, bundleSha, sentSha, requestBytes, runId, budget) {
-  return { type: 'text', text: `[megalens-plugin] bundle_sha256=${bundleSha} sent_sha256=${sentSha} bundle_bytes=${col.bundleBytes} request_bytes=${requestBytes} budget=${budget} run_id=${runId}${col.refused?.length ? `\nextraContext refused (not sent): ${col.refused.join('; ')}` : ''}\n${col.manifest}` };
+function note(col, bundleSha, sentSha, requestBytes, runId, budget, extraNote = '') {
+  return { type: 'text', text: `[megalens-plugin] bundle_sha256=${bundleSha} sent_sha256=${sentSha} bundle_bytes=${col.bundleBytes} request_bytes=${requestBytes} budget=${budget} run_id=${runId}${col.refused?.length ? `\nextraContext refused (not sent): ${col.refused.join('; ')}` : ''}${extraNote}\n${col.manifest}` };
 }
 function audit(rec) {
   const f = env('MEGALENS_AUDIT_LOG'); if (!f) return;
@@ -202,7 +216,7 @@ function fail(msg) { return { isError: true, content: [{ type: 'text', text: msg
 // ---------- MCP stdio loop
 async function handle(msg, send) {
   const { id, method, params } = msg;
-  if (method === 'initialize') return send({ jsonrpc: '2.0', id, result: { protocolVersion: params?.protocolVersion || '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'megalens-local', version: '0.2.0' } } });
+  if (method === 'initialize') return send({ jsonrpc: '2.0', id, result: { protocolVersion: params?.protocolVersion || '2025-06-18', capabilities: { tools: {} }, serverInfo: { name: 'megalens-local', version } } });
   if (method === 'ping') return send({ jsonrpc: '2.0', id, result: {} });
   if (method === 'tools/list') return send({ jsonrpc: '2.0', id, result: { tools: [TOOL] } });
   if (method === 'tools/call') {

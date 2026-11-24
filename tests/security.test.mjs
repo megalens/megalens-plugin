@@ -36,25 +36,25 @@ test('1: secret-looking content is detected', () => {
 test('1: collector skips secret files and files with secret content, and says so in the manifest', () => {
   const pk = '-----BEGIN ' + 'OPENSSH PRIVATE KEY-----\nzzz\n';
   const d = repo((x) => {});
-  put(d, '.envrc', 'export TOKEN=hunter2-envrc\n'); put(d, 'infra/prod.tfvars', 'password="hunter2-tfvars"\n');
+  put(d, '.netrc', 'export TOKEN=hunter2-envrc\n'); put(d, 'infra/prod.tfvars', 'password="hunter2-tfvars"\n');
   put(d, 'src/leaky.js', `const k = "${'AKIA' + 'ABCDEFGHIJKLMNOP'}"; // hunter2-leaky\n`); put(d, 'notes/key.txt', pk);
-  put(d, '.npmrc', '//registry.npmjs.org/:_authToken=hunter2-npmrc\n'); put(d, '.env.example', 'API_URL=http://x\n');
+  put(d, '.npmrc', '//registry.npmjs.org/:_authToken=hunter2-npmrc\n'); put(d, 'docs/config.example', 'API_URL=http://x\n');
   const { j } = collect(d);
   assert.ok(!j.bundle.includes('hunter2') && !j.bundle.includes('PRIVATE KEY') && !j.bundle.includes('AKIA'), 'no secret reaches the bundle');
-  assert.ok(j.bundle.includes('.env.example'));
-  assert.match(j.manifest, /\.envrc: .*secret/); assert.match(j.manifest, /leaky\.js: .*secret-looking content \(AWS access key id\)/); assert.match(j.manifest, /\.npmrc: .*secret/);
+  assert.ok(j.bundle.includes('docs/config.example'));
+  assert.match(j.manifest, /\.netrc: .*secret/); assert.match(j.manifest, /leaky\.js: .*secret-looking content \(AWS access key id\)/); assert.match(j.manifest, /\.npmrc: .*secret/);
   rmSync(d, { recursive: true });
 });
 
 // ---- 2. quoted diff headers
 test('2: file names with spaces / quotes / non-ASCII cannot smuggle a secret diff through', () => {
   const d = repo((x) => {});
-  const names = ['my .env', 'prod key.pem', 'ünï.pem', 'we"ird.key', 'tab\there.pem'];
+  const names = ['my key.pem', 'prod key.pem', 'ünï.pem', 'we"ird.key', 'tab\there.pem'];
   for (const n of names) put(d, n, 'hunter2-quoted\n');
   git(d, 'add', '-A'); // staged, so the headers come from `git diff`, not --no-index
   const { j } = collect(d);
   assert.ok(!j.bundle.includes('hunter2-quoted'), 'secret diff content absent');
-  assert.ok(!/diff --git "?a\/(my \.env|prod key\.pem)/.test(j.bundle));
+  assert.ok(!/diff --git "?a\/(my key\.pem|prod key\.pem)/.test(j.bundle));
   rmSync(d, { recursive: true });
 });
 test('2: an ordinary file with a space in its name still collects normally', () => {

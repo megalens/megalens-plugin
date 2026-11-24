@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="MegaLens">
+  <defs>
+    <linearGradient id="ml-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0F172A"/>
+      <stop offset="100%" stop-color="#1E293B"/>
+    </linearGradient>
+    <linearGradient id="ml-ring" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#818CF8"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="120" height="120" rx="28" fill="url(#ml-bg)"/>
+  <circle cx="58" cy="58" r="32" fill="none" stroke="url(#ml-ring)" stroke-width="8"/>
+  <line x1="81" y1="81" x2="103" y2="103" stroke="url(#ml-ring)" stroke-width="10" stroke-linecap="round"/>
+  <path d="M46 49 L38 58 L46 67" fill="none" stroke="#F8FAFC" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M70 49 L78 58 L70 67" fill="none" stroke="#F8FAFC" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <line x1="62" y1="46" x2="54" y2="70" stroke="#38BDF8" stroke-width="5" stroke-linecap="round"/>
+</svg>

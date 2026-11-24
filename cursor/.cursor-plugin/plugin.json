@@ -1,0 +1,25 @@
+{
+  "name": "megalens",
+  "displayName": "MegaLens",
+  "version": "0.2.0",
+  "description": "Independent code review on your own GitHub Actions runner (Windows, macOS, Linux): review your current branch or PR, view the latest result, and copy a fix prompt for any finding.",
+  "author": {
+    "name": "MegaLens",
+    "email": "support@megalens.ai"
+  },
+  "homepage": "https://megalens.ai",
+  "license": "MIT",
+  "keywords": [
+    "code-review",
+    "github-actions",
+    "pull-request",
+    "security",
+    "mcp",
+    "megalens"
+  ],
+  "logo": "assets/logo.svg",
+  "rules": "./rules/",
+  "skills": "./skills/",
+  "commands": "./commands/",
+  "mcpServers": "./mcp.json"
+}

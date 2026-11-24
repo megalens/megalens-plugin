@@ -598,13 +598,12 @@ if (a[0] === 'result') {
 
 test('README main path is 2 steps (install plugin, /megalens:review) with no --runner or review ids', () => {
   const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
-  const mainPath = readme.split('## Advanced')[0];
-  assert.ok(mainPath.length > 100, 'has a main section before Advanced');
-  assert.match(mainPath, /## Quick start \(2 steps\)/);
+  const mainPath = readme.split('### Claude Code')[1].split('### Codex')[0];
   assert.match(mainPath, /claude --plugin-dir/);
   assert.match(mainPath, /\/megalens:review/);
-  assert.ok(mainPath.includes(SETUP_LINE));
-  assert.match(mainPath, /MegaLens GitHub App/);
+  const guide = readFileSync(new URL('../docs/claude-code.md', import.meta.url), 'utf8');
+  assert.ok(guide.includes(SETUP_LINE));
+  assert.match(guide, /MegaLens GitHub App/);
   assert.equal(mainPath.includes('--runner'), false, '--runner must not appear in README main path');
   assert.equal(/gh:<|gh:\d+|rv_|app:<|app:\d+|app:[0-9a-f-]{36}/.test(mainPath), false, 'review ids must not appear in README main path');
 });

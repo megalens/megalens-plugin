@@ -1,1 +1,13 @@
-{ "name": "megalens-claude-plugin", "version": "0.1.0", "private": true, "type": "module", "scripts": { "test": "node --test tests/collect.test.mjs tests/mcp-server.test.mjs tests/security.test.mjs tests/review2.test.mjs tests/install.test.mjs tests/engine-v2.test.mjs tests/gh-runner.test.mjs tests/one-command.test.mjs tests/app-path.test.mjs" } }
+{
+  "name": "megalens-claude-plugin",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "megalens-codex-install": "codex/scripts/install-codex.mjs"
+  },
+  "scripts": {
+    "sync:release": "node release/sync.mjs",
+    "test": "node release/sync.mjs --check && node --test"
+  }
+}

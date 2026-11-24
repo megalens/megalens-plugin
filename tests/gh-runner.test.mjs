@@ -71,7 +71,8 @@ test('precondition messages name the exact fix', async () => {
   assert.match(wf.message, /\.github\/workflows\/megalens-dispatch\.yml/);
   assert.ok(wf.message.includes(workflowText()), 'prints the whole file to add');
   const sec = await msgOf(pf({ 'gh secret': ok('[{"name":"OTHER"}]') }));
-  assert.equal(sec.message, MSG.noSecret); assert.match(sec.message, /gh secret set MEGALENS_TOKEN/);
+  assert.equal(sec.message, MSG.noSecret);
+  assert.match(sec.message, /npx megalens-review init.*`gh` on stdin.*If browser setup is unavailable.*gh secret set MEGALENS_TOKEN/);
   assert.equal((await msgOf(pf({ 'gh secret': ok('[]') }))).message, MSG.noSecret);
 });
 
@@ -82,7 +83,10 @@ test('secret check: an organisation secret counts; unreadable org list continues
   assert.equal(good.note, '');
   const neither = await msgOf(pf(withOrg(ok('["OTHER"]'))));
   assert.equal(neither.message, MSG.noSecret);
-  const userOwned = await msgOf(pf(withOrg(bad('gh: Not Found (HTTP 404)'))));
+  const userOwned = await msgOf(pf({
+    ...withOrg(bad('gh: Not Found (HTTP 404)')),
+    'gh repo': ok(JSON.stringify({ nameWithOwner: 'acme/widget', defaultBranchRef: { name: 'main' }, isInOrganization: false })),
+  }));
   assert.equal(userOwned.message, MSG.noSecret);
   const paged = await pf(withOrg(ok('["A"]\n[]\n["MEGALENS_TOKEN"]\n')));
   assert.equal(paged.note, '');
@@ -304,6 +308,27 @@ test('main: automatic workflow reviews need no local engine or token and show fi
   assert.equal(r.text.includes('gh:5'), false);
 });
 
+test('the shared GitHub runner does not approve a protected workflow on the user’s behalf', async () => {
+  const installedWorkflow = Buffer.from(workflowText()).toString('base64');
+  const checkout = () => fakeExec({
+    'gh api -X': ok(`file\t${installedWorkflow}\n`),
+  }, { runs: runList });
+  const unapproved = checkout();
+  const stopped = await viaMain(['review', '--runner', 'github'], { exec: unapproved.exec });
+  assert.equal(stopped.code, 4);
+  assert.match(stopped.text, /diff and code excerpts pass through the MegaLens gateway to OpenAI/);
+  assert.match(stopped.text, /MegaLens does not keep your code; it passes through our gateway to the AI provider for the review and is not stored/);
+  assert.match(stopped.text, /--allow-gateway/);
+  assert.ok(!unapproved.calls.some(({ args }) => args[0] === 'workflow'));
+
+  const approved = checkout();
+  const started = await viaMain(['review', '--runner', 'github', '--allow-gateway'], { exec: approved.exec });
+  assert.equal(started.code, 0);
+  const dispatches = approved.calls.filter(({ args }) => args[0] === 'workflow' && args[1] === 'run');
+  assert.equal(dispatches.length, 1);
+  assert.ok(dispatches[0].args.includes('allow_gateway=true'));
+});
+
 // A fake engine that ran a review, found something and failed (exit 4 / document written). Its text may carry any marker string.
 function fakeBinDoc(exit, title, stderr = '') {
   const d = mkdtempSync(path.join(tmpdir(), 'mlfake-')); const bin = path.join(d, 'megalens-review');
@@ -377,11 +402,11 @@ test('workflow template: pinned shas, run-name carries tier, base and head, publ
   assert.match(y, /workflow_dispatch:/);
   const pins = y.match(/megalens\/review-action@[0-9a-f]{40}/g) ?? [];
   assert.equal(pins.length, 3);
-  for (const sha of ['11bd71901bbe5b1630ceea73d27597364c9af683', 'ea165f8d65b6e75b540449e92b4886f43607fa02', 'd3f86a106a0bac45b974a628896c90dbdf5c8093']) assert.ok(y.includes(sha));
+  const releasePins = JSON.parse(readFileSync(new URL('../release/pins.json', import.meta.url), 'utf8'));
+  for (const { sha } of Object.values(releasePins.actions)) assert.ok(y.includes(sha));
   assert.equal(new Set(pins).size, 1, 'one Action pin in all three jobs');
-  assert.equal(pins[0], 'megalens/review-action@950eb5f1eeff21008fcf585587b88fc83546cdcf', 'released v1.2.0 commit');
-  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
-  assert.ok(readme.includes(pins[0]), 'README documents the same Action pin');
+  assert.equal(pins[0], `megalens/review-action@${releasePins.actions.MEGALENS.sha}`);
+  assert.ok(y.includes(`engine-version: '${releasePins.engine}'`));
   assert.match(y, /apparmor_restrict_unprivileged_userns=0/);
   assert.equal(/pull-requests: write|contents: write|actions: write/.test(y), false);
   assert.equal((y.match(/megalens-token:/g) || []).length, 1, 'the account token goes to the create job only');

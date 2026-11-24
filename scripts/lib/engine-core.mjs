@@ -18,7 +18,7 @@ export const REF_RE = /^[A-Za-z0-9][A-Za-z0-9._\/~^@-]{0,99}$/;
 
 export class UsageError extends Error {}
 
-/** `review [standard|double|deep] [--quiet] [--first-review FILE] [--base REF --head REF] [--wait|--no-wait]` */
+/** `review [standard|double|deep] [--quiet] [--first-review FILE] [--base REF --head REF] [--wait|--no-wait] [--allow-gateway]` */
 export function parseReviewArgs(argv, flags = {}) {
   const o = { tier: 'standard', quiet: false, firstReview: null, base: null, head: null, wait: true };
   let tierSeen = false;
@@ -29,6 +29,7 @@ export function parseReviewArgs(argv, flags = {}) {
     else if (a === '--quiet') o.quiet = true;
     else if (a === '--wait') o.wait = true;
     else if (a === '--no-wait') o.wait = false;
+    else if (a === '--allow-gateway') o.allowGateway = true;
     else if (a === '--first-review') o.firstReview = val();
     else if (a === '--base') o.base = val();
     else if (a === '--head') o.head = val();

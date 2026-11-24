@@ -39,7 +39,7 @@ test('1: when changed files fit whole, context follows them', () => {
 
 test('2: nothing reviewable (all changed files excluded) -> no bundle, a clear reason, and no remote call', async () => {
   const d = repo(); put(d, 'src/a.js', 'export const a = 1;\n'); // undo the only reviewable change
-  put(d, 'src/key.js', `const k = "${'AKIA' + 'ABCDEFGHIJKLMNOP'}";\n`); put(d, '.env', 'X=1\n'); git(d, 'add', '-A');
+  put(d, 'src/key.js', `const k = "${'AKIA' + 'ABCDEFGHIJKLMNOP'}";\n`); put(d, '.netrc', 'X=1\n'); git(d, 'add', '-A');
   const { j } = collect(d, '--staged'); assert.equal(j.nothingReviewable, true); assert.match(j.reason, /key\.js.*secret/s);
   const reqs = []; const srv = http.createServer((q, r) => { reqs.push(1); r.end('{}'); }); await new Promise((res) => srv.listen(0, '127.0.0.1', res));
   const p = spawn('node', [SERVER], { cwd: d, env: { ...process.env, MEGALENS_TOKEN: 't', MEGALENS_URL: `http://127.0.0.1:${srv.address().port}/x` }, stdio: ['pipe', 'pipe', 'inherit'] });
