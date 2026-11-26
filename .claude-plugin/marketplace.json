@@ -5,7 +5,7 @@
     {
       "name": "megalens",
       "source": "./claude",
-      "description": "Review your current change with MegaLens: models from different companies review the same diff, changed files and related code."
+      "description": "Review your current change with MegaLens. With /megalens-review, models from different companies review the same diff, changed files and related code. /megalens:review uses OpenAI's GPT-6.2 through the MegaLens GitHub App or GitHub Actions."
     }
   ]
 }
