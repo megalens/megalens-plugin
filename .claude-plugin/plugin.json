@@ -2,7 +2,7 @@
   "name": "megalens",
   "displayName": "MegaLens",
   "version": "0.2.0",
-  "description": "Code review of your change with MegaLens. /megalens-review sends the diff, changed files and bounded context to AI models from different companies. /megalens:review reviews it on GitHub with OpenAI's GPT-6.2, through the MegaLens GitHub App or your GitHub Actions workflow.",
+  "description": "Code review of your change with MegaLens. /megalens-review sends the diff, changed files and bounded context to AI models from different companies. /megalens:review reviews it with OpenAI's GPT-6.2, on your machine or on GitHub through the MegaLens GitHub App or GitHub Actions.",
   "author": {
     "name": "MegaLens",
     "url": "https://megalens.ai"
